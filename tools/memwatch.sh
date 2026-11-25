@@ -73,7 +73,7 @@ sample_container() {
     done
     anon_bytes=$((kb * 1024))
   fi
-  awk -v g="$gpu_mib" -v a="$anon_bytes" 'BEGIN {printf "%.2f %.2f", g / 1024.0, a / 1073741824.0}'
+  awk -v g="$gpu_mib" -v a="$anon_bytes" 'BEGIN {printf "%.2f %.2f\n", g / 1024.0, a / 1073741824.0}'
 }
 
 prev_pswpout=$(awk '/^pswpout /{print $2; exit}' /proc/vmstat 2>/dev/null || echo 0)
