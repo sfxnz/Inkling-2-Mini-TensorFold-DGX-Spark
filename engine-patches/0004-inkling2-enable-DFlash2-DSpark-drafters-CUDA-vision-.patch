@@ -1,5 +1,5 @@
 From 8fd881f7f44c5185e247e3aaf6d6bd6b92af6438 Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 17:38:30 +0000
 Subject: [PATCH 04/14] inkling2: enable DFlash2/DSpark drafters, CUDA vision,
  multi-stream graphs, and paged FP8 KV

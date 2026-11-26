@@ -1,5 +1,5 @@
 From 02fc5116c81fd02ff13bdca769209a8b9248e379 Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 00:08:40 +0000
 Subject: [PATCH 13/14] inkling2: restore loop_ar/gateUpTiled occupancy and use
  4-row SMEM gateDownPrepared

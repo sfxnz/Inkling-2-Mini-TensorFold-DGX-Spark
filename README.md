@@ -22,7 +22,7 @@ VALIDATE_ONLY=1 ./run.sh       # read-only preflight check
 
 ## Measured Results (1x DGX Spark GB10, 2,200 MHz clock lock)
 
-All runs below were measured on `spark1` (NVIDIA GB10 `sm_121`, 48 SMs, 121.69 GiB unified memory, `nvidia-lock-clocks.service` at 2,200 MHz, `MEMORY_RESERVE_GIB=13.0`, `pswpout_delta=0` throughout). Inner-loop and outer-loop/gate rulers are reported separately because thinking mode, sampling temperature, and concurrency change acceptance and throughput.
+All runs below were measured on a single NVIDIA DGX Spark (GB10 `sm_121`, 48 SMs, 121.69 GiB unified memory, `nvidia-lock-clocks.service` at 2,200 MHz, `MEMORY_RESERVE_GIB=13.0`, `pswpout_delta=0` throughout). Inner-loop and outer-loop/gate rulers are reported separately because thinking mode, sampling temperature, and concurrency change acceptance and throughput.
 
 ### Outer-Loop & Qualification Ruler (`tools/bench.py --ruler outer`, `tools/prefill.py`, `tools/startup.py`, `tools/gates.py`)
 
@@ -47,7 +47,7 @@ All runs below were measured on `spark1` (NVIDIA GB10 `sm_121`, 48 SMs, 121.69 G
 | Prose (greedy, thinking off) | **45.64 tok/s** (`52.94 ms/rnd`, `1.426 tok/rnd` at c4) | **78.05 tok/s** | **96.97 tok/s** |
 | Code (greedy, thinking off) | **49.59 tok/s** (`52.51 ms/rnd`) | **83.99 tok/s** | **116.74 tok/s** |
 
-*Note on thinking effort and dense FP8 flags:* `Inkling-2-Mini`'s chat template emits `Thinking effort level: 0` when `enable_thinking=False`; the model weights may still emit a brief separated `<|content_thinking|>` segment before the final answer, which TensorFold places in `reasoning_content` cleanly. `TF_INKLING2_ATTN_FP8=1` and `TF_INKLING2_GATE_FP8=1` trade a small amount of greedy code acceptance for +17-19% prose decode speed; unset them in `EXTRA_ENV` if you want pure BF16 dense projections.
+*Note on thinking effort, dense FP8 flags, and NLL harness:* `Inkling-2-Mini`'s chat template emits `Thinking effort level: 0` when `enable_thinking=False`; the model weights may still emit a brief separated `<|content_thinking|>` segment before the final answer, which TensorFold places in `reasoning_content` cleanly. `TF_INKLING2_ATTN_FP8=1` and `TF_INKLING2_GATE_FP8=1` trade a small amount of greedy code acceptance for +17-19% prose decode speed; unset them in `EXTRA_ENV` if you want pure BF16 dense projections. Note that paired teacher-forced NLL (`tools/nll.py`) is currently unsupported by TensorFold's `inkling2` backend (`prompt_logprobs` is unimplemented in `loop_backend.zig` / `cuda.zig`, returning HTTP 400); quality parity is verified instead via `plain` (`DRAFTER=""`) vs `drafted` (`DFlash2`) 4/4 greedy exactness and 12/12 `tools/gates.py` (including 256K and 1M needle retrieval).
 
 ---
 
@@ -136,7 +136,8 @@ Any variable in `recipe.conf` can be overridden from the environment (e.g., `POR
   # Fast subset without 256K/1M needles:
   python3 tools/gates.py --skip needle_256k,needle_1m,soak
   ```
-- **Paired NLL check (`tools/nll.py`):**
+- **Paired NLL check (`tools/nll.py`, currently unsupported on `inkling2`):**
+  The `inkling2` backend in `loop_backend.zig` / `cuda.zig` does not implement `prompt_logprobs` yet (HTTP 400: `"prompt_logprobs are not supported by this model or backend"`). Once upstream/backend adds `prompt_logprobs` support, capture and compare against a reference with:
   ```sh
   python3 tools/nll.py capture --label ref --out /tmp/nll-ref
   python3 tools/nll.py capture --label cand --out /tmp/nll-cand
@@ -170,12 +171,12 @@ curl -s http://localhost:8000/v1/chat/completions \
 
 This recipe repository (scripts, Dockerfiles, harness, and `engine-patches/`) is licensed under the **Apache License, Version 2.0** ([LICENSE](LICENSE)). Full third-party notices and exact pinned revisions are recorded in [NOTICE](NOTICE):
 
-- **Target Weights:** [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) @ `c9d028302cd0f035fdf8e7e91f089a4ce94d2195` (Apache-2.0 + Thinking Machines Model AUP).
-- **DFlash2 Drafter:** [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) @ `4f9088ea66c21f2b99ed657d1941c306b03e84d2` (Apache-2.0), implementing DFlash ([z-lab/dflash](https://github.com/z-lab/dflash), MIT).
-- **Inference Engine:** [ashhart/TensorFold](https://github.com/ashhart/TensorFold) tag `v1.3.5` (`02b324ae9767253d9911d753d5c835a5070eed1b`, Apache-2.0 / pre-0.6.0 MIT; Ash Hart & contributors).
+- **Target Weights:** Thinking Machines Lab, [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) @ `c9d028302cd0f035fdf8e7e91f089a4ce94d2195` (Apache-2.0 + Thinking Machines Model AUP).
+- **DFlash2 Drafter:** Inco AI, [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) @ `4f9088ea66c21f2b99ed657d1941c306b03e84d2` (Apache-2.0), implementing DFlash (Jian Chen, Yesheng Liang, Zhijian Liu, [z-lab/dflash](https://github.com/z-lab/dflash), MIT).
+- **Inference Engine:** Ash Hart & TensorFold contributors, [ashhart/TensorFold](https://github.com/ashhart/TensorFold) tag `v1.3.5` (`02b324ae9767253d9911d753d5c835a5070eed1b`, Apache-2.0 / pre-0.6.0 MIT).
 - **Adapted / Inspiring Community Recipes:**
   - [Maxrio9/TensorFold](https://github.com/Maxrio9/TensorFold/tree/inkling2-mini-exl3-v2) @ `353717987a736b47f87039c89cfa675c820506c7` (Apache-2.0 / pre-0.6.0 MIT): shared paged FP8 KV pool, 1M context cap, DFlash2 FP8 weights & borrowed head, CUDA graphs, lazy head, CUDA vision, and masked grammar.
   - [MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold) @ `9e3cf20b76e0140bebbbe6ed13f6e3a00e881f12` (Apache-2.0): `ATTN_FP8`, Blackwell `PREFILL_TC`, lazy head, vision, DFlash2 chances, and server compatibility fixes.
   - [tonyd2wild/Inkling-2-Mini-NVFP4-DGX-Spark](https://github.com/tonyd2wild/Inkling-2-Mini-NVFP4-DGX-Spark) @ `2fe0eb57429013c0ccb1c6535339ae61a9e44d9a` (MIT / Apache-2.0): NVFP4 draft head & batched DFlash2 kernel concepts.
   - [sxuff/inkling-2-mini-spark](https://github.com/sxuff/inkling-2-mini-spark) @ `35a4fd8344f01148d35c899cc107aab0c537ce3d` (Apache-2.0): benchmark framing and eager safetensors loading insights.
-- **Runtime Libraries & Toolchain:** `xgrammar` `v0.2.8` (Apache-2.0), `dlpack` (Apache-2.0), `picojson` (BSD-2-Clause), `libjpeg-turbo` `3.1.4.1` (IJG / BSD-3-Clause / zlib), `libwebp` `1.6.0` (BSD-3-Clause), `Zig` `0.17.0` (MIT, build-time only), and NVIDIA CUDA `13.0.0` (`libcublas-13-0`).
+- **Runtime Libraries & Toolchain:** MLC-AI team & DLPack contributors (`xgrammar` `v0.2.8` Apache-2.0, `dlpack` Apache-2.0, `picojson` BSD-2-Clause), IJG / libjpeg-turbo contributors (`libjpeg-turbo` `3.1.4.1`, https://libjpeg-turbo.org, IJG / BSD-3-Clause / zlib), Chromium authors (`libwebp` `1.6.0`, https://chromium.googlesource.com/webm/libwebp, BSD-3-Clause), Zig Software Foundation & contributors (`Zig` `0.17.0`, https://ziglang.org, MIT, build-time only), and NVIDIA (CUDA `13.0.0`, `libcublas-13-0`, NVIDIA Software License Agreement).

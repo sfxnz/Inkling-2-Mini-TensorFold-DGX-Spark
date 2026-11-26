@@ -1,5 +1,5 @@
 From 3658f55ed05d982f6eddbd194f28582b276f0871 Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 17:23:18 +0000
 Subject: [PATCH 03/14] inkling2: add qmmf attention projections, ATTN_FP8
  opt-in, and sm_121a TC prefill

@@ -1,5 +1,5 @@
 From 296d55af36f9b0f1b6a227bb0b85d1cf9cb017a3 Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 23:27:31 +0000
 Subject: [PATCH 12/14] inkling2: batch prefix StateCopy spans, 8-row/32-row
  loop gates, and reg-cached ar/messages
