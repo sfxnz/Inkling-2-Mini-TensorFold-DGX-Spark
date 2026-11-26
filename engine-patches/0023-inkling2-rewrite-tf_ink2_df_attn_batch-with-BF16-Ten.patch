@@ -1,5 +1,5 @@
 From dba99e86d3ae2d1f6d3284c77fd07a60b565e561 Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 12:44:18 +0000
 Subject: [PATCH] inkling2: rewrite tf_ink2_df_attn_batch with BF16 Tensor
  Cores and 16 balanced chunks

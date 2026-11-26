@@ -1,5 +1,5 @@
 From e97517278bf3c0314b84116d9d926faa20dc9b93 Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 12:36:34 +0000
 Subject: [PATCH] inkling2: lossless BF16 TC unembed with fused softcap, opt-in
  FP8 sampled head, batched drawRows

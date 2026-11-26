@@ -1,0 +1,69 @@
+{
+  "all_exact": true,
+  "cases": [
+    {
+      "prompt": "Explain in two sentences why paged KV caching helps concurrent LLM serving.",
+      "exact": true,
+      "drafted": "Paged KV caching stores key/value tensors in fixed-size blocks, reducing memory fragmentation and wasted space compared with contiguous per-request buffers",
+      "plain": "Paged KV caching stores key/value tensors in fixed-size blocks, reducing memory fragmentation and wasted space compared with contiguous per-request buffers",
+      "drafted_reasoning_len": 454,
+      "plain_reasoning_len": 454,
+      "reasoning_exact": true,
+      "drafted_spec": {
+        "rounds": 45,
+        "drafted": 205,
+        "accepted": 83,
+        "acceptance_rate": 0.40487804878048783,
+        "tokens_per_round": 2.8444444444444446
+      }
+    },
+    {
+      "prompt": "Write a Python function `quicksort(xs)` without comments.",
+      "exact": true,
+      "drafted": "",
+      "plain": "",
+      "drafted_reasoning_len": 622,
+      "plain_reasoning_len": 622,
+      "reasoning_exact": true,
+      "drafted_spec": {
+        "rounds": 44,
+        "drafted": 152,
+        "accepted": 83,
+        "acceptance_rate": 0.5460526315789473,
+        "tokens_per_round": 2.909090909090909
+      }
+    },
+    {
+      "prompt": "List three differences between TCP and UDP.",
+      "exact": true,
+      "drafted": "- TCP is connection-oriented; UDP is connectionless.",
+      "plain": "- TCP is connection-oriented; UDP is connectionless.",
+      "drafted_reasoning_len": 513,
+      "plain_reasoning_len": 513,
+      "reasoning_exact": true,
+      "drafted_spec": {
+        "rounds": 42,
+        "drafted": 161,
+        "accepted": 85,
+        "acceptance_rate": 0.5279503105590062,
+        "tokens_per_round": 3.0476190476190474
+      }
+    },
+    {
+      "prompt": "What is 17 * 23? Answer with just the number.",
+      "exact": true,
+      "drafted": "391",
+      "plain": "391",
+      "drafted_reasoning_len": 96,
+      "plain_reasoning_len": 96,
+      "reasoning_exact": true,
+      "drafted_spec": {
+        "rounds": 9,
+        "drafted": 60,
+        "accepted": 35,
+        "acceptance_rate": 0.5833333333333334,
+        "tokens_per_round": 4.888888888888889
+      }
+    }
+  ]
+}

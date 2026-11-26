@@ -9,7 +9,7 @@ series are licensed under the Apache License, Version 2.0 (see LICENSE).
 1. engine-patches/ (Apache License, Version 2.0)
 ================================================================================
 
-Patch series (0001..0014, listed in engine-patches/series) against
+Patch series (0001..0023, listed in engine-patches/series) against
 ashhart/TensorFold at tag v1.3.5 (tag OID d6b3be891b5fb539a705d9d3b5279008045900e8,
 commit 02b324ae9767253d9911d753d5c835a5070eed1b; engine-patches/BASE).
 
@@ -47,17 +47,27 @@ Ported and adapted onto v1.3.5 loop_engine / cuda_native in engine-patches/:
 
 -- MiaAI-Lab (https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold) -
 Commit 9e3cf20b76e0140bebbbe6ed13f6e3a00e881f12. Licensed under the Apache License, Version 2.0.
-Ported, adapted, or used as design inspiration in engine-patches/:
-- TF_INKLING2_ATTN_FP8=1 FP8 attention projections via cuda.qmmf.Lane (from Mia 0012).
-- TF_INKLING2_PREFILL_TC=1 Blackwell native FP4/MXFP8 tensor-core MoE prefill
-  and 4096-row prompt chunks (from Mia 0015 / 0009 / 0011).
-- Lazy head, CUDA vision, DFlash2 calibrated chances, and server/prompt fixes.
+Ported, adapted, or used as design inspiration in engine-patches/ (patches
+0001/0005/0006/0007/0009/0012/0014/0015/0018):
+- 0001: Server, prompt, and chat compatibility fixes.
+- 0005: Sliding AR deduplication, mix_rows default, and vectorized uint4
+  tf_ink2_rel_table.
+- 0006: Draft FP8/FP4 packing framework and shared fixed-block pricing.
+- 0007: Lazy head and native CUDA vision integration concepts.
+- 0009: 4096-row prompt chunking.
+- 0012: TF_INKLING2_ATTN_FP8=1 FP8 attention projections via cuda.qmmf.Lane.
+- 0014: Slot-agnostic wide decode graph key.
+- 0015: TF_INKLING2_PREFILL_TC=1 Blackwell native FP4/MXFP8 tensor-core MoE
+  prefill.
+- 0018: Batched hold_costs, fused keyed DraftKey/race_u selector, per-step
+  softmax chances, and Landing calibration.
 
 -- tonyd2wild (https://github.com/tonyd2wild/Inkling-2-Mini-NVFP4-DGX-Spark) ---
 Commit 2fe0eb57429013c0ccb1c6535339ae61a9e44d9a.
 MIT License (root and dflash2/), Apache-2.0 (tensorfold/).
-- Referenced for NVFP4 draft-head quantization (fp4Of), calibrated lone-stream
-  chances, and batched DFlash2 kernel layout concepts.
+- Referenced for patch 0018 (shared_guard, calibrated lone-stream CHANCES +
+  Landing, hold_costs), NVFP4 draft-head quantization (fp4Of), and batched
+  DFlash2 kernel layout concepts.
 
 -- sxuff (https://github.com/sxuff/inkling-2-mini-spark) -----------------------
 Commit 35a4fd8344f01148d35c899cc107aab0c537ce3d. Licensed under the Apache License, Version 2.0.
@@ -68,16 +78,27 @@ Jian Chen, Yesheng Liang, Zhijian Liu (z-lab). MIT License.
 - Block-diffusion speculative decoding algorithm implemented by the drafter.
 
 -- sfxnz modifications (Apache License, Version 2.0 in engine-patches/) --------
-Commits and patches 0001..0014:
-- Rebasing and unifying paged FP8 KV, DFlash2, CUDA vision, lazy head, CUDA
-  graphs, and structured output onto TensorFold v1.3.5.
-- Parallelized 512-thread tf_ink2moe_plan, persistent window cost_cache,
-  bounded verify_cache, and multi-threaded checkpoint prefetch.
-- Batched DFlash2 absorb + 5-layer propose across active concurrent streams
-  with graphed absorb/block/selector and dynamic shared draft guard.
-- 8x-tiled gateUp, cp.async prompt_tc, TF_INKLING2_GATE_FP8=1, Blackwell RT
-  verify TC MoE, zero-copy pool prefix_cache with batched tf_ink2_copy_spans,
-  8-warp 2x4 prompt_tc_coop, and tf_ink2moe_up_wide for multi-row verify.
+Commits and patches 0001..0023:
+- 0001..0014 (M1/M2): Rebasing and unifying paged FP8 KV, DFlash2, CUDA vision,
+  lazy head, CUDA graphs, and structured output onto TensorFold v1.3.5;
+  parallelized 512-thread tf_ink2moe_plan, persistent window cost_cache,
+  bounded verify_cache, multi-threaded checkpoint prefetch; batched DFlash2
+  absorb/propose with graphed absorb/block/selector and dynamic shared draft
+  guard; 8x-tiled gateUp, cp.async prompt_tc, TF_INKLING2_GATE_FP8=1,
+  Blackwell RT verify TC MoE, zero-copy pool prefix_cache with batched
+  tf_ink2_copy_spans, 8-warp 2x4 prompt_tc_coop, and tf_ink2moe_up_wide.
+- 0015..0023 (M3): Sliding loop_ar deduplication, batched pass messages,
+  1-pass RMSNorm, tiled small-M gate_down/gate_up, uint4 rel_table;
+  stream-batched multi-stream conv/attn with bucketed global last_pos and
+  slot-agnostic Shape graphs; Nvfp4Experts BLOCK4 repack with fused split-half
+  softcap-SwiGLU and sm_121a TC prefill; lossless BF16 Tensor Core unembed
+  (plus opt-in SAMPLED_FP8_HEAD=1 reusing resident FP8 lazy_head) and batched
+  verify/drawRows; qmmf_group dense fusion (TF_QMMF_HALF_BN=1); uniform
+  batched shared_guard with diverged priceMulti and batched hold_costs;
+  distinct-token Graphs.price() fix, single-launch fused keyed DFlash2
+  selector, and calibrated CHANCES + Landing; wired --drafter-bits 4 NVFP4
+  draft layers; and BF16 Tensor Core tf_ink2_df_attn_batch with 16 balanced
+  chunks eliminating the >=2K context decode cliff.
 
 ================================================================================
 2. Not included (fetched separately by each user under their own terms)

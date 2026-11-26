@@ -1,5 +1,5 @@
 From 64f5c290637bb52d44d5e8f5e2b60d190676bb9f Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 17:57:26 +0000
 Subject: [PATCH] inkling2: add framed schema tool/JSON constraints,
  reasoning_effort, and TF_REASONING_FIELD

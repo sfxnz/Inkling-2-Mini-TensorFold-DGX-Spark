@@ -1,5 +1,5 @@
 From 2e64f8b63e920f40b2cc3769d3bda3f0ad2452e4 Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 22:28:34 +0000
 Subject: [PATCH] inkling2: cooperative TC prefill, wide decode MoE, FP8 bulk
  prompt qmmf, and uncached loop_ar

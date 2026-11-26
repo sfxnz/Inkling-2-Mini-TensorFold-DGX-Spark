@@ -27,7 +27,7 @@
   - Sanity Microbenchmarks (under `flock`):
     - D2D 1 GiB copy BW (R+W, median of 10): **216.62 GB/s** (min 213.15, max 221.87)
     - BF16 GEMM 8192^3 (median of 10): **97.90 TFLOPS** (min 93.60, max 101.20)
-- **dgx-spark-2 (worker, not used for 1x recipe, checked for cluster sanity):**
+- **dgx-spark (worker, not used for 1x recipe, checked for cluster sanity):**
   - GPU idle (0%, 208 MHz), `nvidia-lock-clocks.service` active, load avg `0.08, 0.04, 0.08`, `MemAvailable` 120,849 MiB, swap used 57 MiB.
 
 ## Phase Status
@@ -243,6 +243,116 @@
    - Probed `tools/nll.py capture` + direct `POST /v1/completions` (`prompt_logprobs=1`) on `tf-inkling2:m2-p9` (`best-m2-p9` flags) under `flock`: **unsupported by backend** (`HTTP 400: {"error": {"message": "prompt_logprobs are not supported by this model or backend", "type": "invalid_request_error"}}`).
    - Engine source confirms `zig/src/families/inkling2/loop_backend.zig:498-510` omits `prompt_rows` (defaults `false` in `core/lanes/backend.zig:158`, wired at `native/cuda.zig:488`, refused at `server/fields.zig:366`). Also `first_row` (`logprobs`) is not wired on `inkling2` `vtable`.
    - Stopped cleanly via `./stop.sh` (`docker ps -a` empty).
+
+### M3 Decode Optimization Sprint (`inkling2-v135-m3` from `48f5781`)
+1. **`ctl-m3-00` (fresh M3 baseline control on `tf-inkling2:m2-p9`, `best-config.json`):**
+   - Warm boot `14.47 s` (`loaded in 13.6s`), KV pool `4,699,136` tokens, `min_mem_avail_gib = 9.47 GiB`, `peak_gpu_res_gib = 103.06 GiB`, `peak_proc_anon_gib = 1.85 GiB`, `pswpout_delta = 0`, `alerts = []`, host load `0.09 -> 1.53`.
+   - Outer sampled prose (think off, `runs=6`): `c1 = 42.25` (`50.65 ms/rnd`, `2.133 t/r`, `acc 0.443`), `c4 = 70.47` agg (`18.24/strm`, `70.35 ms/rnd`, `1.276 t/r`, `acc 0.509`).
+   - Inner greedy prose (`runs=6`): `c1 = 46.52` (`52.00 ms/rnd`, `2.398 t/r`, `acc 0.451`), `c4 = 73.19` agg (`18.89/strm`, `67.52 ms/rnd`, `1.265 t/r`, `acc 0.423`).
+   - Inner greedy code (`runs=6`): `c1 = 48.93` (`51.66 ms/rnd`, `2.529 t/r`, `acc 0.473`), `c4 = 82.32` agg (`22.01/strm`, `78.19 ms/rnd`, `1.733 t/r`, `acc 0.470`).
+   - Cold prefill (`runs=1`): `4K = 2,520.8 tok/s` (`1.627s`), `32K = 2,462.2 tok/s` (`13.462s`).
+2. **`cand-m3-p1` (`tf-inkling2:m3-p1`, `edb3883` = `author-loop` Commit 1 `8edc80c` + `environment.zig`, Lever 5: dedup sliding `loop_ar`, `PASS_MESSAGES=1`, `mix_rows` + 1-pass RMSNorm, tiled small-M `gate_down`/`gate_up`, `uint4` `rel_table`):**
+   - Boot `16.49 s` (`loaded in 16.1s`, fresh `window-costs`), KV pool `4,697,600` tokens, `min_mem_avail_gib = 9.41 GiB`, `peak_gpu_res_gib = 103.04 GiB`, `peak_proc_anon_gib = 2.10 GiB`, 7/7 fast gates PASSED (`drafted_exactness` 4/4, `prefix_cache` 8704/8726). (Note: `pswpout_sum=66669` ~260 MiB background host page-cache reclaim after build despite `min_avail=9.41 GiB`.)
+   - Outer sampled prose: `c1 = 43.72` (+3.5%, `49.75 ms/rnd`, `2.188 t/r`), `c4 = 71.83` (+1.9%, `67.66 ms/rnd`, `1.243 t/r`).
+   - Inner greedy prose: `c1 = 47.61` (+2.3%, `50.13 ms/rnd`, `2.387 t/r`), `c4 = 74.65` (+2.0%, `65.96 ms/rnd`, `1.286 t/r`).
+   - Inner greedy code: `c1 = 50.26` (+2.7%, `50.16 ms/rnd`, `2.510 t/r`), `c4 = 77.15` (`66.35 ms/rnd`, `1.354 t/r`).
+   - Cold prefill: `4K = 2,421.1` (`1.687s`), `32K = 2,575.1` (+4.6%, `12.872s`).
+   - Verdict: **ACCEPTED** (lossless `-1.5 to -2.7 ms/rnd` across all cells + 32K prefill win).
+3. **`cand-m3-p2` (`tf-inkling2:m3-p2`, `84f571c` = `author-loop` Commit 2 `f101dc0`, Lever 1: stream-batched `conv`/`attn` + bucketed global `last_pos` + slot-agnostic `Shape` graphs):**
+   - Boot `16.53 s` (`loaded in 15.6s`), KV pool `4,699,648` tokens, `min_mem_avail_gib = 10.22 GiB`, `peak_gpu_res_gib = 102.78 GiB`, `peak_proc_anon_gib = 1.60 GiB`, `pswpout_delta = 0`, `alerts = []`, 7/7 fast gates PASSED.
+   - Outer sampled prose: `c1 = 42.08` (`49.18 ms/rnd`, `2.058 t/r`), `c4 = 78.80` (+9.7% vs `m3-p1`, +11.8% vs `ctl-m3-00`, `62.56 ms/rnd`, `1.271 t/r`).
+   - Inner greedy prose: `c1 = 46.61` (`48.26 ms/rnd`, `2.231 t/r`), `c4 = 83.40` (+11.7% vs `m3-p1`, +14.0% vs `ctl-m3-00`, `59.17 ms/rnd`, `1.278 t/r`).
+   - Inner greedy code: `c1 = 50.43` (`51.11 ms/rnd`, `2.573 t/r`), `c4 = 84.66` (+9.7% vs `m3-p1`, `59.04 ms/rnd`, `1.332 t/r`).
+   - Cold prefill: `4K = 2,442.7` (`1.675s`), `32K = 2,616.5` (new best, +6.3% vs `ctl-m3-00`, `12.582s`).
+   - Verdict: **ACCEPTED** (massive lossless c4 win `-5.1 to -7.3 ms/rnd`, lower anon RAM, `pswpout=0`).
+4. **`cand-m3-p3` (`tf-inkling2:m3-p3`, `1bfc3b4` = `author-moe` Commit 1 `0fcb81a` + `environment.zig`, Lever 7: NVFP4 BLOCK4 repack + fused softcap-SwiGLU + sm_121a TC prefill):**
+   - Boot `16.49 s` (`loaded in 15.5s`), KV pool `4,700,672` tokens (0 B VRAM delta), `min_mem_avail_gib = 9.95 GiB`, `peak_gpu_res_gib = 102.81 GiB`, `peak_proc_anon_gib = 1.64 GiB`, `pswpout_delta = 0`, `alerts = []`, 7/7 fast gates PASSED.
+   - Outer sampled prose: `c1 = 45.56` (+8.3% vs `m3-p2`, `48.08 ms/rnd`), `c4 = 89.92` (+14.1% vs `m3-p2`, +27.6% vs `ctl-m3-00`, `59.73 ms/rnd`, `1.395 t/r`).
+   - Inner greedy prose: `c1 = 47.81` (`43.25 ms/rnd`, `-5.01 ms/rnd`), `c4 = 91.17` (+9.3% vs `m3-p2`, +24.6% vs `ctl-m3-00`, `51.21 ms/rnd`, `1.212 t/r`).
+   - Inner greedy code: `c1 = 65.54` (+30.0% vs `m3-p2`, `52.36 ms/rnd`, `3.413 t/r`), `c4 = 99.36` (+17.4% vs `m3-p2`, `54.34 ms/rnd`, `1.396 t/r`).
+   - Cold prefill: `4K = 2,802.1` (+14.7%, `1.457s`), `32K = 2,878.6` (+10.0%, +16.9% vs `ctl-m3-00`, `11.475s`).
+   - Verdict: **ACCEPTED** (huge win across c1, c4, code, and prefill; 0 VRAM delta, `pswpout=0`).
+5. **`cand-m3-p4` (`tf-inkling2:m3-p4`, `e975172` = `author-loop` Commit 3 `43110c8` + `environment.zig`, Lever 3: lossless BF16 TC unembed + batched/sliced `drawRows` + batched `verify`):**
+   - Boot `16.53 s` (`loaded in 14.8s`), KV pool `4,698,368` tokens, `min_mem_avail_gib = 10.01 GiB`, `peak_gpu_res_gib = 102.83 GiB`, `peak_proc_anon_gib = 1.78 GiB`, `pswpout_delta = 0`, `alerts = []`, 7/7 fast gates PASSED.
+   - Outer sampled prose: `c1 = 44.72` (`48.20 ms/rnd`, `2.170 t/r`), `c4 = 89.31` (`58.38 ms/rnd`, `-1.35 ms/rnd`, `1.347 t/r`).
+   - Inner greedy prose: `c1 = 48.30` (+1.0%, `44.72 ms/rnd`), `c4 = 94.82` (+4.0%, +29.6% vs `ctl-m3-00`, `54.58 ms/rnd`, `1.340 t/r`).
+   - Inner greedy code: `c1 = 67.41` (+2.9%, `54.34 ms/rnd`, `3.644 t/r`), `c4 = 119.57` (+20.3%, +45.3% vs `ctl-m3-00`, `74.35 ms/rnd`, `2.522 t/r`).
+   - Cold prefill: `4K = 2,807.2` (`1.456s`), `32K = 2,854.7` (`11.593s`).
+   - Verdict: **ACCEPTED** (lossless `-1.35 ms/rnd` on sampled c4 + strong greedy prose/code c4 wins).
+6. **`cand-m3-p5` & `cand-m3-p5-fp8tensor` (`tf-inkling2:m3-p5`, `79a07b2` = `author-loop` Commit 4 `4c1607e`, Lever 6 `QMMF_GROUP=1` + Lever 10 `ATTN_FP8_GROUP`):**
+   - `ATTN_FP8_GROUP=1` (7/7 fast gates PASS, `pswpout=0`, `4,700,928` KV): inner greedy prose c1 `52.24` (`47.86 ms/rnd`), c4 `94.74`; outer sampled `44.05 / 88.41` (`48.78 / 57.83 ms/rnd`); **code c1 collapsed `67.41 -> 53.61` (-20.5%, `acc 0.464 -> 0.391`), code c4 `110.50`**; prefill `4K 2,759.9 / 32K 2,814.9`.
+   - Same-binary A/B `ATTN_FP8_GROUP=0` + `QMMF_GROUP=1` (`min_avail=10.66 GiB`, `peak_anon=1.20 GiB`, `pswpout=0`): outer sampled `c1 = 45.52` (`47.73 ms/rnd`), `c4 = 87.49` (`55.34 ms/rnd`, `-3.04 ms/rnd` vs `m3-p4`); inner greedy prose `c1 = 48.19` (`40.89 ms/rnd`, `-3.83 ms/rnd`), `c4 = 94.83` (`52.46 ms/rnd`); inner greedy code `c1 = 66.83` (`acc 0.460`, recovered!), `c4 = 108.45`; cold prefill **`4K = 2,910.8` / `32K = 2,898.1`** (new bests).
+   - Verdict: **`QMMF_GROUP=1` ACCEPTED; `ATTN_FP8_GROUP` REJECTED as default (flipped default to `false` on `inkling2-v135-m3`).**
+7. **`cand-m3-p6` (`tf-inkling2:m3-p6`, `2831881` = `author-dflash` Commit 1 `0d6eced`, Lever 2: `shared_guard` uniform depth + diverged `shared_costs` + batched `hold_costs`):**
+   - 4/4 `shared_guard.zig` unit tests PASS; 7/7 fast gates PASS; cold/fresh-warm boot `18.53 s` (`loaded in 16.7s`, `8 widths, 12 shared, 4 hold, propose 4.34 ms, sampled +2.11 ms`), KV pool `4,701,184` tokens, `min_mem_avail_gib = 10.32 GiB`, `peak_proc_anon_gib = 1.47 GiB`, `pswpout_delta = 0`, `alerts = []`.
+   - Outer sampled prose: `c1 = 44.64` (`47.64 ms/rnd`), **`c4 = 99.98`** (+14.3% vs `m3-p5`, +41.9% vs `ctl-m3-00`, `26.78/strm`, `1.989 t/r`).
+   - Inner greedy prose: `c1 = 49.35` (`42.53 ms/rnd`), **`c4 = 108.89`** (+14.8% vs `m3-p5`, +48.8% vs `ctl-m3-00`, `28.36/strm`, `2.133 t/r`).
+   - Inner greedy code: `c1 = 66.33` (`51.60 ms/rnd`), **`c4 = 129.23`** (+19.2% vs `m3-p5`, +57.0% vs `ctl-m3-00`, `36.27/strm`, `2.734 t/r`).
+   - Cold prefill: `4K = 2,831.2`, `32K = 2,885.7`.
+   - Verdict: **ACCEPTED** (massive c4 breakthrough across prose & code, 100% lossless, `pswpout=0`).
+8. **`cand-m3-p7` & `cand-m3-p7b` (`tf-inkling2:m3-p7b`, `126c969` = `author-dflash` Commit 2 `2a8e2a5` + `loop_graphs.zig:61` distinct-token `Graphs.price()` fix, Lever 4 + 8c):**
+   - Initial `cand-m3-p7` (`21e29b2`, 7/7 fast gates PASS, `4K=2,998.2`, `32K=2,861.2`) exposed a latent `loop_graphs.zig:61` bug (`const zeros = @splat(0)` gave a flat `1..8` cost curve, causing `CHANCES=1` to over-draft `d=6.16` on prose with `acc=0.266` and regress c1 greedy prose `49.35 -> 46.32`).
+   - Fixed `loop_graphs.zig:61` to pass distinct tokens `(1000 + j * 4099) % vocab` + bumped cache key to `inkling2-warm-v4` (`cand-m3-p7b`, `126c969`, `min_avail=10.99 GiB`, `peak_anon=0.90 GiB`, `pswpout=0`, `4,699,904` KV):
+     - Outer sampled prose: **`c1 = 47.07`** (+5.4% vs `m3-p6`, +11.4% vs `ctl-m3-00`, `46.08 ms/rnd`, `acc 0.461`, `ttft 0.147s`), **`c4 = 102.68`** (+2.7% vs `m3-p6`, +45.7% vs `ctl-m3-00`, `2.048 t/r`).
+     - Inner greedy prose: **`c1 = 53.02`** (+7.4% vs `m3-p6`, +14.0% vs `ctl-m3-00`, `43.03 ms/rnd`, `acc 0.491`), `c4 = 104.17` (`63.38 ms/rnd`).
+     - Inner greedy code: **`c1 = 73.33`** (+10.6% vs `m3-p6`, +49.9% vs `ctl-m3-00`, `acc 0.589`), **`c4 = 129.38`**.
+   - Verdict: **ACCEPTED** (huge c1 + c4 win across every workload, 100% lossless, `pswpout=0`).
+9. **`cand-m3-p8` & `cand-m3-p8-v64k` (`tf-inkling2:m3-p8`, `88ae043` = `author-dflash` Commit 3 `5b8ca28`, Lever 8a + 8b: wired `--drafter-bits 4` NVFP4 draft layers + vocab-pruned draft head):**
+   - `cand-m3-p8` (`DRAFTER_BITS=4`, `DRAFT_VOCAB=0`, 7/7 fast gates PASS, `min_avail=10.34 GiB`, `peak_anon=1.50 GiB`, `pswpout=0`): `propose` dropped `4.29 -> 3.58 ms` (-0.71 ms), drafter VRAM dropped `522 -> 333 MB` (`4,711,168` KV tokens, +11K). Outer sampled prose `c1 = 47.56` (`45.41 ms/rnd`, `acc 0.469`), `c4 = 103.18` (`27.37/strm`, `2.138 t/r`); inner greedy prose `c1 = 54.26` (`41.49 ms/rnd`), `c4 = 107.97`; inner greedy code `c1 = 71.78`, `c4 = 128.61`; cold prefill `4K = 2,791.5`, `32K = 2,888.6`.
+   - `cand-m3-p8-v64k` (`TF_INKLING2_DRAFT_VOCAB=65536`): `propose` hit `2.48 ms` (4/4 gates incl. multilingual PASS), but `c1` sampled prose collapsed to `35.18` (`1.106 t/r`), `c4` `79.18` (`1.016 t/r`), `c1` greedy prose `37.35` (`1.174 t/r`). Verified root cause in `tokenizer.json`: Inkling-2-Mini places space-prefixed English/code words at IDs `149,876+` (`" the"=149876`, `" and"=149880`, `" def"=151560`), not `0..65K`.
+   - Verdict: **`DRAFTER_BITS=4` NVFP4 draft layers ACCEPTED; prefix-slice `DRAFT_VOCAB=65536` REJECTED (keep `DRAFT_VOCAB=0`).**
+10. **`cand-m3-p9` (`tf-inkling2:m3-p9`, `dba99e8` = `author-dflash` Commit 4 `db3a66b`, Lever 9: BF16 TC `tf_ink2_df_attn_batch` + 16 balanced chunks):**
+    - 7/7 fast gates PASS, KV pool `4,708,096` tokens, `propose = 3.46 ms` (down from `4.36 ms`).
+    - Outer sampled prose: **`c1 = 47.92`** (+13.4% vs `ctl-m3-00`, `45.50 ms/rnd`), **`c4 = 105.13`** (+49.2% vs `ctl-m3-00`, `27.50/strm`, `2.061 t/r`).
+    - Inner greedy prose: **`c1 = 56.12`** (+20.6% vs `ctl-m3-00`, `43.02 ms/rnd`), **`c4 = 109.22`** (+49.2% vs `ctl-m3-00`, `28.58/strm`).
+    - Inner greedy code: **`c1 = 73.43`** (+50.1% vs `ctl-m3-00`, `46.87 ms/rnd`), **`c4 = 131.66`** (+60.0% vs `ctl-m3-00`, `37.02/strm`).
+    - Cold prefill: `4K = 2,793.8`, `32K = 2,882.1`.
+    - Verdict: **ACCEPTED** (all-time best across every decode cell).
+11. **4K-Context Lever 9 A/B & 6-Knob Same-Binary Sweep on `tf-inkling2:m3-p9` (`dba99e8`, all `pswpout=0`, `min_avail=10.91-11.08 GiB`, `peak_anon=0.87-0.94 GiB`):**
+    - 4K-context decode A/B (`runs=4` median): `m3-p8` `49.76 tok/s` (`50.19 ms/rnd`) -> **`m3-p9` `54.55 tok/s` (+9.6%, `41.67 ms/rnd`, `-8.52 ms/rnd`)**.
+    - `TF_QMMF_HALF_BN=1` (lossless): sampled `49.33 / 106.67`, greedy `55.93 (39.26 ms/r) / 114.57` (+4.9%). **ACCEPTED.**
+    - `TF_INKLING2_MOE_WAVES=1` (lossless): sampled `48.56 / 106.13`, greedy `56.70 (39.44 ms/r) / 114.58` (+4.9%). **ACCEPTED.**
+    - `TF_INKLING2_SAMPLED_FP8_HEAD=1` (reuses FP8 `lazy_head`, 0 VRAM): sampled **`54.18 (39.55 ms/r, acc 0.500) / 109.91`** (+13.1% c1 / +4.5% c4), greedy `55.54 / 112.15`. **ACCEPTED (clearly-labelled opt-in lossy default).**
+    - `TF_INKLING2_WR_FP8=1`: sampled `50.07 / 108.43`, greedy c1 dipped `56.12 -> 54.10`. **KEEP OPT-IN `0`.**
+    - `TF_INKLING2_DRAFT_LAYER_BITS=8`: `propose 4.42` vs `3.46 ms`, greedy c1 `54.92`. **KEEP `4`.**
+    - `TF_INKLING2_SHARED_MAX_ROWS=20`: sampled c4 `104.26`, greedy c1 `54.62`. **KEEP `16`.**
+12. **`cand-m3-combo` (combined final M3 `EXTRA_ENV` on `tf-inkling2:m3-p9`, `dba99e8`):**
+    - `EXTRA_ENV="TF_INKLING2_ATTN_FP8=1 TF_INKLING2_PREFILL_TC=1 TF_INKLING2_GATE_FP8=1 TF_QMMF_HALF_BN=1 TF_INKLING2_MOE_WAVES=1 TF_INKLING2_SAMPLED_FP8_HEAD=1"`.
+    - 7/7 fast gates PASS (`drafted_exactness` 4/4, `prefix_cache` 8704/8726), KV pool `4,719,872` tokens, `min_mem_avail_gib = 10.45 GiB`, `peak_gpu_res_gib = 102.92 GiB`, `peak_proc_anon_gib = 1.53 GiB`, `pswpout_delta = 0`, `alerts = []`.
+    - Outer sampled prose: **`c1 = 54.50`** (+29.0% vs `ctl-m3-00`, `39.16 ms/rnd`, `acc 0.496`, `ttft 0.142s`), **`c4 = 110.70`** (+57.1% vs `ctl-m3-00`, `29.60/strm`, `2.069 t/r`).
+    - Inner greedy prose: **`c1 = 56.04`** (+20.5%, `41.64 ms/rnd`), **`c4 = 111.05`** (+51.7%, `28.81/strm`).
+    - Inner greedy code: **`c1 = 75.88`** (+55.1%, `45.82 ms/rnd`, `acc 0.594`), **`c4 = 132.74`** (+61.2%, `37.31/strm`, `acc 0.596`).
+    - Cold prefill: **`4K = 2,825.9`** (`1.447s`), **`32K = 2,882.7`** (`11.414s`).
+    - Verdict: **ACCEPTED as M3 release candidate (`opt/m3-decode`). Proceeding to clean-room `tf-inkling2:clean-verify-m3` build and full qualification.**
+
+### M3 Clean-Room Qualification Suite (`tf-inkling2:clean-verify-m3` / `tf-inkling2:m3-p9`, `0001..0023` @ engine `dba99e8`, recipe `opt/m3-decode` `7512b92`)
+- **Clean-room build (`profiles/clean-verify-m3-build.log`):** Built from pinned TensorFold `v1.3.5` (`02b324ae`) + `engine-patches/0001..0023` (`PATCH_SHA=38d486856695b5852b9219eb3e20733e99ae390426c707b9b99f03f20f329249`), `tensorfold-native` SHA-256 `12a9c9ca413736ecc618f111c82977f921ab09da87588905901ba43b795565ec`, image SHA-256 `sha256:9ae0ffd1de2b271d9407523b30db4a30b6c918f5c7a349b6cfb1085ba92e0217`. Tagged `tf-inkling2:m3-p9` to exact clean-room image.
+- **KV pool & footprint (`MEMORY_RESERVE_GIB=13.0`, `DRAFTER_BITS=4`):** `18,462` pages x `256` = **`4,726,272` KV tokens** (`74.37 GiB`, 4x 1M context), drafter weights `333.2 MB` (NVFP4, down from `522.3 MB`), target weights `18.89 GB`, `model 102.57 GiB`.
+1. **Startup (`profiles/m3-qual-startup.json`):** cold **`17.052 s`**, warm **`16.796 s`**.
+2. **Multi-length Cold Prefill (`profiles/m3-qual-prefill.json`, `runs=2` median, `cached_tokens == 0` exact):**
+   - `4K = 2,923.7 tok/s` (`+24.6%` vs M2 `2,347.1`)
+   - `8K = 3,012.5 tok/s` (`+19.4%` vs M2 `2,522.7`)
+   - `16K = 3,024.4 tok/s` (`+18.0%` vs M2 `2,563.8`)
+   - `32K = 2,900.3 tok/s` (`+17.7%` vs M2 `2,464.6`)
+   - `65K = 2,627.2 tok/s` (`+15.4%` vs M2 `2,275.9`)
+   - `128K = 2,214.6 tok/s` (`+11.8%` vs M2 `1,980.4`)
+3. **Full Outer Ruler (`profiles/m3-qual-outer.json`, `c=1,2,4,8`, `runs=6` median, 0 errors/0 loops):**
+   - `outer_sampled_prose_nothink`: **`54.48`** (`+28.9%` vs M2 `42.25`, `41.42 ms/rnd`, `ttft 0.143s`) / **`73.49`** / **`114.11`** (`+57.9%` vs M2 `72.26`, `30.04/strm`) / **`151.32`** (`+60.3%` vs M2 `94.40`, `19.99/strm`).
+   - `outer_thinking_on_prose` (`temp=0.7, top_k=20`): **`56.76`** (`+29.7%` vs M2 `43.75`) / `70.25` / **`112.60`** (`+53.0%` vs M2 `73.60`) / **`151.43`** (`+64.5%` vs M2 `92.05`).
+   - `outer_code_nothink`: **`65.55`** (`+35.5%` vs M2 `48.37`) / `79.95` / **`122.05`** (`+52.4%` vs M2 `80.09`) / **`156.75`** (`+59.4%` vs M2 `98.37`).
+   - `outer_greedy_prose_nothink`: **`56.95`** / `73.43` / **`110.70`** / **`154.10`**.
+4. **Full Inner Ruler (`profiles/m3-qual-inner-prose.json`, `profiles/m3-qual-inner-code.json`, `c=1,4,8`, `runs=6` median, 0 errors/0 loops):**
+   - `inner_greedy_prose`: **`56.49`** (`+22.2%` vs M2 `46.21`) / **`113.60`** (`+45.5%` vs M2 `78.05`) / **`151.40`** (`+56.1%` vs M2 `96.97`).
+   - `inner_greedy_code`: **`74.53`** (`+50.3%` vs M2 `49.59`) / **`132.29`** (`+57.5%` vs M2 `83.99`) / **`162.00`** (`+38.8%` vs M2 `116.74`).
+5. **Acceptance Gates, Exactness & Memory (`profiles/m3-qual-gates.json`, `profiles/m3-qual-gates-memwatch.json`, `profiles/m3-plain-vs-drafted.json`):**
+   - **12/12 `gates.py` PASSED**: `load`, `chat`, `reasoning`, `tools`, `structured`, `vision` (png/jpeg/webp), `drafted_exactness` (serial==concurrent 4/4), `multilingual` (ko/ja/zh/ar/emoji, 0 `\ufffd`), `prefix_cache` (`8704/8726`), `needle_256k` (`302.46s`, 2/2 exact), `needle_1m` (`2869.93s`, `1,023,701` & `1,023,881` exact), `soak` (`252.33s`, c4+c8, 0 loops/errors).
+   - **Memwatch (684 samples across 12/12 gates incl. `needle_1m` + `soak`):** `min_mem_avail_gib = 10.45 GiB` (vs `8.36 GiB` in M2), `peak_gpu_res_gib = 102.89 GiB`, `peak_proc_anon_gib = 1.43 GiB` (vs `2.93 GiB` in M2), **`pswpout_delta = 0`**, `alerts = []`.
+   - **Pure `plain` (`DRAFTER="" EXTRA_ARGS="--no-drafts"`, `drafts: off`, `drafted=0`) vs `drafted` (`DFlash2`):** **4/4 exact character-for-character match** (`all_exact: true`, checking both `content` and `reasoning_content`). Also fixed `recipe.conf` line 17 (`DRAFTER=${DRAFTER-incoai/Inkling-2-Mini-DFlash2}`) in `7512b92` so `DRAFTER=""` properly disables the drafter.
+6. **Clean-Verify A/B (`profiles/clean-verify-m3-ab.json`, `A1 m3-p9 / B clean-verify-m3 / A2 m3-p9`, `runs=4`, `pswpout=0`, `min_avail=10.95..11.30 GiB`, `alerts=[]`):**
+   - `A1 (m3-p9)`: sampled `54.57 / 107.71`, greedy `56.24 / 112.62`, prefill `2,969.4 / 2,871.8`.
+   - `B (clean-verify-m3)`: sampled `54.04 / 111.97`, greedy `56.78 / 109.67`, prefill `2,841.0 / 2,893.0`.
+   - `A2 (m3-p9)`: sampled `51.40 / 108.44`, greedy `55.91 / 99.82`, prefill `2,920.0 / 2,860.9`.
+   - Parity confirmed (`B` matches or beats `avg(A1, A2)` across decode and 32K prefill; GPU stopped cleanly via `./stop.sh`, `docker ps -a` empty, `nvidia-smi` `0%`).
 
 
 

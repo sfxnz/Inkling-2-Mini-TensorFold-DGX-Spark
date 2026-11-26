@@ -1,5 +1,5 @@
 From 1bfc3b4dd3aafb6b3d2caa75b919533275e4ecac Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 12:32:19 +0000
 Subject: [PATCH] inkling2: pack NVFP4 experts into BLOCK4 with fused softcap
  SwiGLU and sm_121a TC prefill

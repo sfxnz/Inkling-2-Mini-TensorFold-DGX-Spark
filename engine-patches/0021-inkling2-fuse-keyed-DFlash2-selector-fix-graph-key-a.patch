@@ -1,5 +1,5 @@
 From 126c969c93bec712a34feee5a5b7259305c45b65 Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 12:33:21 +0000
 Subject: [PATCH] inkling2: fuse keyed DFlash2 selector, fix graph key, and
  wire calibrated CHANCES + Landing

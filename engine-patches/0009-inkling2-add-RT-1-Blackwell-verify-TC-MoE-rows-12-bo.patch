@@ -1,5 +1,5 @@
 From a5705079c129d8ccc7aa489e963dbdcd61629776 Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 21:19:32 +0000
 Subject: [PATCH] inkling2: add RT=1 Blackwell verify TC MoE (rows>=12), bound
  verify_cache=64, include flags in warmCacheKey

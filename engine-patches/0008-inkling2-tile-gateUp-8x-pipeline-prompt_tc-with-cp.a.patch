@@ -1,5 +1,5 @@
 From 39257187640e56c7141131618da9e604c8f2ed49 Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 20:32:51 +0000
 Subject: [PATCH] inkling2: tile gateUp 8x, pipeline prompt_tc with cp.async,
  add NVFP4 DFlash2 head and TF_INKLING2_GATE_FP8

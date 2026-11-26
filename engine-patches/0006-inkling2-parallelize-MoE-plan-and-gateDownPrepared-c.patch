@@ -1,5 +1,5 @@
 From 5185b43ef4296083f7c4aff7261a0f7a7467e51e Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 19:27:33 +0000
 Subject: [PATCH] inkling2: parallelize MoE plan and gateDownPrepared, cache
  warm costs, expand verify graph cache, prefetch weights
