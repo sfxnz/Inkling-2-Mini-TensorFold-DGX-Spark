@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reproduce the patched TensorFold image (tf-inkling2:m2-p9) from a clean checkout of BASE + engine-patches/.
+# Reproduce the patched TensorFold image (tf-inkling2:m3-p9) from a clean checkout of BASE + engine-patches/.
 # Serializes Docker builds under /tmp/inference-hillclimb.lock.
 set -euo pipefail
 

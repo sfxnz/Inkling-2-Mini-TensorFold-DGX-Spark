@@ -1,7 +1,7 @@
 From 8fd881f7f44c5185e247e3aaf6d6bd6b92af6438 Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@users.noreply.github.com>
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
 Date: Wed, 25 Nov 2026 17:38:30 +0000
-Subject: [PATCH 04/14] inkling2: enable DFlash2/DSpark drafters, CUDA vision,
+Subject: [PATCH] inkling2: enable DFlash2/DSpark drafters, CUDA vision,
  multi-stream graphs, and paged FP8 KV
 
 ---
@@ -6574,6 +6574,3 @@ index f56ec64..521b811 100644
      .{ .name = "TF_CUDA_POOL_AFTER_WARMUP", .scope = .cuda, .kind = .flag, .blank_default = false, .forms = "0 or 1 (default 0; size an idle Qwen DFlash2 device pool after warm-up)" },
      .{ .name = "TF_QWEN_KV_HOST_GIB", .scope = .cuda, .kind = .u64, .min = 1, .max = std.math.maxInt(u64) >> 30, .forms = "positive whole GiB fitting an unsigned 64-bit byte count; blank or unset: one full KV window" },
      .{ .name = "TF_CACHE_EVICT", .scope = .common, .kind = .word, .words = &.{ "main", "decayed_resume" }, .forms = "main or decayed_resume (default main)" },
--- 
-2.43.0
-

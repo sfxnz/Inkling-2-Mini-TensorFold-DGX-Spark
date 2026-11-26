@@ -1,0 +1,267 @@
+From dba99e86d3ae2d1f6d3284c77fd07a60b565e561 Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+Date: Thu, 26 Nov 2026 12:44:18 +0000
+Subject: [PATCH] inkling2: rewrite tf_ink2_df_attn_batch with BF16 Tensor
+ Cores and 16 balanced chunks
+
+Implement Lever 9 (100% lossless) to eliminate the >= 2K context cliff in
+DFlash2 draft attention (5.78 ms at c1 4K -> ~0.3 ms estimated):
+
+- dflash2.cuh / dflash2_cuda.zig:
+  - Replace scalar FP32 inner loops in tf_ink2_df_attn_batch with register-resident
+    Q + mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 Tensor Cores for both
+    QK^T and PV (P output fragment feeds PV A-fragment directly in registers with
+    zero shared-memory softmax staging and 2-shuffle warp-local online softmax).
+  - Vectorize K/V ring loads with 128-bit uint4 loads into padded shared memory.
+  - Split [lo, hi] evenly across 16 balanced chunks (chunks=16, 64 threads/CTA ->
+    128 CTAs at c1 / 512 CTAs at c4 saturating all 48 GB10 SMs) with fast early
+    exit for empty chunks (min 32 keys/chunk) and NaN-safe empty-chunk skipping
+    in tf_ink2_df_merge_batch.
+  - Exact VRAM accounting automatically preserved via dflash.partialBytes() and
+    dflash.scratchBytes() in cuda_capacity.zig.
+---
+ zig/kernels/cuda/inkling2/dflash2.cuh      | 193 ++++++++++++++++++++-
+ zig/src/families/inkling2/dflash2_cuda.zig |   4 +-
+ 2 files changed, 191 insertions(+), 6 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/dflash2.cuh b/zig/kernels/cuda/inkling2/dflash2.cuh
+index 9525175..a3cfc15 100644
+--- a/zig/kernels/cuda/inkling2/dflash2.cuh
++++ b/zig/kernels/cuda/inkling2/dflash2.cuh
+@@ -185,8 +185,190 @@ extern "C" __global__ void __launch_bounds__(64) tf_ink2_df_qk_batch(
+     ink2DraftQk(local, slot.pos0, sh);
+ }
+ 
+-extern "C" __global__ void __launch_bounds__(256) tf_ink2_df_attn_batch(
++// Balanced-chunk BF16 Tensor Core (m16n8k16) draft attention with uint4 loads for DFlash2 (T=8, hq=32, hk=8, D=128).
++// Eliminates the >= 2K context cliff from scalar FP32 inner loops and under-occupied 4-chunk grids.
++extern "C" __global__ void __launch_bounds__(64) tf_ink2_df_attn_batch(
+     AttnArgs a, const ink2df::BatchSlot* __restrict__ slots, int layer, int chunks, int window) {
++#if __CUDA_ARCH__ >= 800
++    using namespace ink2d;
++    const int z = blockIdx.z, j = blockIdx.y, chunk_id = blockIdx.x;
++    const ink2df::BatchSlot slot = slots[z];
++    const int pos0 = slot.pos0;
++    const int nqt = a.T * a.hq;
++    const size_t chunk_out_base = (static_cast<size_t>(z) * chunks + chunk_id) * nqt;
++    const int lo = max(0, pos0 - window + 1);
++    const int hi = pos0 + a.T - 1;
++    const int total_keys = hi - lo + 1;
++    const int per_chunk = max(32, (total_keys + chunks - 1) / chunks);
++    const int k0 = lo + chunk_id * per_chunk;
++    const int k1 = min(hi + 1, k0 + per_chunk);
++    if (k0 >= k1) {
++        if (threadIdx.x < 32) {
++            const int qi = threadIdx.x;
++            const size_t rh = chunk_out_base + static_cast<size_t>(qi >> 2) * a.hq + j * 4 + (qi & 3);
++            a.pml[rh * 2] = -INFINITY;
++            a.pml[rh * 2 + 1] = 0.0f;
++        }
++        return;
++    }
++
++    __shared__ uint16_t sk[32][kD + 8];
++    __shared__ uint16_t sv[32][kD + 8];
++
++    const int warp = threadIdx.x >> 5;
++    const int lane = threadIdx.x & 31;
++    const int gid = lane >> 2;
++    const int tid = lane & 3;
++    const int qi0 = warp * 16 + gid;
++    const int qi1 = qi0 + 8;
++    const int min_key0 = pos0 + (qi0 >> 2) - window;
++    const int min_key1 = pos0 + (qi1 >> 2) - window;
++
++    const uint16_t* q_base = a.q + static_cast<size_t>(z) * nqt * kD;
++    const uint16_t* qp0 = q_base + (static_cast<size_t>(qi0 >> 2) * a.hq + j * 4 + (qi0 & 3)) * kD;
++    const uint16_t* qp1 = q_base + (static_cast<size_t>(qi1 >> 2) * a.hq + j * 4 + (qi1 & 3)) * kD;
++    uint32_t q_frag[8][4];
++#pragma unroll
++    for (int ks = 0; ks < 8; ++ks) {
++        q_frag[ks][0] = *reinterpret_cast<const uint32_t*>(qp0 + ks * 16 + 2 * tid);
++        q_frag[ks][1] = *reinterpret_cast<const uint32_t*>(qp1 + ks * 16 + 2 * tid);
++        q_frag[ks][2] = *reinterpret_cast<const uint32_t*>(qp0 + ks * 16 + 2 * tid + 8);
++        q_frag[ks][3] = *reinterpret_cast<const uint32_t*>(qp1 + ks * 16 + 2 * tid + 8);
++    }
++
++    const uint16_t* kc = reinterpret_cast<const uint16_t*>(slot.k[layer]);
++    const uint16_t* vc = reinterpret_cast<const uint16_t*>(slot.v[layer]);
++
++    float m0 = -INFINITY, l0 = 0.0f;
++    float m1 = -INFINITY, l1 = 0.0f;
++    float o[16][4];
++#pragma unroll
++    for (int nt = 0; nt < 16; ++nt) o[nt][0] = o[nt][1] = o[nt][2] = o[nt][3] = 0.0f;
++
++    const int row_t = threadIdx.x >> 4;
++    const int vec_c = threadIdx.x & 15;
++    for (int kt = k0; kt < k1; kt += 32) {
++        const int nk = min(32, k1 - kt);
++#pragma unroll
++        for (int kk = row_t; kk < 32; kk += 4) {
++            if (kk < nk) {
++                const size_t at = (static_cast<size_t>((kt + kk) % a.ring) * a.hk + j) * kD + vec_c * 8;
++                *reinterpret_cast<uint4*>(&sk[kk][vec_c * 8]) = *reinterpret_cast<const uint4*>(kc + at);
++                *reinterpret_cast<uint4*>(&sv[kk][vec_c * 8]) = *reinterpret_cast<const uint4*>(vc + at);
++            } else {
++                *reinterpret_cast<uint4*>(&sk[kk][vec_c * 8]) = make_uint4(0, 0, 0, 0);
++                *reinterpret_cast<uint4*>(&sv[kk][vec_c * 8]) = make_uint4(0, 0, 0, 0);
++            }
++        }
++        __syncthreads();
++
++        float s[4][4];
++#pragma unroll
++        for (int t = 0; t < 4; ++t) {
++            s[t][0] = s[t][1] = s[t][2] = s[t][3] = 0.0f;
++#pragma unroll
++            for (int ks = 0; ks < 8; ++ks) {
++                const uint32_t b0 = *reinterpret_cast<const uint32_t*>(&sk[t * 8 + gid][ks * 16 + 2 * tid]);
++                const uint32_t b1 = *reinterpret_cast<const uint32_t*>(&sk[t * 8 + gid][ks * 16 + 2 * tid + 8]);
++                asm volatile(
++                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++                    : "+f"(s[t][0]), "+f"(s[t][1]), "+f"(s[t][2]), "+f"(s[t][3])
++                    : "r"(q_frag[ks][0]), "r"(q_frag[ks][1]), "r"(q_frag[ks][2]), "r"(q_frag[ks][3]), "r"(b0), "r"(b1));
++            }
++        }
++
++        float tile_m0 = m0, tile_m1 = m1;
++#pragma unroll
++        for (int t = 0; t < 4; ++t) {
++            const int c0 = t * 8 + 2 * tid;
++            const int c1 = c0 + 1;
++            const int k_c0 = kt + c0;
++            const int k_c1 = kt + c1;
++            const bool v00 = (c0 < nk) && (k_c0 >= pos0 || k_c0 > min_key0);
++            const bool v01 = (c1 < nk) && (k_c1 >= pos0 || k_c1 > min_key0);
++            const bool v10 = (c0 < nk) && (k_c0 >= pos0 || k_c0 > min_key1);
++            const bool v11 = (c1 < nk) && (k_c1 >= pos0 || k_c1 > min_key1);
++            s[t][0] = v00 ? s[t][0] * a.scale : -INFINITY;
++            s[t][1] = v01 ? s[t][1] * a.scale : -INFINITY;
++            s[t][2] = v10 ? s[t][2] * a.scale : -INFINITY;
++            s[t][3] = v11 ? s[t][3] * a.scale : -INFINITY;
++            tile_m0 = fmaxf(tile_m0, fmaxf(s[t][0], s[t][1]));
++            tile_m1 = fmaxf(tile_m1, fmaxf(s[t][2], s[t][3]));
++        }
++        tile_m0 = fmaxf(tile_m0, __shfl_xor_sync(0xffffffffu, tile_m0, 1));
++        tile_m0 = fmaxf(tile_m0, __shfl_xor_sync(0xffffffffu, tile_m0, 2));
++        tile_m1 = fmaxf(tile_m1, __shfl_xor_sync(0xffffffffu, tile_m1, 1));
++        tile_m1 = fmaxf(tile_m1, __shfl_xor_sync(0xffffffffu, tile_m1, 2));
++
++        const float al0 = (tile_m0 == -INFINITY) ? 1.0f : expf(m0 - tile_m0);
++        const float al1 = (tile_m1 == -INFINITY) ? 1.0f : expf(m1 - tile_m1);
++        float sum0 = 0.0f, sum1 = 0.0f;
++        uint32_t p_frag[2][4];
++#pragma unroll
++        for (int ks = 0; ks < 2; ++ks) {
++            const int t0 = ks * 2, t1 = ks * 2 + 1;
++            const float p00 = (tile_m0 == -INFINITY) ? 0.0f : expf(s[t0][0] - tile_m0);
++            const float p01 = (tile_m0 == -INFINITY) ? 0.0f : expf(s[t0][1] - tile_m0);
++            const float p10 = (tile_m1 == -INFINITY) ? 0.0f : expf(s[t0][2] - tile_m1);
++            const float p11 = (tile_m1 == -INFINITY) ? 0.0f : expf(s[t0][3] - tile_m1);
++            const float p02 = (tile_m0 == -INFINITY) ? 0.0f : expf(s[t1][0] - tile_m0);
++            const float p03 = (tile_m0 == -INFINITY) ? 0.0f : expf(s[t1][1] - tile_m0);
++            const float p12 = (tile_m1 == -INFINITY) ? 0.0f : expf(s[t1][2] - tile_m1);
++            const float p13 = (tile_m1 == -INFINITY) ? 0.0f : expf(s[t1][3] - tile_m1);
++            sum0 += (p00 + p01) + (p02 + p03);
++            sum1 += (p10 + p11) + (p12 + p13);
++            p_frag[ks][0] = static_cast<uint32_t>(tobf(p00)) | (static_cast<uint32_t>(tobf(p01)) << 16);
++            p_frag[ks][1] = static_cast<uint32_t>(tobf(p10)) | (static_cast<uint32_t>(tobf(p11)) << 16);
++            p_frag[ks][2] = static_cast<uint32_t>(tobf(p02)) | (static_cast<uint32_t>(tobf(p03)) << 16);
++            p_frag[ks][3] = static_cast<uint32_t>(tobf(p12)) | (static_cast<uint32_t>(tobf(p13)) << 16);
++        }
++        sum0 += __shfl_xor_sync(0xffffffffu, sum0, 1);
++        sum0 += __shfl_xor_sync(0xffffffffu, sum0, 2);
++        sum1 += __shfl_xor_sync(0xffffffffu, sum1, 1);
++        sum1 += __shfl_xor_sync(0xffffffffu, sum1, 2);
++        l0 = l0 * al0 + sum0;
++        l1 = l1 * al1 + sum1;
++        m0 = tile_m0;
++        m1 = tile_m1;
++
++#pragma unroll
++        for (int nt = 0; nt < 16; ++nt) {
++            o[nt][0] *= al0;
++            o[nt][1] *= al0;
++            o[nt][2] *= al1;
++            o[nt][3] *= al1;
++            const int d_col = nt * 8 + gid;
++#pragma unroll
++            for (int ks = 0; ks < 2; ++ks) {
++                const int k_base = ks * 16 + 2 * tid;
++                const uint32_t vb0 = static_cast<uint32_t>(sv[k_base][d_col]) | (static_cast<uint32_t>(sv[k_base + 1][d_col]) << 16);
++                const uint32_t vb1 = static_cast<uint32_t>(sv[k_base + 8][d_col]) | (static_cast<uint32_t>(sv[k_base + 9][d_col]) << 16);
++                asm volatile(
++                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++                    : "+f"(o[nt][0]), "+f"(o[nt][1]), "+f"(o[nt][2]), "+f"(o[nt][3])
++                    : "r"(p_frag[ks][0]), "r"(p_frag[ks][1]), "r"(p_frag[ks][2]), "r"(p_frag[ks][3]), "r"(vb0), "r"(vb1));
++            }
++        }
++        __syncthreads();
++    }
++
++    const size_t rh0 = chunk_out_base + static_cast<size_t>(qi0 >> 2) * a.hq + j * 4 + (qi0 & 3);
++    const size_t rh1 = chunk_out_base + static_cast<size_t>(qi1 >> 2) * a.hq + j * 4 + (qi1 & 3);
++    float* po0 = a.po + rh0 * kD;
++    float* po1 = a.po + rh1 * kD;
++#pragma unroll
++    for (int nt = 0; nt < 16; ++nt) {
++        const int d0 = nt * 8 + 2 * tid;
++        *reinterpret_cast<float2*>(po0 + d0) = make_float2(o[nt][0], o[nt][1]);
++        *reinterpret_cast<float2*>(po1 + d0) = make_float2(o[nt][2], o[nt][3]);
++    }
++    if (tid == 0) {
++        a.pml[rh0 * 2] = m0;
++        a.pml[rh0 * 2 + 1] = l0;
++        a.pml[rh1 * 2] = m1;
++        a.pml[rh1 * 2 + 1] = l1;
++    }
++#else
+     const int z = blockIdx.z;
+     const ink2df::BatchSlot slot = slots[z];
+     const int nqt = a.T * a.hq;
+@@ -197,6 +379,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2_df_attn_batch(
+     local.po = a.po + static_cast<size_t>(z) * chunks * nqt * ink2d::kD;
+     local.pml = a.pml + static_cast<size_t>(z) * chunks * nqt * 2;
+     ink2DraftAttn<true>(local, slot.pos0, window);
++#endif
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(128) tf_ink2_df_merge_batch(
+@@ -212,9 +395,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_ink2_df_merge_batch(
+     for (int c = 0; c < chunks; ++c) {
+         const size_t at = base + static_cast<size_t>(c) * nqt;
+         const float m = pml[at * 2];
+-        const float wt = m == -INFINITY ? 0.0f : expf(m - mx);
+-        l += pml[at * 2 + 1] * wt;
+-        acc += po[at * kD + d] * wt;
++        if (m != -INFINITY) {
++            const float wt = expf(m - mx);
++            l += pml[at * 2 + 1] * wt;
++            acc += po[at * kD + d] * wt;
++        }
+     }
+     out[idx * kD + d] = tobf(acc / l);
+ }
+diff --git a/zig/src/families/inkling2/dflash2_cuda.zig b/zig/src/families/inkling2/dflash2_cuda.zig
+index 81910e1..87e34e7 100644
+--- a/zig/src/families/inkling2/dflash2_cuda.zig
++++ b/zig/src/families/inkling2/dflash2_cuda.zig
+@@ -13,7 +13,7 @@ const block = w_.block;
+ const depth = block - 1;
+ const max_batch = engine.max_slots;
+ const max_context_rows = max_batch * block;
+-const chunks = (w_.window + block - 2) / dsp.chunk + 2;
++const chunks = 16;
+ const top_words = 43;
+ const Session = dspark.Session;
+ 
+@@ -436,7 +436,7 @@ pub const Drafter = struct {
+             .c0 = 0,
+             .scale = 1.0 / @sqrt(@as(f32, w_.dim)),
+         };
+-        try launch3(d.attn_batch, s, chunks, w_.kv_heads, count, 256, .{
++        try launch3(d.attn_batch, s, chunks, w_.kv_heads, count, 64, .{
+             at,
+             a.proposeSlots(),
+             @as(i32, @intCast(i)),

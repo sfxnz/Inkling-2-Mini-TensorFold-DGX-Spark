@@ -1,0 +1,812 @@
+From 126c969c93bec712a34feee5a5b7259305c45b65 Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+Date: Thu, 26 Nov 2026 12:33:21 +0000
+Subject: [PATCH] inkling2: fuse keyed DFlash2 selector, fix graph key, and
+ wire calibrated CHANCES + Landing
+
+Implement Lever 4 and Lever 8c (100% lossless) for Inkling-2-Mini DFlash2:
+
+- dflash2.cuh / dflash2_cuda.zig:
+  - Fuse multi-step candidate selection + bit-exact keyed Gumbel race
+    (race_u matching sample.cu bit-for-bit, toggled via TF_INKLING2_DRAFT_KEYED=1)
+    + per-step softmax probability output into a single tf_ink2_df_select[8]_batch
+    launch per round (replacing up to 7 + 7*count serial launches).
+  - Fix the latent b.ns graph-key bug by collapsing DFlash2 proposal graph Key
+    to { k, sum_n } (slot- and rule-independent).
+  - Remove redundant cuMemcpyDtoDAsync(a.mixed, a.matrix) in absorb / absorbBatch
+    by writing addNorm directly into a.normed.
+  - Coalesce staging HtoD uploads (AbsorbStage, ProposeStage) and walk+chances
+    DtoH download (ProposeOut) into 1 DMA each.
+
+- dspark_cuda.zig / loop_backend.zig / loop_drafter.zig:
+  - Store held_chances and anchor on Session (host-only, zero GPU VRAM change).
+  - Wire Backend.vtable.probabilities + lanes.draft_tree.Landing online
+    calibration (separate greedy and sampled tables) behind
+    TF_INKLING2_DFLASH2_CHANCES=1 (lone streams by default; optional
+    TF_INKLING2_DFLASH2_CHANCES_SHARED=1 and TF_INKLING2_DRAFT_CONFIDENCE).
+  - Export draft_probabilities, granted_depth, and draft_slack=7 in facts() so
+    c1 adapts verify width dynamically (1-2 rows on uncertain tokens, 5-7 rows
+    on confident spans) while c4 retains shared_guard uniform depth control.
+
+Credits (for NOTICE, Apache-2.0 / MIT):
+- Fused keyed DraftKey selector, softmax chances, and Landing calibration
+  adapted from MiaAI-Lab (commit 9e3cf20b, patch 0018-mini-dflash2-drafter.patch)
+  and tonyd2wild (commit 2fe0eb57, patch 0018).
+---
+ zig/kernels/cuda/inkling2/dflash2.cuh      | 130 ++++++++++---
+ zig/src/families/inkling2/dflash2_cuda.zig | 213 ++++++++++-----------
+ zig/src/families/inkling2/dspark_cuda.zig  |   9 +
+ zig/src/families/inkling2/loop_backend.zig |  68 ++++++-
+ zig/src/families/inkling2/loop_drafter.zig |   2 +-
+ zig/src/families/inkling2/loop_graphs.zig  |   6 +-
+ zig/src/platform/environment.zig           |   3 +
+ 7 files changed, 296 insertions(+), 135 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/dflash2.cuh b/zig/kernels/cuda/inkling2/dflash2.cuh
+index 175da14..9aa4fc2 100644
+--- a/zig/kernels/cuda/inkling2/dflash2.cuh
++++ b/zig/kernels/cuda/inkling2/dflash2.cuh
+@@ -4,6 +4,30 @@ constexpr int kTop = 16;
+ constexpr int kRank = 256;
+ constexpr int kLogprobTop = 20;
+ constexpr int kLogprobWords = 3 + 2 * kLogprobTop;
++
++// A sampled stream's draft key (matching sample.cu and MiaAI-Lab patch 0018).
++struct DraftKey {
++    unsigned long long seed;
++    float inv_t;  // 0: greedy draft selection
++    unsigned pos;
++};
++
++__device__ __forceinline__ unsigned long long kmix(unsigned long long x) {
++    x ^= x >> 30;
++    x *= 0xBF58476D1CE4E5B9ull;
++    x ^= x >> 27;
++    x *= 0x94D049BB133111EBull;
++    return x ^ (x >> 31);
++}
++
++// sample.cu's keyed uniform (mix, uniform, race_uniform), bit for bit.
++__device__ __forceinline__ float race_u(unsigned long long seed, unsigned pos, unsigned id) {
++    unsigned long long x = kmix(seed + 0x9E3779B97F4A7C15ull);
++    x = kmix(x ^ (static_cast<unsigned long long>(pos) * 0xD1B54A32D192ED03ull));
++    x = kmix(x ^ static_cast<unsigned long long>(id));
++    const float u = (static_cast<float>(static_cast<unsigned>(x >> 40)) + 0.5f) * (1.0f / 16777216.0f);
++    return fminf(u, __uint_as_float(0x3F7FFFFFu));
++}
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(64) tf_ink2_df_qk(QkArgs a, const int* position) {
+@@ -203,45 +227,107 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2_df_gather_hidden(
+     for (int c = threadIdx.x; c < width; c += blockDim.x) d[c] = s[c];
+ }
+ 
++// Fused multi-step candidate selector with bit-exact keyed Gumbel race and per-step softmax chances.
++// Adapted from MiaAI-Lab patch 0018 (commit 9e3cf20b). Copyright 2026 MiaAI-Lab.
+ template <typename Book>
+ __device__ __forceinline__ void ink2DfSelectBatch(
+     const unsigned* __restrict__ top, const uint16_t* __restrict__ projected,
+     const Book* __restrict__ predecessor, const Book* __restrict__ successor,
+     const float* __restrict__ prev_scales, const float* __restrict__ next_scales,
+-    unsigned* __restrict__ walk, long long* __restrict__ ids, uint16_t* __restrict__ logits,
++    unsigned* __restrict__ walk, float* __restrict__ chances,
++    const ink2df::DraftKey* __restrict__ keys,
+     const int* __restrict__ row_offs, const int* __restrict__ stream_ns,
+-    int step, int vocab, float cap) {
++    int vocab, float cap) {
++    using namespace ink2d;
+     using namespace ink2df;
++    __shared__ float scores[kTop];
++    __shared__ unsigned cand_ids[kTop];
++    __shared__ unsigned parent_s;
+     const int s = blockIdx.x;
+-    if (step >= stream_ns[s]) return;
+-    ink2DfSelect(
+-        top + static_cast<size_t>(row_offs[s]) * kLogprobWords,
+-        projected + static_cast<size_t>(row_offs[s]) * kRank,
+-        predecessor,
+-        successor,
+-        prev_scales,
+-        next_scales,
+-        walk + static_cast<size_t>(s) * 8,
+-        ids + static_cast<size_t>(s) * kTop,
+-        logits + static_cast<size_t>(s) * kTop,
+-        step,
+-        vocab,
+-        cap);
++    const int n = stream_ns[s];
++    const int row0 = row_offs[s];
++    const int candidate = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    unsigned* my_walk = walk + static_cast<size_t>(s) * 8;
++    float* my_chances = chances + static_cast<size_t>(s) * 7;
++    const DraftKey key = keys != nullptr ? keys[s] : DraftKey{0, 0.0f, 0};
++    if (threadIdx.x == 0) parent_s = my_walk[0];
++    __syncthreads();
++    for (int step = 0; step < n; ++step) {
++        const unsigned* entries = top + static_cast<size_t>(row0 + step) * kLogprobWords;
++        const unsigned id = entries[2 + candidate];
++        const unsigned parent = parent_s;
++        float score = -INFINITY;
++        if (id < static_cast<unsigned>(vocab) && parent < static_cast<unsigned>(vocab)) {
++            float correction = 0.0f;
++            const float ps = sizeof(Book) == 1 ? prev_scales[parent] : 1.0f;
++            const float ss = sizeof(Book) == 1 ? next_scales[id] : 1.0f;
++            for (int j = lane; j < kRank; j += 32) {
++                const Book a = predecessor[static_cast<size_t>(parent) * kRank + j];
++                const Book b = successor[static_cast<size_t>(id) * kRank + j];
++                const float p = sizeof(Book) == 1 ? bfr(fp8Value(a) * ps) : bf(a);
++                const float q = sizeof(Book) == 1 ? bfr(fp8Value(b) * ss) : bf(b);
++                const float h = bf(projected[static_cast<size_t>(row0 + step) * kRank + j]);
++                correction += bfr(p * h) * q;
++            }
++            correction = tf_common::warp_sum(correction);
++            const float unary = __uint_as_float(entries[2 + kLogprobTop + candidate]);
++            const float corrected = bfr(unary + bfr(correction));
++            score = bfr(cap * tanhf(corrected / cap));
++        }
++        if (lane == 0) {
++            scores[candidate] = score;
++            cand_ids[candidate] = id;
++        }
++        __syncthreads();
++        if (threadIdx.x == 0) {
++            float mx = -INFINITY;
++            for (int i = 0; i < kTop; ++i)
++                if (isfinite(scores[i]) && scores[i] > mx) mx = scores[i];
++            int best = 0;
++            if (key.inv_t > 0.0f) {
++                float best_v = -INFINITY;
++                for (int i = 0; i < kTop; ++i) {
++                    if (!isfinite(scores[i])) continue;
++                    const float u = race_u(key.seed, key.pos + static_cast<unsigned>(step), cand_ids[i]);
++                    const float v = scores[i] * key.inv_t - logf(-logf(u));
++                    if (v > best_v) {
++                        best_v = v;
++                        best = i;
++                    }
++                }
++            } else {
++                for (int i = 1; i < kTop; ++i)
++                    if (scores[i] > scores[best]) best = i;
++            }
++            float prob = 0.0f;
++            if (isfinite(scores[best]) && isfinite(mx)) {
++                float z = 0.0f;
++                for (int i = 0; i < kTop; ++i)
++                    if (isfinite(scores[i])) z += expf(scores[i] - mx);
++                if (z > 0.0f) prob = expf(scores[best] - mx) / z;
++            }
++            const unsigned picked = isfinite(scores[best]) ? cand_ids[best] : static_cast<unsigned>(vocab);
++            my_walk[step + 1] = picked;
++            my_chances[step] = prob;
++            parent_s = picked;
++        }
++        __syncthreads();
++    }
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(512) tf_ink2_df_select_batch(
+     const unsigned* __restrict__ top, const uint16_t* __restrict__ projected,
+     const uint16_t* __restrict__ predecessor, const uint16_t* __restrict__ successor,
+-    unsigned* __restrict__ walk, long long* __restrict__ ids, uint16_t* __restrict__ logits,
+-    const int* __restrict__ row_offs, const int* __restrict__ stream_ns, int step, int vocab, float cap) {
+-    ink2DfSelectBatch(top, projected, predecessor, successor, nullptr, nullptr, walk, ids, logits, row_offs, stream_ns, step, vocab, cap);
++    unsigned* __restrict__ walk, float* __restrict__ chances, const ink2df::DraftKey* __restrict__ keys,
++    const int* __restrict__ row_offs, const int* __restrict__ stream_ns, int vocab, float cap) {
++    ink2DfSelectBatch(top, projected, predecessor, successor, nullptr, nullptr, walk, chances, keys, row_offs, stream_ns, vocab, cap);
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(512) tf_ink2_df_select8_batch(
+     const unsigned* __restrict__ top, const uint16_t* __restrict__ projected,
+     const uint8_t* __restrict__ predecessor, const uint8_t* __restrict__ successor,
+     const float* __restrict__ prev_scales, const float* __restrict__ next_scales,
+-    unsigned* __restrict__ walk, long long* __restrict__ ids, uint16_t* __restrict__ logits,
+-    const int* __restrict__ row_offs, const int* __restrict__ stream_ns, int step, int vocab, float cap) {
+-    ink2DfSelectBatch(top, projected, predecessor, successor, prev_scales, next_scales, walk, ids, logits, row_offs, stream_ns, step, vocab, cap);
++    unsigned* __restrict__ walk, float* __restrict__ chances, const ink2df::DraftKey* __restrict__ keys,
++    const int* __restrict__ row_offs, const int* __restrict__ stream_ns, int vocab, float cap) {
++    ink2DfSelectBatch(top, projected, predecessor, successor, prev_scales, next_scales, walk, chances, keys, row_offs, stream_ns, vocab, cap);
+ }
+diff --git a/zig/src/families/inkling2/dflash2_cuda.zig b/zig/src/families/inkling2/dflash2_cuda.zig
+index b6dc16e..e9064e4 100644
+--- a/zig/src/families/inkling2/dflash2_cuda.zig
++++ b/zig/src/families/inkling2/dflash2_cuda.zig
+@@ -24,6 +24,13 @@ pub const BatchSlot = extern struct {
+     _pad: i32 = 0,
+ };
+ 
++/// Sampled stream draft key matching dflash2.cuh's ink2df::DraftKey and sample.cu bit-for-bit.
++pub const DraftKey = extern struct {
++    seed: u64 = 0,
++    inv_t: f32 = 0,
++    pos: u32 = 0,
++};
++
+ pub const AbsorbItem = struct {
+     slot: usize,
+     from: u64,
+@@ -35,7 +42,27 @@ pub const ProposeItem = struct {
+     slot: usize,
+     pending: u32,
+     n: usize,
+-    rule: ?u64,
++    key: DraftKey = .{},
++};
++
++const AbsorbStage = extern struct {
++    batch_slots: [max_batch]BatchSlot,
++    row_slot: [max_context_rows]i32,
++    row_local: [max_context_rows]i32,
++};
++
++const ProposeOut = extern struct {
++    walk: [max_batch * block]u32,
++    chances: [max_batch * depth]f32,
++};
++
++const ProposeStage = extern struct {
++    out: ProposeOut,
++    batch_slots: [max_batch]BatchSlot,
++    keys: [max_batch]DraftKey,
++    row_map: [max_batch * depth]i32,
++    row_offs: [max_batch]i32,
++    stream_ns: [max_batch]i32,
+ };
+ 
+ fn ring(context: usize) usize {
+@@ -72,16 +99,8 @@ const Scratch = struct {
+     top_parts: u64,
+     top: u64,
+     projected: u64,
+-    ids: u64,
+-    scores: u64,
+-    position: u64,
+-    walk: u64,
+-    batch_slots: u64,
+-    row_slot: u64,
+-    row_local: u64,
+-    row_map: u64,
+-    row_offs: u64,
+-    stream_ns: u64,
++    absorb_stage: u64,
++    propose_stage: u64,
+ 
+     fn layout(base: u64, rows_per_pass: usize, total: *usize) Scratch {
+         const b = 2;
+@@ -108,16 +127,8 @@ const Scratch = struct {
+             .top_parts = cuda.sample.Draws.topkPartsBytes(w_.vocab, w_.top_k, draft_rows),
+             .top = draft_rows * top_words * 4,
+             .projected = draft_rows * w_.rank * b,
+-            .ids = max_batch * w_.top_k * @sizeOf(i64),
+-            .scores = max_batch * w_.top_k * b,
+-            .position = max_batch * 4,
+-            .walk = block_rows * 4,
+-            .batch_slots = max_batch * @sizeOf(BatchSlot),
+-            .row_slot = max_batch * engine.window_rows * 4,
+-            .row_local = max_batch * engine.window_rows * 4,
+-            .row_map = draft_rows * 4,
+-            .row_offs = max_batch * 4,
+-            .stream_ns = max_batch * 4,
++            .absorb_stage = @sizeOf(AbsorbStage),
++            .propose_stage = @sizeOf(ProposeStage),
+         };
+         var s: Scratch = undefined;
+         inline for (@typeInfo(@TypeOf(sizes)).@"struct".field_names) |field| {
+@@ -126,6 +137,37 @@ const Scratch = struct {
+         }
+         return s;
+     }
++
++    inline fn absorbSlots(s: Scratch) u64 {
++        return s.absorb_stage + @offsetOf(AbsorbStage, "batch_slots");
++    }
++    inline fn absorbRowSlot(s: Scratch) u64 {
++        return s.absorb_stage + @offsetOf(AbsorbStage, "row_slot");
++    }
++    inline fn absorbRowLocal(s: Scratch) u64 {
++        return s.absorb_stage + @offsetOf(AbsorbStage, "row_local");
++    }
++    inline fn walk(s: Scratch) u64 {
++        return s.propose_stage + @offsetOf(ProposeOut, "walk");
++    }
++    inline fn chances(s: Scratch) u64 {
++        return s.propose_stage + @offsetOf(ProposeOut, "chances");
++    }
++    inline fn proposeSlots(s: Scratch) u64 {
++        return s.propose_stage + @offsetOf(ProposeStage, "batch_slots");
++    }
++    inline fn keys(s: Scratch) u64 {
++        return s.propose_stage + @offsetOf(ProposeStage, "keys");
++    }
++    inline fn rowMap(s: Scratch) u64 {
++        return s.propose_stage + @offsetOf(ProposeStage, "row_map");
++    }
++    inline fn rowOffs(s: Scratch) u64 {
++        return s.propose_stage + @offsetOf(ProposeStage, "row_offs");
++    }
++    inline fn streamNs(s: Scratch) u64 {
++        return s.propose_stage + @offsetOf(ProposeStage, "stream_ns");
++    }
+ };
+ 
+ pub fn scratchBytes(rows_per_pass: usize) usize {
+@@ -138,10 +180,7 @@ const AbsorbKey = usize;
+ const AbsorbGraphCache = cuda.graph_cache.Cache(AbsorbKey);
+ const Key = struct {
+     k: u8,
+-    max_n: u8,
+     sum_n: u16,
+-    sampled_mask: u16,
+-    rules: [max_batch]u64 = @splat(0),
+ };
+ const GraphCache = cuda.graph_cache.Cache(Key);
+ 
+@@ -265,12 +304,10 @@ pub const Drafter = struct {
+         while (offset < rows) {
+             const n: usize = @min(rows - offset, max_context_rows);
+             try d.project(k, s, from + offset * dspark.tap_stride, d.w.fuse, a.mixed, n, h, 4 * h);
+-            try dsp.addNorm(&d.k, s, a.mixed, 0, 0, 0, d.w.fuse_norm, a.matrix, n, h, w_.eps);
+-            // Keep the normalized fusion outside the projection output, which is reused by every layer.
+-            try d.memory.d.check(d.memory.d.api.cuMemcpyDtoDAsync_v2(a.mixed, a.matrix, n * h * 2, s.handle), "cuMemcpyDtoDAsync");
++            try dsp.addNorm(&d.k, s, a.mixed, 0, 0, 0, d.w.fuse_norm, a.normed, n, h, w_.eps);
+             for (d.w.layer, 0..) |l, i| {
+                 const kv_weights = l.qkv.afterRows(w_.q, h);
+-                try d.project(k, s, a.mixed, kv_weights, a.matrix, n, 2 * w_.kv, h);
++                try d.project(k, s, a.normed, kv_weights, a.matrix, n, 2 * w_.kv, h);
+                 try dsp.qk(&d.k, s, d.qkArgs(session, i, 0, pos + offset), n);
+             }
+             offset += n;
+@@ -290,17 +327,16 @@ pub const Drafter = struct {
+             const a = d.scratch;
+             const n = b.rows;
+             try d.project(b.k, s, a.batch_taps, d.w.fuse, a.mixed, n, h, 4 * h);
+-            try dsp.addNorm(&d.k, s, a.mixed, 0, 0, 0, d.w.fuse_norm, a.matrix, n, h, w_.eps);
+-            try d.memory.d.check(d.memory.d.api.cuMemcpyDtoDAsync_v2(a.mixed, a.matrix, n * h * 2, s.handle), "cuMemcpyDtoDAsync");
++            try dsp.addNorm(&d.k, s, a.mixed, 0, 0, 0, d.w.fuse_norm, a.normed, n, h, w_.eps);
+             for (d.w.layer, 0..) |l, i| {
+                 const kv_weights = l.qkv.afterRows(w_.q, h);
+-                try d.project(b.k, s, a.mixed, kv_weights, a.matrix, n, 2 * w_.kv, h);
++                try d.project(b.k, s, a.normed, kv_weights, a.matrix, n, 2 * w_.kv, h);
+                 try launch(d.qk_batch_absorb, s, n, w_.kv_heads, 64, .{
+                     a.matrix,
+                     l.k_norm,
+-                    a.batch_slots,
+-                    a.row_slot,
+-                    a.row_local,
++                    a.absorbSlots(),
++                    a.absorbRowSlot(),
++                    a.absorbRowLocal(),
+                     @as(i32, @intCast(i)),
+                     @as(i64, 2 * w_.kv),
+                     @as(i32, w_.kv_heads),
+@@ -334,15 +370,13 @@ pub const Drafter = struct {
+             return;
+         }
+         const a = d.scratch;
+-        var batch_slots: [max_batch]BatchSlot = undefined;
+-        var row_slot: [max_context_rows]i32 = undefined;
+-        var row_local: [max_context_rows]i32 = undefined;
++        var stage: AbsorbStage = undefined;
+         var out_row: usize = 0;
+         for (items, 0..) |it, idx| {
+             const session = &d.sessions[it.slot];
+             const skip = it.rows -| (w_.window - 1);
+             const take = it.rows - skip;
+-            batch_slots[idx] = .{ .k = session.k, .v = session.v, .pos0 = @intCast(it.pos + skip) };
++            stage.batch_slots[idx] = .{ .k = session.k, .v = session.v, .pos0 = @intCast(it.pos + skip) };
+             if (take > 0) {
+                 try d.memory.d.check(d.memory.d.api.cuMemcpyDtoDAsync_v2(
+                     a.batch_taps + out_row * dspark.tap_stride,
+@@ -351,15 +385,13 @@ pub const Drafter = struct {
+                     s.handle,
+                 ), "cuMemcpyDtoDAsync");
+                 for (0..take) |j| {
+-                    row_slot[out_row + j] = @intCast(idx);
+-                    row_local[out_row + j] = @intCast(j);
++                    stage.row_slot[out_row + j] = @intCast(idx);
++                    stage.row_local[out_row + j] = @intCast(j);
+                 }
+                 out_row += take;
+             }
+         }
+-        try cuda.copy_source.enqueue(d.memory.d, a.batch_slots, std.mem.sliceAsBytes(batch_slots[0..items.len]), s);
+-        try cuda.copy_source.enqueue(d.memory.d, a.row_slot, std.mem.sliceAsBytes(row_slot[0..out_row]), s);
+-        try cuda.copy_source.enqueue(d.memory.d, a.row_local, std.mem.sliceAsBytes(row_local[0..out_row]), s);
++        try cuda.copy_source.enqueue(d.memory.d, a.absorb_stage, std.mem.asBytes(&stage), s);
+         var body: AbsorbBody = .{ .d = d, .k = k, .rows = out_row };
+         if (d.absorb_graphs) |*g| {
+             _ = try g.run(out_row, s, 0, .{ .ctx = &body, .run = AbsorbBody.run });
+@@ -386,7 +418,7 @@ pub const Drafter = struct {
+         const a = d.scratch;
+         try launch3(d.qk_batch, s, block, w_.heads + w_.kv_heads, count, 64, .{
+             d.qkArgs(&d.sessions[0], i, w_.heads, 0),
+-            a.batch_slots,
++            a.proposeSlots(),
+             @as(i32, @intCast(i)),
+         });
+         const at: dsp.AttnArgs = .{
+@@ -406,7 +438,7 @@ pub const Drafter = struct {
+         };
+         try launch3(d.attn_batch, s, chunks, w_.kv_heads, count, 256, .{
+             at,
+-            a.batch_slots,
++            a.proposeSlots(),
+             @as(i32, @intCast(i)),
+             @as(i32, chunks),
+             @as(i32, w_.window),
+@@ -433,7 +465,7 @@ pub const Drafter = struct {
+         try launch(d.conv_batch, s, rows, 1, 256, .{ a.conv, a.delta, cv.base, a.residual, @as(i32, h), @as(i32, 1) });
+     }
+ 
+-    fn selectStepBatch(d: *const Drafter, s: cuda.Stream, count: usize, step: usize, vocab: usize) !void {
++    fn selectAllBatch(d: *const Drafter, s: cuda.Stream, count: usize, vocab: usize) !void {
+         const a = d.scratch;
+         const p = d.w.predecessor;
+         const q = d.w.successor;
+@@ -443,8 +475,7 @@ pub const Drafter = struct {
+             args.add(p.scales);
+             args.add(q.scales);
+         }
+-        for ([_]u64{ a.walk, a.ids, a.scores, a.row_offs, a.stream_ns }) |ptr| args.add(ptr);
+-        args.add(@as(i32, @intCast(step)));
++        for ([_]u64{ a.walk(), a.chances(), a.keys(), a.rowOffs(), a.streamNs() }) |ptr| args.add(ptr);
+         args.add(@as(i32, @intCast(vocab)));
+         args.add(@as(f32, w_.cap));
+         try cuda.launch.launch(d.select_batch, .{ .grid = .{ .x = @intCast(count) }, .block = .{ .x = 512 } }, s, &args);
+@@ -455,7 +486,6 @@ pub const Drafter = struct {
+         m: *const engine.Model,
+         k: *const engine.Kernels,
+         key: Key,
+-        ns: [max_batch]u8 = @splat(0),
+ 
+         fn run(ptr: *anyopaque, s: cuda.Stream) anyerror!void {
+             const b: *Block = @ptrCast(@alignCast(ptr));
+@@ -465,7 +495,7 @@ pub const Drafter = struct {
+             const target = b.m.w.c.text;
+             const count: usize = b.key.k;
+             const total_rows = count * block;
+-            try ops.embed(k, s, a.walk, total_rows, b.m.w.embed, b.m.w.embed_norm, a.residual, h, target.eps);
++            try ops.embed(k, s, a.walk(), total_rows, b.m.w.embed, b.m.w.embed_norm, a.residual, h, target.eps);
+             for (d.w.layer, 0..) |l, i| {
+                 try d.convInputBatch(k, s, l.input_norm, l.attention_conv, total_rows);
+                 try d.project(k, s, a.conv, l.qkv, a.matrix, total_rows, w_.q + 2 * w_.kv, h);
+@@ -480,7 +510,7 @@ pub const Drafter = struct {
+             try dsp.addNorm(&d.k, s, a.residual, 0, 0, 0, d.w.norm, a.normed, total_rows, h, w_.eps);
+             const sum_n: usize = b.key.sum_n;
+             const head_x = if (count == 1) a.normed + h * 2 else blk: {
+-                try launch(d.gather_hidden, s, sum_n, 1, 256, .{ a.normed, a.head_in, a.row_map, @as(i32, h) });
++                try launch(d.gather_hidden, s, sum_n, 1, 256, .{ a.normed, a.head_in, a.rowMap(), @as(i32, h) });
+                 break :blk a.head_in;
+             };
+             const v = target.unpadded_vocab;
+@@ -498,28 +528,7 @@ pub const Drafter = struct {
+             }
+             try b.k.draws.topkRows(s, a.logits, v, w_.top_k, a.top_parts, a.top, sum_n);
+             try d.project(k, s, head_x, d.w.project, a.projected, sum_n, w_.rank, h);
+-            const max_n: usize = b.key.max_n;
+-            for (0..max_n) |step| {
+-                try d.selectStepBatch(s, count, step, v);
+-                if (b.key.sampled_mask != 0) {
+-                    for (0..count) |idx| {
+-                        if ((b.key.sampled_mask & (@as(u16, 1) << @intCast(idx))) == 0) continue;
+-                        if (step >= b.ns[idx]) continue;
+-                        try b.k.draws.draw(
+-                            s,
+-                            a.scores + idx * w_.top_k * 2,
+-                            w_.top_k,
+-                            b.key.rules[idx],
+-                            a.position + idx * 4,
+-                            step,
+-                            a.walk + (idx * block + step + 1) * 4,
+-                            1,
+-                            a.ids + idx * w_.top_k * @sizeOf(i64),
+-                            null,
+-                        );
+-                    }
+-                }
+-            }
++            try d.selectAllBatch(s, count, v);
+         }
+     };
+ 
+@@ -527,58 +536,48 @@ pub const Drafter = struct {
+         if (items.len == 0) return;
+         if (items.len > max_batch) return error.BadDraftBatch;
+         const a = d.scratch;
+-        var walk_host: [max_batch * block]u32 = @splat(w_.mask);
+-        var pos_host: [max_batch]i32 = undefined;
+-        var batch_slots: [max_batch]BatchSlot = undefined;
+-        var row_map: [max_batch * depth]i32 = undefined;
+-        var row_offs: [max_batch]i32 = undefined;
+-        var stream_ns: [max_batch]i32 = undefined;
+-        var key: Key = .{ .k = @intCast(items.len), .max_n = 0, .sum_n = 0, .sampled_mask = 0 };
+-        var ns: [max_batch]u8 = @splat(0);
++        var stage: ProposeStage = .{
++            .out = .{ .walk = @splat(w_.mask), .chances = @splat(0) },
++            .batch_slots = @splat(.{}),
++            .keys = @splat(.{}),
++            .row_map = @splat(0),
++            .row_offs = @splat(0),
++            .stream_ns = @splat(0),
++        };
+         var sum_n: usize = 0;
+-        var max_n: usize = 0;
+         for (items, 0..) |it, idx| {
+             const session = &d.sessions[it.slot];
+             if (it.n == 0 or it.n > depth or session.end == 0) return error.BadDraftDepth;
+-            walk_host[idx * block] = it.pending;
+-            pos_host[idx] = @intCast(session.end);
+-            batch_slots[idx] = .{ .k = session.k, .v = session.v, .pos0 = pos_host[idx] };
+-            row_offs[idx] = @intCast(sum_n);
+-            stream_ns[idx] = @intCast(it.n);
+-            ns[idx] = @intCast(it.n);
+-            for (0..it.n) |step| row_map[sum_n + step] = @intCast(idx * block + 1 + step);
++            stage.out.walk[idx * block] = it.pending;
++            stage.batch_slots[idx] = .{ .k = session.k, .v = session.v, .pos0 = @intCast(session.end) };
++            stage.keys[idx] = it.key;
++            stage.row_offs[idx] = @intCast(sum_n);
++            stage.stream_ns[idx] = @intCast(it.n);
++            for (0..it.n) |step| stage.row_map[sum_n + step] = @intCast(idx * block + 1 + step);
+             sum_n += it.n;
+-            max_n = @max(max_n, it.n);
+-            if (it.rule) |r| {
+-                key.sampled_mask |= (@as(u16, 1) << @intCast(idx));
+-                key.rules[idx] = r;
+-            }
+         }
+-        key.max_n = @intCast(max_n);
+-        key.sum_n = @intCast(sum_n);
+-        try cuda.copy_source.enqueue(d.memory.d, a.walk, std.mem.sliceAsBytes(walk_host[0 .. items.len * block]), s);
+-        try cuda.copy_source.enqueue(d.memory.d, a.position, std.mem.sliceAsBytes(pos_host[0..items.len]), s);
+-        try cuda.copy_source.enqueue(d.memory.d, a.batch_slots, std.mem.sliceAsBytes(batch_slots[0..items.len]), s);
+-        try cuda.copy_source.enqueue(d.memory.d, a.row_map, std.mem.sliceAsBytes(row_map[0..sum_n]), s);
+-        try cuda.copy_source.enqueue(d.memory.d, a.row_offs, std.mem.sliceAsBytes(row_offs[0..items.len]), s);
+-        try cuda.copy_source.enqueue(d.memory.d, a.stream_ns, std.mem.sliceAsBytes(stream_ns[0..items.len]), s);
+-        var b: Block = .{ .d = d, .m = m, .k = k, .key = key, .ns = ns };
++        const key: Key = .{ .k = @intCast(items.len), .sum_n = @intCast(sum_n) };
++        try cuda.copy_source.enqueue(d.memory.d, a.propose_stage, std.mem.asBytes(&stage), s);
++        var b: Block = .{ .d = d, .m = m, .k = k, .key = key };
+         if (d.graphs) |*g| {
+             _ = try g.run(key, s, 0, .{ .ctx = &b, .run = Block.run });
+         } else try Block.run(&b, s);
+         try s.synchronize();
+-        try d.memory.download(@intCast(a.walk - d.memory.ptr), std.mem.sliceAsBytes(walk_host[0 .. items.len * block]));
++        var out: ProposeOut = undefined;
++        try d.memory.download(@intCast(a.propose_stage - d.memory.ptr), std.mem.asBytes(&out));
+         for (items, 0..) |it, idx| {
+             const session = &d.sessions[it.slot];
+             const dst = session.held[0..it.n];
+-            @memcpy(dst, walk_host[idx * block + 1 ..][0..it.n]);
++            @memcpy(dst, out.walk[idx * block + 1 ..][0..it.n]);
+             for (dst) |t| if (t >= m.w.c.text.unpadded_vocab) return error.DraftNonfinite;
++            @memcpy(session.held_chances[0..it.n], out.chances[idx * depth ..][0..it.n]);
+             session.held_len = it.n;
++            session.anchor = session.end;
+         }
+     }
+ 
+-    pub fn propose(d: *Drafter, slot: usize, m: *const engine.Model, k: *const engine.Kernels, s: cuda.Stream, pending: u32, n: usize, rule: ?u64) !void {
+-        const items = [_]ProposeItem{.{ .slot = slot, .pending = pending, .n = n, .rule = rule }};
++    pub fn propose(d: *Drafter, slot: usize, m: *const engine.Model, k: *const engine.Kernels, s: cuda.Stream, pending: u32, n: usize, key: DraftKey) !void {
++        const items = [_]ProposeItem{.{ .slot = slot, .pending = pending, .n = n, .key = key }};
+         return d.proposeBatch(m, k, s, &items);
+     }
+ };
+diff --git a/zig/src/families/inkling2/dspark_cuda.zig b/zig/src/families/inkling2/dspark_cuda.zig
+index d93ef71..b5f0418 100644
+--- a/zig/src/families/inkling2/dspark_cuda.zig
++++ b/zig/src/families/inkling2/dspark_cuda.zig
+@@ -93,7 +93,9 @@ pub const Session = struct {
+     end: usize = 0,
+     pending: usize = 0,
+     held: [depth]u32 = undefined,
++    held_chances: [depth]f32 = @splat(0),
+     held_len: usize = 0,
++    anchor: usize = 0,
+ 
+     pub const newest_bytes = h * 2;
+     pub const tap_bytes = 2 * engine.window_rows * tap_stride;
+@@ -155,10 +157,17 @@ pub const Session = struct {
+         try writer.span(session.newest, newest_bytes);
+     }
+ 
++    pub fn own(session: *const Session, i: usize) f64 {
++        const p: f64 = @floatCast(session.held_chances[i]);
++        return @log(@max(p, 1e-6));
++    }
++
+     pub fn reset(session: *Session) void {
+         session.end = 0;
+         session.pending = 0;
+         session.held_len = 0;
++        session.held_chances = @splat(0);
++        session.anchor = 0;
+     }
+ };
+ 
+diff --git a/zig/src/families/inkling2/loop_backend.zig b/zig/src/families/inkling2/loop_backend.zig
+index 8c3607c..55931c2 100644
+--- a/zig/src/families/inkling2/loop_backend.zig
++++ b/zig/src/families/inkling2/loop_backend.zig
+@@ -82,6 +82,11 @@ pub const Backend = struct {
+     sampled_head_delta_ms: f64 = 0,
+     priced_width: usize = 0,
+     shared_block_streams: u32 = 0,
++    landing: lanes.draft_tree.Landing = .{},
++    chances_on: bool = true,
++    chances_shared: bool = false,
++    draft_confidence: ?f64 = null,
++    draft_keyed: bool = true,
+ 
+     const extra_shared_widths = [_]u32{ 12, 16, 24, 32 };
+     const hold_stream_counts = [_]u32{ 1, 2, 4, 8 };
+@@ -160,7 +165,7 @@ pub const Backend = struct {
+         var tc_buf: [24]u8 = undefined;
+         const tc_str = std.fmt.bufPrint(&tc_buf, "tc{d}_v{d}", .{ modelopt.prefillTcMode(), modelopt.verifyTcRows() }) catch return null;
+         const parts = [_][]const u8{
+-            "inkling2-warm-v3",
++            "inkling2-warm-v4",
+             cap_str,
+             @tagName(d.*),
+             draft_mode,
+@@ -218,7 +223,7 @@ pub const Backend = struct {
+         for (0..streams) |slot| {
+             d.session(slot).reset();
+             absorbs[slot] = .{ .slot = slot, .from = b.m.taps.?.buffer, .pos = 0, .rows = 1 };
+-            proposes[slot] = .{ .slot = slot, .pending = @intCast((1000 + slot * 4099) % vocab), .n = 2, .rule = null };
++            proposes[slot] = .{ .slot = slot, .pending = @intCast((1000 + slot * 4099) % vocab), .n = 2, .key = .{} };
+         }
+         try d.absorbBatch(&b.k.glue, b.s, absorbs[0..streams]);
+         try b.s.synchronize();
+@@ -256,6 +261,10 @@ pub const Backend = struct {
+         if (d.* == .dflash2) {
+             const shared = if (try b.d.currentCapability() == 121) @as(u32, engine.max_slots) else 2;
+             b.shared_block_streams = try environment.read(u32, "TF_INKLING2_DFLASH2_SHARED", shared);
++            b.chances_on = try environment.read(bool, "TF_INKLING2_DFLASH2_CHANCES", true);
++            b.chances_shared = try environment.read(bool, "TF_INKLING2_DFLASH2_CHANCES_SHARED", false);
++            b.draft_keyed = try environment.read(bool, "TF_INKLING2_DRAFT_KEYED", true);
++            b.draft_confidence = readConfidence();
+         }
+         d.enableGraphs(b.gpa);
+         b.m.taps = d.taps();
+@@ -457,9 +466,17 @@ pub const Backend = struct {
+         return .{ .ptr = b, .vtable = &vtable, .draft_grammar = false };
+     }
+ 
++    fn readConfidence() ?f64 {
++        const raw = std.c.getenv("TF_INKLING2_DRAFT_CONFIDENCE") orelse return null;
++        const v = std.fmt.parseFloat(f64, std.mem.span(raw)) catch return null;
++        if (!std.math.isFinite(v)) return null;
++        return std.math.clamp(v, 0.0, 1.0);
++    }
++
+     pub fn facts(b: *const Backend) lanes.Model {
+         const drafting = b.drafter != null;
+         const is_dflash2 = if (b.drafter) |d| d == .dflash2 else false;
++        const use_chances = is_dflash2 and b.chances_on;
+         return .{
+             .fixed_draft_block = is_dflash2,
+             .exact_width = window_rows,
+@@ -468,6 +485,10 @@ pub const Backend = struct {
+             .speculate = drafting,
+             .speculate_early = false,
+             .drafts = if (drafting) @intCast(b.priced_width -| 1) else 0,
++            .draft_probabilities = use_chances and b.draft_confidence == null,
++            .granted_depth = use_chances and b.draft_confidence == null,
++            .draft_slack = if (use_chances) dspark.depth else 0,
++            .draft_confidence = if (use_chances) b.draft_confidence else null,
+             .plain_guard = drafting,
+             .protect_shared_streams = drafting,
+             .shared_block_streams = b.shared_block_streams,
+@@ -684,10 +705,37 @@ pub const Backend = struct {
+         .verify = verify,
+         .keep = keep,
+         .draft = draft,
++        .probabilities = probabilities,
+         .release = release,
+         .reports_fill = true,
+     };
+ 
++    fn activeStreams(b: *const Backend) usize {
++        var n: usize = 0;
++        for (b.streams) |s| n += @intFromBool(s != null);
++        return n;
++    }
++
++    /// Calibrated cumulative landing probabilities for held DFlash2 drafts (lone streams by default).
++    /// Adapted from MiaAI-Lab patch 0018 (commit 9e3cf20b). Copyright 2026 MiaAI-Lab.
++    fn probabilities(ptr: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
++        const b = self(ptr);
++        if (!b.chances_on) return false;
++        const d = if (b.drafter) |*x| x else return false;
++        if (d.* != .dflash2) return false;
++        if (b.activeStreams() > 1 and !b.chances_shared) return false;
++        const slot = b.slotOf(s) orelse return false;
++        const session = d.session(slot);
++        if (out.len > session.held_len) return false;
++        var run: f64 = 1.0;
++        const sampled = s.sampling != null;
++        for (out, 0..) |*o, i| {
++            run *= b.landing.chance(sampled, session.own(i));
++            o.* = run;
++        }
++        return true;
++    }
++
+     fn prefill(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+         const b = self(ptr);
+         const l = try b.opening(s);
+@@ -871,6 +919,14 @@ pub const Backend = struct {
+                         return error.PositionMismatch;
+                     for (rows, 0..) |row, i| if (row != i) return error.ChainsOnly;
+                     if (session.end + session.pending != l.base) return error.DraftContextGap;
++                    if (b.chances_on and session.held_len > 0 and r.start == session.anchor) {
++                        const kept = @min(rows.len - 1, session.held_len);
++                        const sampled = r.stream.sampling != null;
++                        for (0..kept) |i| b.landing.observe(sampled, session.own(i), true);
++                        if (kept < session.held_len and r.follow.len > kept) {
++                            b.landing.observe(sampled, session.own(kept), r.follow[kept] == session.held[kept]);
++                        }
++                    }
+                     session.pending += rows.len;
+                     session.held_len = 0;
+                     if (r.depth != 0 or session.pending >= window_rows or !r.stream.shared_round) {
+@@ -885,7 +941,13 @@ pub const Backend = struct {
+                     break :blk try b.feed(r.first orelse return error.NoFirstToken);
+                 };
+                 if (r.depth != 0) {
+-                    propose_items[n_propose] = .{ .slot = slot, .pending = pending, .n = r.depth, .rule = if (l.sampled) l.rule else null };
++                    const key: dflash.DraftKey = if (b.draft_keyed) blk_k: {
++                        if (cuda.sample.ruleFor(r.stream.sampling)) |sr| {
++                            break :blk_k .{ .seed = sr.seed, .inv_t = sr.inv_t, .pos = @intCast(r.position) };
++                        }
++                        break :blk_k .{};
++                    } else .{};
++                    propose_items[n_propose] = .{ .slot = slot, .pending = pending, .n = r.depth, .key = key };
+                     n_propose += 1;
+                 }
+             }
+diff --git a/zig/src/families/inkling2/loop_drafter.zig b/zig/src/families/inkling2/loop_drafter.zig
+index bf9c353..04ff346 100644
+--- a/zig/src/families/inkling2/loop_drafter.zig
++++ b/zig/src/families/inkling2/loop_drafter.zig
+@@ -182,7 +182,7 @@ pub const Drafter = union(Kind) {
+     pub fn propose(d: *Drafter, slot: usize, m: *const engine.Model, k: *const engine.Kernels, s: cuda.Stream, pending: u32, n: usize, rule: ?u64) !void {
+         switch (d.*) {
+             .dspark => |*x| try x.propose(&x.sessions[slot], m, k, s, pending, n, rule),
+-            .dflash2 => |*x| try x.propose(slot, m, k, s, pending, n, rule),
++            .dflash2 => |*x| try x.propose(slot, m, k, s, pending, n, .{}),
+         }
+     }
+ };
+diff --git a/zig/src/families/inkling2/loop_graphs.zig b/zig/src/families/inkling2/loop_graphs.zig
+index ccb0e85..c77724d 100644
+--- a/zig/src/families/inkling2/loop_graphs.zig
++++ b/zig/src/families/inkling2/loop_graphs.zig
+@@ -58,8 +58,10 @@ pub const Graphs = struct {
+ 
+     /// Price warmed greedy verify graphs so the first request does not learn their capture time.
+     pub fn price(g: *Graphs, m: *engine.Model, k: *engine.Kernels, s: cuda.Stream, io: std.Io, width: usize, lazy: bool, samples: usize) !f64 {
+-        const zeros: [engine.window_rows]u32 = @splat(0);
+-        const chain: round.Chain = .{ .slot = m.slot, .position = 0, .tokens = zeros[0..width], .record = width > 1 };
++        const vocab: usize = m.w.c.text.unpadded_vocab;
++        var toks: [engine.window_rows]u32 = undefined;
++        for (&toks, 0..) |*t, j| t.* = @intCast((1000 + j * 4099) % vocab);
++        const chain: round.Chain = .{ .slot = m.slot, .position = 0, .tokens = toks[0..width], .record = width > 1 };
+         try g.warm(m, k, s, width, chain.record, lazy);
+         var times: [3]f64 = undefined;
+         for (times[0..samples]) |*ms| {
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 419d507..41386d1 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -77,6 +77,9 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_INKLING2_DFLASH2_DIR", .scope = .cuda, .kind = .path, .forms = "a local Mini DFlash2 checkpoint directory" },
+     .{ .name = "TF_INKLING2_DFLASH2_TRIM_SELECTOR", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (default 1 stores only Mini's real tokenizer rows in both DFlash2 selector codebooks)" },
+     .{ .name = "TF_INKLING2_DFLASH2_SHARED", .scope = .cuda, .kind = .u32, .only = &.{ 0, 2, 4 }, .forms = "0, 2 or 4 (maximum active streams for Mini DFlash2 shared pricing; default 4 on GB10, 2 elsewhere)" },
++    .{ .name = "TF_INKLING2_DFLASH2_CHANCES", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 enables calibrated per-step Landing draft depth on Mini lone streams; default 1)" },
++    .{ .name = "TF_INKLING2_DFLASH2_CHANCES_SHARED", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 enables per-step Landing draft chances on Mini shared rounds; default 0)" },
++    .{ .name = "TF_INKLING2_DRAFT_KEYED", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 runs bit-exact keyed Gumbel race inside fused tf_ink2_df_select8_batch; default 1)" },
+     .{ .name = "TF_CUDA_POOL_AFTER_WARMUP", .scope = .cuda, .kind = .flag, .blank_default = false, .forms = "0 or 1 (default 0; size an idle Qwen DFlash2 device pool after warm-up)" },
+     .{ .name = "TF_QWEN_KV_HOST_GIB", .scope = .cuda, .kind = .u64, .min = 1, .max = std.math.maxInt(u64) >> 30, .forms = "positive whole GiB fitting an unsigned 64-bit byte count; blank or unset: one full KV window" },
+     .{ .name = "TF_CACHE_EVICT", .scope = .common, .kind = .word, .words = &.{ "main", "decayed_resume" }, .forms = "main or decayed_resume (default main)" },

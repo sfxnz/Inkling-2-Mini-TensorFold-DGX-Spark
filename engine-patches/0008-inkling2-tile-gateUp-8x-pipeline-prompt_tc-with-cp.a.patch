@@ -1,8 +1,8 @@
 From 39257187640e56c7141131618da9e604c8f2ed49 Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@users.noreply.github.com>
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
 Date: Wed, 25 Nov 2026 20:32:51 +0000
-Subject: [PATCH 08/14] inkling2: tile gateUp 8x, pipeline prompt_tc with
- cp.async, add NVFP4 DFlash2 head and TF_INKLING2_GATE_FP8
+Subject: [PATCH] inkling2: tile gateUp 8x, pipeline prompt_tc with cp.async,
+ add NVFP4 DFlash2 head and TF_INKLING2_GATE_FP8
 
 ---
  zig/kernels/cuda/inkling2/decode_head.cuh    | 50 ++++++++++++
@@ -549,6 +549,3 @@ index d146832..7295f3b 100644
          "TF_INKLING2_DFLASH2_DIR",
          "TF_INKLING2_DFLASH2_TRIM_SELECTOR",
          "TF_INKLING2_DFLASH2_SHARED",
--- 
-2.43.0
-

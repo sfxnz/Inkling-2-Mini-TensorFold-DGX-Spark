@@ -1,0 +1,1112 @@
+From 1bfc3b4dd3aafb6b3d2caa75b919533275e4ecac Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+Date: Thu, 26 Nov 2026 12:32:19 +0000
+Subject: [PATCH] inkling2: pack NVFP4 experts into BLOCK4 with fused softcap
+ SwiGLU and sm_121a TC prefill
+
+Load-time GPU repack of Inkling 2 Mini NVFP4 routed experts (L0-19, 44/48 visits) into Nvfp4Experts BLOCK4 layout directly inside the existing weight arena (zero extra steady-state VRAM; reusable 382 MB staging buffer freed before KV pool sizing).
+
+Decode/verify (M=1..31):
+- Fused gate+up+softcap-SwiGLU in nvfp4_experts.cu (GB10 sm_121 register-ring ld_nc + fp4pair + post-MMA group scale + post-K outer scale), eliminating b.gate, b.up, and 44 tf_ink2moe_act launches per round.
+- Split-half 16-col/warp (tf_nvfp4_softcap_half) for low-row saturation at c1 and HW-scheduled 32-col/warp CTAs (or equal-waves via TF_INKLING2_MOE_WAVES=1) for c4 diverged M=4..31, with bit-exact BF16 intermediate rounding (negative up_cap) and ascending-expert combine.
+- Selectable via TF_INKLING2_FAST_MOE=1 (default ON; 0 keeps raw ModelOpt path for same-binary A/B).
+
+Prefill (M>=32):
+- Build nvfp4_experts with arch_specific=true (sm_121a) and wire fused tf_nvfp4_prompt_softcap_tc_q + tf_nvfp4_prompt_down_tc_q (4-stage 46 KiB SMEM pipeline, mma.mxf4nvf4, dynamic NT row-tile skipping) directly over packed BLOCK4 weights, plus BF16 MMA fallback (tf_nvfp4_prompt_softcap + tf_nvfp4_prompt_down) when PREFILL_TC=0.
+
+Credits:
+- Adapted from MiaAI-Lab (commit 9e3cf20b, patches/0007-mini-expert-split.patch and patches/0015-mini-prefill-tc.patch, Apache-2.0/MIT) and upstream TensorFold PR #4441 Nvfp4Experts integration.
+---
+ zig/build/cuda_kernels.zig                 |   2 +-
+ zig/kernels/cuda/experts.cuh               |  17 +-
+ zig/kernels/cuda/inkling2/modelopt.cu      |  37 ++
+ zig/kernels/cuda/nvfp4_experts.cu          | 345 ++++++++++++++++--
+ zig/src/families/inkling2/loop_weights.zig |   4 +-
+ zig/src/families/inkling2/modelopt.zig     | 389 +++++++++++++++++++++
+ zig/src/platform/environment.zig           |   3 +
+ 7 files changed, 765 insertions(+), 32 deletions(-)
+
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 6174694..f0ead8c 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -99,7 +99,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "exlr8_dense", .flags = &.{ "-O3", "--fmad=false" } }, // ours: EXLR8 dense matrices by row, the Metal order
+     .{ .name = "nvfp4_experts_tile", .flags = &.{"-O3"}, .min_sm = 80 },
+     .{ .name = "experts_bf16", .flags = &.{"-O3"} }, // ours: grouped bf16 experts on the plan, mma fragment blocks
+-    .{ .name = "nvfp4_experts", .flags = &.{"-O3"} }, // nvfp4/experts.cu's device code, the NVFP4 expert kernels
++    .{ .name = "nvfp4_experts", .flags = &.{"-O3"}, .arch_specific = true }, // nvfp4/experts.cu's device code, the NVFP4 expert kernels
+     .{ .name = "nvfp4_experts32", .flags = &.{"-O3"} }, // ours: GLM's routed experts at block 32 with csf0 scales
+     .{ .name = "rank_sum", .flags = &.{"-O3"} }, // ours: the rank-order sum of a reduce-scatter (rank_scatter.zig)
+     .{ .name = "lane_gemv", .flags = &.{"-O3"} }, // ours: qmm_group's arithmetic, a column tile's K slices in one CTA
+diff --git a/zig/kernels/cuda/experts.cuh b/zig/kernels/cuda/experts.cuh
+index 73621f8..4444399 100644
+--- a/zig/kernels/cuda/experts.cuh
++++ b/zig/kernels/cuda/experts.cuh
+@@ -53,6 +53,13 @@ __device__ __forceinline__ float swiglu(float g, float u, float limit) {
+   return bf(gv / (1.f + expf(-gv))) * uv;
+ }
+ 
++__device__ __forceinline__ float softcap_swiglu(float g, float u, float gate_cap, float up_cap) {
++  const float gc = gate_cap * tanhf(g / gate_cap);
++  const float uc = up_cap * tanhf(u / up_cap);
++  const float sig = 1.f / (1.f + expf(-g));
++  return gc * sig * uc;
++}
++
+ // a < 0 ? 0 : a, not fmaxf, which would make a NaN sum 0.
+ __device__ __forceinline__ float relu2(float a) {
+   const float b = bf(a), u = b < 0.f ? 0.f : b;
+@@ -61,7 +68,7 @@ __device__ __forceinline__ float relu2(float a) {
+ 
+ template <int EPI, int M, int RT>
+ __device__ __forceinline__ void epilogue(const float (&acc)[M][RT][NTW][4], int r, void* out, int N, int col0, int pr0,
+-                                         int pr1, bool v0, bool v1, float limit) {
++                                         int pr1, bool v0, bool v1, float limit, float limit2 = 0.f) {
+ #pragma unroll
+   for (int h = 0; h < 2; ++h) {
+     if (!(h ? v1 : v0)) continue;
+@@ -80,6 +87,14 @@ __device__ __forceinline__ void epilogue(const float (&acc)[M][RT][NTW][4], int
+         } else if constexpr (EPI == 2) {
+           o0 = swiglu(a0, acc[M - 1][r][j][2 * h], limit);
+           o1 = swiglu(a1, acc[M - 1][r][j][2 * h + 1], limit);
++        } else if constexpr (EPI == 4) {
++          if (limit2 < 0.f) {
++            o0 = softcap_swiglu(bf(a0), bf(acc[M - 1][r][j][2 * h]), limit, -limit2);
++            o1 = softcap_swiglu(bf(a1), bf(acc[M - 1][r][j][2 * h + 1]), limit, -limit2);
++          } else {
++            o0 = softcap_swiglu(a0, acc[M - 1][r][j][2 * h], limit, limit2);
++            o1 = softcap_swiglu(a1, acc[M - 1][r][j][2 * h + 1], limit, limit2);
++          }
+         } else {
+           o0 = a0;
+           o1 = a1;
+diff --git a/zig/kernels/cuda/inkling2/modelopt.cu b/zig/kernels/cuda/inkling2/modelopt.cu
+index 20cb289..3e21283 100644
+--- a/zig/kernels/cuda/inkling2/modelopt.cu
++++ b/zig/kernels/cuda/inkling2/modelopt.cu
+@@ -865,3 +865,40 @@ extern "C" __global__ void __launch_bounds__(128)
+                                void* __restrict__ out, int N, int skip) {
+   ink2o::prompt_tc_body<1, 1>(xc, xsc, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip);
+ }
++
++// Pack row-major ModelOpt NVFP4 codes [E][n_src][k/2] and scales [E][n_src][k/16] with row stride
++// (row = row0 + row_step * col) into Nvfp4Experts BLOCK4 layout [E][n_out/32][k/32][parts][144] at part m.
++extern "C" __global__ void __launch_bounds__(144)
++    tf_ink2_pack_fp4_experts(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
++                             uint32_t* __restrict__ out, int n_src, int n_out, int k, int row0, int row_step,
++                             int parts, int m) {
++  const int g = blockIdx.x, cb = blockIdx.y, e = blockIdx.z, w = threadIdx.x, kg = k / 32;
++  uint32_t* dst = out + (((static_cast<long long>(e) * (n_out / 32) + cb) * kg + g) * parts + m) * 144;
++  const uint8_t* ce = codes + static_cast<long long>(e) * n_src * (k / 2);
++  const uint8_t* se = scales + static_cast<long long>(e) * n_src * (k / 16);
++  if (w < 128) {
++    const int gq = w / 16, t = (w / 4) % 4, j = w % 4;
++    const long long row = row0 + static_cast<long long>(row_step) * (cb * 32 + j * 8 + gq);
++    uint32_t word = 0;
++#pragma unroll
++    for (int h = 0; h < 2; ++h)
++#pragma unroll
++      for (int q = 0; q < 4; ++q) {
++        const int input = g * 32 + h * 16 + t * 4 + q;
++        const uint8_t byte = ce[row * (k / 2) + input / 2];
++        const uint32_t nib = (input & 1) ? byte >> 4 : byte & 0xF;
++        word |= nib << (4 * (2 * h + q / 2 + 4 * (q % 2)));
++      }
++    dst[w] = word;
++  } else {
++    uint32_t word = 0;
++#pragma unroll
++    for (int x = 0; x < 4; ++x) {
++      const int s = 4 * (w - 128) + x;  // ((t * 2 + h) * 4 + j) * 2 + c
++      const int c = s % 2, j = (s / 2) % 4, h = (s / 8) % 2, t = s / 16;
++      const long long row = row0 + static_cast<long long>(row_step) * (cb * 32 + j * 8 + t * 2 + c);
++      word |= static_cast<uint32_t>(se[row * (k / 16) + g * 2 + h]) << (8 * x);
++    }
++    dst[w] = word;
++  }
++}
+diff --git a/zig/kernels/cuda/nvfp4_experts.cu b/zig/kernels/cuda/nvfp4_experts.cu
+index 02ab967..1070692 100644
+--- a/zig/kernels/cuda/nvfp4_experts.cu
++++ b/zig/kernels/cuda/nvfp4_experts.cu
+@@ -6,6 +6,7 @@
+ 
+ #include "experts.cuh"
+ #include "common/fp_pairs.cuh"
++#include "mma4.cuh"
+ 
+ namespace tf_nvfp4_experts {
+ 
+@@ -78,7 +79,10 @@ struct Ring {
+   template <typename Sum>
+   __device__ __forceinline__ void run(int KG, int, int lane, int t, int jh, const uint4* blk, const __nv_bfloat16* x0,
+                                       const __nv_bfloat16* x1, bool v0, bool v1, Sum sum) {
+-    constexpr int D = 2;
++#ifndef TF_NVFP4_RING_D
++#define TF_NVFP4_RING_D 2
++#endif
++    constexpr int D = TF_NVFP4_RING_D;  // stages in flight: the sums and their k order do not depend on it
+     Stage<M, Word> st[D];
+ #pragma unroll
+     for (int d = 0; d < D; ++d)
+@@ -165,7 +169,7 @@ __device__ __forceinline__ void unit_full(int unit, int lane, int gq, int t, int
+                                           const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
+                                           const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB,
+                                           const int* __restrict__ items, const int* __restrict__ members,
+-                                          void* __restrict__ out, int N, float limit, int skip) {
++                                          void* __restrict__ out, int N, float limit, int skip, float limit2 = 0.f) {
+   TF_RING_STORAGE Ring<M, WARPS, uint4> ring;
+   const int it = unit / NB, cb = unit - it * NB;
+   const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+@@ -192,30 +196,29 @@ __device__ __forceinline__ void unit_full(int unit, int lane, int gq, int t, int
+ #pragma unroll
+         for (int q = 0; q < 4; ++q) acc[m][0][j][q] *= g;
+     }
+-    epilogue<EPI, M, 1>(acc, 0, out, N, cb * COLS + 2 * t, pr0, pr1, v0, v1, limit);
++    epilogue<EPI, M, 1>(acc, 0, out, N, cb * COLS + 2 * t, pr0, pr1, v0, v1, limit, limit2);
+   }
+ }
+ 
+ template <int M, int EPI, int WARPS>
+-__global__ void __launch_bounds__(WARPS * 32)
+-    nvfp4_expert_kernel(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
+-                        const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
+-                        const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
+-                        float limit, int skip) {
++__device__ __forceinline__ void decode_body(const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
++                                            const uint4* __restrict__ W, const float* __restrict__ scale, int KG,
++                                            int NB, const int* __restrict__ items, const int* __restrict__ counts,
++                                            const int* __restrict__ members, void* __restrict__ out, int N,
++                                            float limit, int skip, float limit2 = 0.f) {
+   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
+   const int units = __ldg(counts) * NB;
+   for (int unit = blockIdx.x * WARPS + (threadIdx.x >> 5); unit < units; unit += gridDim.x * WARPS)
+     unit_full<M, EPI, WARPS>(unit, lane, gq, t, threadIdx.x >> 5, X, x_stride, slots, W, scale, KG, NB, items,
+-                             members, out, N, limit, skip);
++                             members, out, N, limit, skip, limit2);
+ }
+ 
+-// The decode form's units dealt in equal waves: ceil(units / waves) warps run, the others leave at once.
+ template <int M, int EPI, int WARPS>
+-__global__ void __launch_bounds__(WARPS * 32)
+-    nvfp4_expert_waves(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
+-                       const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
+-                       const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
+-                       float limit, int skip) {
++__device__ __forceinline__ void waves_body(const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
++                                           const uint4* __restrict__ W, const float* __restrict__ scale, int KG,
++                                           int NB, const int* __restrict__ items, const int* __restrict__ counts,
++                                           const int* __restrict__ members, void* __restrict__ out, int N,
++                                           float limit, int skip, float limit2 = 0.f) {
+   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
+   const int units = __ldg(counts) * NB;
+   if (units == 0) return;  // no items: no wave to divide by
+@@ -224,7 +227,26 @@ __global__ void __launch_bounds__(WARPS * 32)
+   if (w >= run) return;
+   for (int unit = w; unit < units; unit += run)
+     unit_full<M, EPI, WARPS>(unit, lane, gq, t, threadIdx.x >> 5, X, x_stride, slots, W, scale, KG, NB, items,
+-                             members, out, N, limit, skip);
++                             members, out, N, limit, skip, limit2);
++}
++
++template <int M, int EPI, int WARPS>
++__global__ void __launch_bounds__(WARPS * 32)
++    nvfp4_expert_kernel(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
++                        const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
++                        const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
++                        float limit, int skip) {
++  decode_body<M, EPI, WARPS>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N, limit, skip, 0.f);
++}
++
++// The decode form's units dealt in equal waves: ceil(units / waves) warps run, the others leave at once.
++template <int M, int EPI, int WARPS>
++__global__ void __launch_bounds__(WARPS * 32)
++    nvfp4_expert_waves(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
++                       const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
++                       const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
++                       float limit, int skip) {
++  waves_body<M, EPI, WARPS>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N, limit, skip, 0.f);
+ }
+ 
+ // Half a unit's stage: the lane's words of n8 tiles 2jh and 2jh + 1, all its scales, its inputs.
+@@ -261,7 +283,7 @@ __device__ __forceinline__ void compute_half(float (&acc)[M][2][4], const Half<M
+ // experts.cuh's epilogue on a half unit's two n8 tiles.
+ template <int EPI, int M>
+ __device__ __forceinline__ void epilogue_half(const float (&acc)[M][2][4], void* out, int N, int col0, int pr0, int pr1,
+-                                              bool v0, bool v1, float limit) {
++                                              bool v0, bool v1, float limit, float limit2 = 0.f) {
+ #pragma unroll
+   for (int h = 0; h < 2; ++h) {
+     if (!(h ? v1 : v0)) continue;
+@@ -280,6 +302,14 @@ __device__ __forceinline__ void epilogue_half(const float (&acc)[M][2][4], void*
+         } else if constexpr (EPI == 2) {
+           o0 = swiglu(a0, acc[M - 1][j][2 * h], limit);
+           o1 = swiglu(a1, acc[M - 1][j][2 * h + 1], limit);
++        } else if constexpr (EPI == 4) {
++          if (limit2 < 0.f) {
++            o0 = softcap_swiglu(bf(a0), bf(acc[M - 1][j][2 * h]), limit, -limit2);
++            o1 = softcap_swiglu(bf(a1), bf(acc[M - 1][j][2 * h + 1]), limit, -limit2);
++          } else {
++            o0 = softcap_swiglu(a0, acc[M - 1][j][2 * h], limit, limit2);
++            o1 = softcap_swiglu(a1, acc[M - 1][j][2 * h + 1], limit, limit2);
++          }
+         } else {
+           o0 = a0;
+           o1 = a1;
+@@ -293,11 +323,11 @@ __device__ __forceinline__ void epilogue_half(const float (&acc)[M][2][4], void*
+ 
+ // The decode form with two warps a unit (16 columns each): the same sums, twice the warps for few items.
+ template <int M, int EPI, int WARPS>
+-__global__ void __launch_bounds__(WARPS * 32)
+-    nvfp4_expert_half(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
+-                      const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
+-                      const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
+-                      float limit, int skip) {
++__device__ __forceinline__ void half_body(const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
++                                          const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB,
++                                          const int* __restrict__ items, const int* __restrict__ counts,
++                                          const int* __restrict__ members, void* __restrict__ out, int N, float limit,
++                                          int skip, float limit2) {
+   TF_RING_STORAGE Ring<M, WARPS, uint2> ring;
+   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3, wi = threadIdx.x >> 5;
+   const int units = __ldg(counts) * NB * 2;
+@@ -327,11 +357,20 @@ __global__ void __launch_bounds__(WARPS * 32)
+ #pragma unroll
+           for (int q = 0; q < 4; ++q) acc[m][j][q] *= g;
+       }
+-      epilogue_half<EPI, M>(acc, out, N, cb * COLS + 16 * jh + 2 * t, pr0, pr1, v0, v1, limit);
++      epilogue_half<EPI, M>(acc, out, N, cb * COLS + 16 * jh + 2 * t, pr0, pr1, v0, v1, limit, limit2);
+     }
+   }
+ }
+ 
++template <int M, int EPI, int WARPS>
++__global__ void __launch_bounds__(WARPS * 32)
++    nvfp4_expert_half(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
++                      const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
++                      const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
++                      float limit, int skip) {
++  half_body<M, EPI, WARPS>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N, limit, skip, 0.f);
++}
++
+ // The prompt form's tile: 16 RT rows a warp, WM x WN warps (BM pairs of one item by WN 32-column blocks a CTA).
+ template <int M, int RT, int WM, int WN>
+ struct Prompt4 {
+@@ -363,7 +402,8 @@ __device__ __forceinline__ void prompt_tiles(const __nv_bfloat16* __restrict__ X
+                                              const uint4* __restrict__ W, const float* __restrict__ scale, int KG,
+                                              int NB, const int* __restrict__ members, void* __restrict__ out, int N,
+                                              float limit, int cbt, int e, int first, int cnt,
+-                                             const __nv_bfloat16* __restrict__ X_b, void* __restrict__ out_b, int split) {
++                                             const __nv_bfloat16* __restrict__ X_b, void* __restrict__ out_b,
++                                             int split, float limit2 = 0.f) {
+   using P = Prompt4<M, RT, WM, WN>;
+   constexpr int STAGES = P::STAGES;
+   extern __shared__ uint4 sm[];
+@@ -504,10 +544,10 @@ __device__ __forceinline__ void prompt_tiles(const __nv_bfloat16* __restrict__ X
+         void* o1 = out;
+         if (v0 && q0 >= split) { q0 -= split; o0 = out_b; }
+         if (v1 && q1 >= split) { q1 -= split; o1 = out_b; }
+-        epilogue<EPI, M, TA>(acc, r, o0, N, cb * COLS + 2 * t, q0, q1, v0, false, limit);
+-        epilogue<EPI, M, TA>(acc, r, o1, N, cb * COLS + 2 * t, q0, q1, false, v1, limit);
++        epilogue<EPI, M, TA>(acc, r, o0, N, cb * COLS + 2 * t, q0, q1, v0, false, limit, limit2);
++        epilogue<EPI, M, TA>(acc, r, o1, N, cb * COLS + 2 * t, q0, q1, false, v1, limit, limit2);
+       } else {
+-        epilogue<EPI, M, TA>(acc, r, out, N, cb * COLS + 2 * t, p0, p1, v0, v1, limit);
++        epilogue<EPI, M, TA>(acc, r, out, N, cb * COLS + 2 * t, p0, p1, v0, v1, limit, limit2);
+       }
+     }
+   }
+@@ -519,7 +559,7 @@ __device__ __forceinline__ void prompt_body(const __nv_bfloat16* __restrict__ X,
+                                             int NB, const int* __restrict__ items, const int* __restrict__ counts,
+                                             const int* __restrict__ members, void* __restrict__ out, int N,
+                                             float limit, int skip, const __nv_bfloat16* __restrict__ X_b,
+-                                            void* __restrict__ out_b, int split) {
++                                            void* __restrict__ out_b, int split, float limit2 = 0.f) {
+   static_assert(RT == 4, "the dispatch below spells out 0 .. 4 row tiles");
+   const int nbt = (NB + WN - 1) / WN, it = blockIdx.x / nbt, cbt = blockIdx.x - it * nbt;
+   if (it >= __ldg(counts)) return;
+@@ -527,7 +567,7 @@ __device__ __forceinline__ void prompt_body(const __nv_bfloat16* __restrict__ X,
+   if (e == skip) return;  // an expert the family computes itself, left alone as the decode form does
+   const int nt = max(0, min(RT, (cnt - 16 * RT * ((threadIdx.x >> 5) / WN) + 15) >> 4));
+ #define TF_TILES(NT) \
+-  prompt_tiles<M, EPI, RT, WM, WN, NT, FACT, PAIR>(X, x_stride, slots, W, scale, KG, NB, members, out, N, limit, cbt, e, first, cnt, X_b, out_b, split)
++  prompt_tiles<M, EPI, RT, WM, WN, NT, FACT, PAIR>(X, x_stride, slots, W, scale, KG, NB, members, out, N, limit, cbt, e, first, cnt, X_b, out_b, split, limit2)
+   switch (nt) {
+     case 4: TF_TILES(4); break;
+     case 3: TF_TILES(3); break;
+@@ -557,6 +597,179 @@ template __global__ void nvfp4_expert_kernel<2, 2, 1>(const __nv_bfloat16* __res
+ template __global__ void nvfp4_expert_kernel<1, 0, 1>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
+ template __global__ void nvfp4_expert_kernel<1, 3, 1>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
+ template __global__ void nvfp4_expert_kernel<1, 1, 1>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
++
++// Extract 4 consecutive FP4 nibbles [4t..4t+3] (half=0) or [16+4t..16+4t+3] (half=1) from fp4pair's word order.
++__device__ __forceinline__ uint32_t unpack_k4(uint32_t w, int half) {
++  const uint32_t v = half ? (w >> 8) : w;
++  return (v & 0x000Fu) | ((v >> 12) & 0x00F0u) | ((v << 4) & 0x0F00u) | ((v >> 8) & 0xF000u);
++}
++
++// Pre-quantized FP4 prompt tile: 64 rows x 64 inputs (2 uint4 of codes + 1 uint32 of scales per row), STAGES=4 in 46 KiB.
++template <int M, int RT, int WM, int WN>
++struct Prompt4Q {
++  static constexpr int THREADS = WM * WN * 32, BM = 16 * RT * WM, XC = 2, SG = 2, WB = M * BLOCK4;
++  static constexpr int XU = BM * XC, XSU = BM / 4, WU = WN * SG * WB, SU = XU + XSU + WU;
++  static constexpr int XPT = (XU + THREADS - 1) / THREADS;
++  static constexpr int STAGES = SU * 16 * 4 <= 49152 ? 4 : SU * 16 * 3 <= 49152 ? 3 : 2;
++};
++
++template <int M, int EPI, int RT, int WM, int WN, int NT>
++__device__ __forceinline__ void prompt_tiles_tc_q(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc,
++                                                  int x_stride, int slots, const uint4* __restrict__ W,
++                                                  const float* __restrict__ scale, int KG, int NB,
++                                                  const int* __restrict__ members, void* __restrict__ out, int N,
++                                                  float limit, int cbt, int e, int first, int cnt, float limit2 = 0.f) {
++  using P = Prompt4Q<M, RT, WM, WN>;
++  constexpr int STAGES = P::STAGES;
++  extern __shared__ uint4 sm[];
++  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp / WN, wn = warp - wm * WN;
++  const int t = lane & 3, gq = lane >> 2, cb = cbt * WN + wn, cbs = min(WN, NB - cbt * WN);
++  const int c_stride = x_stride >> 1;  // bytes per row of FP4 codes (K / 2)
++  const int s_stride = x_stride >> 4;  // bytes per row of UE4M3 scales (K / 16)
++  const uint8_t* xsrc[P::XPT];
++  int xdst[P::XPT];
++#pragma unroll
++  for (int i = 0; i < P::XPT; ++i) {
++    const int q = tid + i * P::THREADS, r = q / P::XC, c = q - r * P::XC;
++    xdst[i] = r * P::XC + c;
++    xsrc[i] = nullptr;
++    if (q < P::XU && r < cnt) {
++      const int p = __ldg(members + first + r);
++      xsrc[i] = xc + (size_t)(slots ? p / slots : p) * c_stride + 16 * c;
++    }
++  }
++  const uint8_t* ssrc = nullptr;
++  if (tid < P::BM && tid < cnt) {
++    const int p = __ldg(members + first + tid);
++    ssrc = xsc + (size_t)(slots ? p / slots : p) * s_stride;
++  }
++  const uint4* wsrc = W + ((size_t)e * NB + cbt * WN) * (size_t)KG * P::WB;
++  auto stage = [&](int s, int g0) {
++    uint4* xcs = sm + s * P::SU;
++    uint32_t* xss = reinterpret_cast<uint32_t*>(xcs + P::XU);
++    uint4* ws = xcs + P::XU + P::XSU;
++#pragma unroll
++    for (int i = 0; i < P::XPT; ++i)
++      if (xsrc[i]) cp16(xcs + xdst[i], xsrc[i] + (size_t)g0 * 16);
++    if (tid < P::BM)
++      xss[tid] = ssrc ? *reinterpret_cast<const uint32_t*>(ssrc + (size_t)g0 * 2) : 0u;
++    for (int q = tid; q < cbs * P::SG * P::WB; q += P::THREADS) {
++      const int j = q / (P::SG * P::WB), o = q - j * P::SG * P::WB;
++      cp16(ws + q, wsrc + ((size_t)j * KG + g0) * P::WB + o);
++    }
++  };
++  constexpr int TA = NT > 0 ? NT : 1;
++  const int base = 16 * RT * wm;
++  const bool active = NT > 0 && cb < NB;
++  float acc[M][TA][NTW][4];
++#pragma unroll
++  for (int m = 0; m < M; ++m)
++#pragma unroll
++    for (int r = 0; r < NT; ++r)
++#pragma unroll
++      for (int j = 0; j < NTW; ++j) acc[m][r][j][0] = acc[m][r][j][1] = acc[m][r][j][2] = acc[m][r][j][3] = 0.f;
++  const int steps = KG >> 1;
++#pragma unroll
++  for (int s = 0; s < STAGES - 1; ++s) {
++    if (s < steps) stage(s, s * P::SG);
++    cp_commit();
++  }
++  const int t_lo = (t & 1) * 2, t_hi = t_lo + 1, thalf = t >> 1;
++  for (int k = 0; k < steps; ++k) {
++    cp_wait<STAGES - 2>();
++    __syncthreads();
++    if (k + STAGES - 1 < steps) stage((k + STAGES - 1) % STAGES, (k + STAGES - 1) * P::SG);
++    cp_commit();
++    if (!active) continue;
++    const uint4* xcs = sm + (k % STAGES) * P::SU;
++    const uint32_t* xss = reinterpret_cast<const uint32_t*>(xcs + P::XU);
++    const uint4* ws0 = xcs + P::XU + P::XSU + (wn * P::SG) * P::WB;
++    const uint4* ws1 = ws0 + P::WB;
++    uint32_t a[TA][4], sa[TA];
++#pragma unroll
++    for (int r = 0; r < NT; ++r) {
++      const int r0 = base + 16 * r;
++      const uint32_t* p0 = reinterpret_cast<const uint32_t*>(xcs + (r0 + gq) * P::XC);
++      const uint32_t* p1 = reinterpret_cast<const uint32_t*>(xcs + (r0 + gq + 8) * P::XC);
++      a[r][0] = p0[t];
++      a[r][1] = p1[t];
++      a[r][2] = p0[4 + t];
++      a[r][3] = p1[4 + t];
++      sa[r] = (t & 1) ? xss[r0 + gq + 8] : xss[r0 + gq];
++    }
++#pragma unroll
++    for (int m = 0; m < M; ++m) {
++      const uint4 w0_lo = ws0[m * BLOCK4 + gq * 4 + t_lo];
++      const uint4 w0_hi = ws0[m * BLOCK4 + gq * 4 + t_hi];
++      const uint4 w1_lo = ws1[m * BLOCK4 + gq * 4 + t_lo];
++      const uint4 w1_hi = ws1[m * BLOCK4 + gq * 4 + t_hi];
++      const uint2 sc0_0 = reinterpret_cast<const uint2*>(ws0 + m * BLOCK4 + 32)[(gq >> 1) * 2 + 0];
++      const uint2 sc0_1 = reinterpret_cast<const uint2*>(ws0 + m * BLOCK4 + 32)[(gq >> 1) * 2 + 1];
++      const uint2 sc1_0 = reinterpret_cast<const uint2*>(ws1 + m * BLOCK4 + 32)[(gq >> 1) * 2 + 0];
++      const uint2 sc1_1 = reinterpret_cast<const uint2*>(ws1 + m * BLOCK4 + 32)[(gq >> 1) * 2 + 1];
++#pragma unroll
++      for (int j = 0; j < NTW; ++j) {
++        const uint32_t b0 = unpack_k4(comp(w0_lo, j), thalf) | (unpack_k4(comp(w0_hi, j), thalf) << 16);
++        const uint32_t b1 = unpack_k4(comp(w1_lo, j), thalf) | (unpack_k4(comp(w1_hi, j), thalf) << 16);
++        const int sh = (2 * (j & 1) + (gq & 1)) * 8;
++        const uint32_t u00 = ((j < 2 ? sc0_0.x : sc0_0.y) >> sh) & 0xFFu;
++        const uint32_t u01 = ((j < 2 ? sc0_1.x : sc0_1.y) >> sh) & 0xFFu;
++        const uint32_t u10 = ((j < 2 ? sc1_0.x : sc1_0.y) >> sh) & 0xFFu;
++        const uint32_t u11 = ((j < 2 ? sc1_1.x : sc1_1.y) >> sh) & 0xFFu;
++        const uint32_t sb = u00 | (u01 << 8) | (u10 << 16) | (u11 << 24);
++#pragma unroll
++        for (int r = 0; r < NT; ++r) mma4::mma_fp4(acc[m][r][j], a[r], b0, b1, sa[r], sb);
++      }
++    }
++  }
++  cp_wait<0>();
++  if (!active) return;
++  if constexpr (NT > 0) {
++#pragma unroll
++    for (int m = 0; m < M; ++m) {
++      const float g = __ldg(scale + e * M + m);
++#pragma unroll
++      for (int r = 0; r < NT; ++r)
++#pragma unroll
++        for (int j = 0; j < NTW; ++j)
++#pragma unroll
++          for (int q = 0; q < 4; ++q) acc[m][r][j][q] *= g;
++    }
++#pragma unroll
++    for (int r = 0; r < NT; ++r) {
++      const int m0 = base + 16 * r + gq, m1 = m0 + 8;
++      const bool v0 = m0 < cnt, v1 = m1 < cnt;
++      const int p0 = v0 ? __ldg(members + first + m0) : 0, p1 = v1 ? __ldg(members + first + m1) : 0;
++      epilogue<EPI, M, TA>(acc, r, out, N, cb * COLS + 2 * t, p0, p1, v0, v1, limit, limit2);
++    }
++  }
++}
++
++template <int M, int EPI, int RT, int WM, int WN>
++__device__ __forceinline__ void prompt_body_tc_q(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc,
++                                                 int x_stride, int slots, const uint4* __restrict__ W,
++                                                 const float* __restrict__ scale, int KG, int NB,
++                                                 const int* __restrict__ items, const int* __restrict__ counts,
++                                                 const int* __restrict__ members, void* __restrict__ out, int N,
++                                                 float limit, int skip, float limit2 = 0.f) {
++  static_assert(RT == 4, "the dispatch below spells out 0 .. 4 row tiles");
++  const int nbt = (NB + WN - 1) / WN, it = blockIdx.x / nbt, cbt = blockIdx.x - it * nbt;
++  if (it >= __ldg(counts)) return;
++  const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
++  if (e == skip) return;
++  const int nt = max(0, min(RT, (cnt - 16 * RT * ((threadIdx.x >> 5) / WN) + 15) >> 4));
++#define TF_TILES_TCQ(NT) \
++  prompt_tiles_tc_q<M, EPI, RT, WM, WN, NT>(xc, xsc, x_stride, slots, W, scale, KG, NB, members, out, N, limit, cbt, \
++                                            e, first, cnt, limit2)
++  switch (nt) {
++    case 4: TF_TILES_TCQ(4); break;
++    case 3: TF_TILES_TCQ(3); break;
++    case 2: TF_TILES_TCQ(2); break;
++    case 1: TF_TILES_TCQ(1); break;
++    default: TF_TILES_TCQ(0);
++  }
++#undef TF_TILES_TCQ
++}
+ }
+ 
+ // The prompt form's entries, 4 row tiles a warp in one row of WN warps: relu^2 up, SwiGLU gate-up, bf16 sums down.
+@@ -596,3 +809,77 @@ TF_NVFP4_PAIR_PROMPT(tf_nvfp4_pair_prompt_down, 1, 3, 8)
+   }
+ TF_NVFP4_FACT(tf_nvfp4_fact_swiglu, 2, 2, 4)
+ TF_NVFP4_FACT(tf_nvfp4_fact_down_f32, 1, 0, 8)
++
++// Inkling 2 Mini's softcapped SwiGLU gate-up and bf16 down experts (decode, equal-waves, split-half, and prompt TC).
++extern "C" __global__ void __launch_bounds__(128)
++    tf_nvfp4_softcap(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
++                     const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
++                     const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
++                     float gate_cap, float up_cap, int skip) {
++  tf_nvfp4_experts::decode_body<2, 4, 4>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N,
++                                         gate_cap, skip, up_cap);
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_nvfp4_softcap_waves(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
++                           const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
++                           const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out,
++                           int N, float gate_cap, float up_cap, int skip) {
++  tf_nvfp4_experts::waves_body<2, 4, 4>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N, gate_cap,
++                                        skip, up_cap);
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_nvfp4_softcap_half(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
++                          const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
++                          const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out,
++                          int N, float gate_cap, float up_cap, int skip) {
++  tf_nvfp4_experts::half_body<2, 4, 4>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N, gate_cap,
++                                       skip, up_cap);
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_nvfp4_down_bf16_waves(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
++                             const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
++                             const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out,
++                             int N, float limit, int skip) {
++  tf_nvfp4_experts::waves_body<1, 3, 4>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N, limit,
++                                        skip, 0.f);
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_nvfp4_down_bf16_half(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
++                            const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
++                            const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out,
++                            int N, float limit, int skip) {
++  tf_nvfp4_experts::half_body<1, 3, 4>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N, limit,
++                                       skip, 0.f);
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_nvfp4_prompt_softcap(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
++                            const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
++                            const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out,
++                            int N, float gate_cap, float up_cap, int skip) {
++  tf_nvfp4_experts::prompt_body<2, 4, 4, 1, 4>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N,
++                                               gate_cap, skip, nullptr, nullptr, 0, up_cap);
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_nvfp4_prompt_softcap_tc_q(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc, int x_stride,
++                                 int slots, const uint4* __restrict__ W, const float* __restrict__ scale, int KG,
++                                 int NB, const int* __restrict__ items, const int* __restrict__ counts,
++                                 const int* __restrict__ members, void* __restrict__ out, int N, float gate_cap,
++                                 float up_cap, int skip) {
++  tf_nvfp4_experts::prompt_body_tc_q<2, 4, 4, 1, 4>(xc, xsc, x_stride, slots, W, scale, KG, NB, items, counts, members,
++                                                    out, N, gate_cap, skip, up_cap);
++}
++
++extern "C" __global__ void __launch_bounds__(256)
++    tf_nvfp4_prompt_down_tc_q(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc, int x_stride, int slots,
++                              const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB,
++                              const int* __restrict__ items, const int* __restrict__ counts,
++                              const int* __restrict__ members, void* __restrict__ out, int N, float limit, int skip) {
++  tf_nvfp4_experts::prompt_body_tc_q<1, 3, 4, 1, 8>(xc, xsc, x_stride, slots, W, scale, KG, NB, items, counts, members,
++                                                    out, N, limit, skip, 0.f);
++}
+diff --git a/zig/src/families/inkling2/loop_weights.zig b/zig/src/families/inkling2/loop_weights.zig
+index 4c17765..87f4e6b 100644
+--- a/zig/src/families/inkling2/loop_weights.zig
++++ b/zig/src/families/inkling2/loop_weights.zig
+@@ -218,6 +218,8 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, ck: *core.Checkpoint,
+     defer if (pack_stream) |*ps| ps.deinit();
+     var stage: ?cuda.DeviceBuffer = if (use_qmmf) try cuda.DeviceBuffer.alloc(d, @max(q_max * h, h * q_max) * 2) else null;
+     defer if (stage) |*sb| sb.free();
++    var moe_packer: ?modelopt.Packer = if (modelopt.fastMoeEnabled()) try modelopt.Packer.init(d) else null;
++    defer if (moe_packer) |*mp| mp.deinit();
+     w.embed = try l.tensor(ck, "model.llm.embed.weight", .{}, .bf16, &.{ c.text.vocab, h });
+     w.embed_norm = try l.tensor(ck, "model.llm.embed_norm.weight", .{}, .bf16, &.{h});
+     w.norm = try l.tensor(ck, "model.llm.norm.weight", .{}, .bf16, &.{h});
+@@ -315,7 +317,7 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, ck: *core.Checkpoint,
+         layer.router = try A.put(&l, ck, "model.llm.layers.{d}.mlp.gate.weight", L, &.{ c.text.experts, h });
+         layer.router_bias = try l.tensor(ck, "model.llm.layers.{d}.mlp.gate.bias", L, .f32, &.{c.text.experts});
+         var prefix: [96]u8 = undefined;
+-        layer.experts = try modelopt.load(&l, ck, try std.fmt.bufPrint(&prefix, "model.llm.layers.{d}.mlp.experts.", L), formats[k], c.text.experts, h, c.text.expert_inter);
++        layer.experts = try modelopt.loadPacked(&l, if (moe_packer) |*mp| mp else null, ck, try std.fmt.bufPrint(&prefix, "model.llm.layers.{d}.mlp.experts.", L), formats[k], c.text.experts, h, c.text.expert_inter);
+         @memset(&layer.controllers, .{ .down = 0, .forget = 0, .gain = 0 });
+         const lp = c.text.loop.?;
+         if (i >= lp.core_start and i < lp.core_end) try controllers(&l, ck, &c.text, i, lp.gate_rank, &layer.controllers);
+diff --git a/zig/src/families/inkling2/modelopt.zig b/zig/src/families/inkling2/modelopt.zig
+index 605650b..6e07a1a 100644
+--- a/zig/src/families/inkling2/modelopt.zig
++++ b/zig/src/families/inkling2/modelopt.zig
+@@ -28,6 +28,21 @@ pub fn wideRows() usize {
+     return @import("sys").environment.read(u32, "TF_INKLING2_WIDE_ROWS", 4) catch 4;
+ }
+ 
++/// TF_INKLING2_FAST_MOE=1 (default): load-time GPU repack of NVFP4 experts into BLOCK4 layout with fused softcap SwiGLU.
++pub fn fastMoeEnabled() bool {
++    return @import("sys").environment.read(bool, "TF_INKLING2_FAST_MOE", true) catch true;
++}
++
++/// TF_INKLING2_MOE_WAVES=1: cap decode/verify grids to resident CTAs using equal-waves scheduling instead of HW-scheduled CTAs.
++pub fn moeWavesEnabled() bool {
++    return @import("sys").environment.read(bool, "TF_INKLING2_MOE_WAVES", false) catch false;
++}
++
++/// TF_NVFP4_SPLIT_DOWN=1: split NVFP4 down projection into 16-column half units when they fit resident warps.
++pub fn splitDownEnabled() bool {
++    return @import("sys").environment.read(bool, "TF_NVFP4_SPLIT_DOWN", false) catch false;
++}
++
+ pub const Projection = struct {
+     codes: u64,
+     scales: u64,
+@@ -37,12 +52,21 @@ pub const Projection = struct {
+     k: u32,
+ };
+ 
++/// Packed Nvfp4Experts BLOCK4 layout ([E][n/32][k/32][parts][144] u32) and per-expert outer scales.
++pub const PackedNvfp4 = struct {
++    up: u64,
++    up_scale: u64,
++    down: u64,
++    down_scale: u64,
++};
++
+ /// One physical layer. Loop visits share these device pointers.
+ pub const Layer = struct {
+     format: Format,
+     experts: u32,
+     w13: Projection,
+     w2: Projection,
++    packed_nvfp4: ?PackedNvfp4 = null,
+ };
+ 
+ pub const Weight = extern struct {
+@@ -59,8 +83,20 @@ pub const Weight = extern struct {
+     row_step: i32,
+ };
+ 
++pub fn promptQSmem(parts: usize, wn: usize) u32 {
++    const su = 64 * 2 + 16 + wn * 2 * parts * 36;
++    const stages: usize = if (su * 16 * 4 <= 49152) 4 else if (su * 16 * 3 <= 49152) 3 else 2;
++    return @intCast(stages * su * 16);
++}
++
++pub fn maxItems(pairs: usize, experts_count: usize, tile: usize) usize {
++    const active = @min(pairs, experts_count);
++    return active + (pairs - active) / tile;
++}
++
+ pub const Kernels = struct {
+     mod: cuda.Module,
++    nv_mod: cuda.Module,
+     plan: cuda.Function,
+     decode: cuda.Function,
+     decode_wide: cuda.Function,
+@@ -73,18 +109,49 @@ pub const Kernels = struct {
+     verify_tc_mxfp8: cuda.Function,
+     act: cuda.Function,
+     combine: cuda.Function,
++    nv_softcap: cuda.Function,
++    nv_softcap_waves: cuda.Function,
++    nv_softcap_half: cuda.Function,
++    nv_down_bf16: cuda.Function,
++    nv_down_bf16_waves: cuda.Function,
++    nv_down_bf16_half: cuda.Function,
++    nv_prompt_softcap: cuda.Function,
++    nv_prompt_down: cuda.Function,
++    nv_prompt_softcap_tc_q: cuda.Function,
++    nv_prompt_down_tc_q: cuda.Function,
+     resident: usize,
+     resident_wide: usize,
++    nv_softcap_half_resident: usize,
++    nv_softcap_waves_resident: usize,
++    nv_down_waves_resident: usize,
++    nv_down_half_resident: usize,
+     tc_ok: bool,
+ 
+     pub fn load(d: *const cuda.Driver, sms: usize) !Kernels {
+         var mod = try cuda.Module.load(d, cuda.kernels.inkling2_modelopt);
+         errdefer mod.unload();
++        var nv_mod = try cuda.Module.load(d, cuda.kernels.nvfp4_experts);
++        errdefer nv_mod.unload();
+         const decode = try mod.function("tf_ink2moe_up");
+         const decode_wide = try mod.function("tf_ink2moe_up_wide");
++        const nv_softcap = try nv_mod.function("tf_nvfp4_softcap");
++        const nv_softcap_waves = try nv_mod.function("tf_nvfp4_softcap_waves");
++        const nv_softcap_half = try nv_mod.function("tf_nvfp4_softcap_half");
++        const nv_down_bf16 = try nv_mod.function(cuda.experts.Nvfp4Experts.symbols.down_bf16);
++        const nv_down_bf16_waves = try nv_mod.function("tf_nvfp4_down_bf16_waves");
++        const nv_down_bf16_half = try nv_mod.function("tf_nvfp4_down_bf16_half");
++        const nv_prompt_softcap = try nv_mod.function("tf_nvfp4_prompt_softcap");
++        const nv_prompt_down = try nv_mod.function("tf_nvfp4_prompt_down");
++        const nv_prompt_softcap_tc_q = try nv_mod.function("tf_nvfp4_prompt_softcap_tc_q");
++        const nv_prompt_down_tc_q = try nv_mod.function("tf_nvfp4_prompt_down_tc_q");
++        try nv_prompt_softcap.allowDynamicShared(cuda.experts.Nvfp4Experts.promptSmem(2, 4));
++        try nv_prompt_down.allowDynamicShared(cuda.experts.Nvfp4Experts.promptSmem(1, 8));
++        try nv_prompt_softcap_tc_q.allowDynamicShared(promptQSmem(2, 4));
++        try nv_prompt_down_tc_q.allowDynamicShared(promptQSmem(1, 8));
+         const cap = try d.currentCapability();
+         return .{
+             .mod = mod,
++            .nv_mod = nv_mod,
+             .plan = try mod.function("tf_ink2moe_plan"),
+             .decode = decode,
+             .decode_wide = decode_wide,
+@@ -97,13 +164,28 @@ pub const Kernels = struct {
+             .verify_tc_mxfp8 = try mod.function("tf_ink2moe_verify_tc_mxfp8"),
+             .act = try mod.function("tf_ink2moe_act"),
+             .combine = try mod.function("tf_ink2moe_combine"),
++            .nv_softcap = nv_softcap,
++            .nv_softcap_waves = nv_softcap_waves,
++            .nv_softcap_half = nv_softcap_half,
++            .nv_down_bf16 = nv_down_bf16,
++            .nv_down_bf16_waves = nv_down_bf16_waves,
++            .nv_down_bf16_half = nv_down_bf16_half,
++            .nv_prompt_softcap = nv_prompt_softcap,
++            .nv_prompt_down = nv_prompt_down,
++            .nv_prompt_softcap_tc_q = nv_prompt_softcap_tc_q,
++            .nv_prompt_down_tc_q = nv_prompt_down_tc_q,
+             .resident = @max(1, try decode.occupancy(128, 0)) * sms,
+             .resident_wide = @max(1, try decode_wide.occupancy(128, 0)) * sms,
++            .nv_softcap_half_resident = @max(1, try nv_softcap_half.occupancy(128, 0)) * sms,
++            .nv_softcap_waves_resident = @max(1, try nv_softcap_waves.occupancy(128, 0)) * sms,
++            .nv_down_waves_resident = @max(1, try nv_down_bf16_waves.occupancy(128, 0)) * sms,
++            .nv_down_half_resident = @max(1, try nv_down_bf16_half.occupancy(128, 0)) * sms,
+             .tc_ok = cap == 120 or cap == 121,
+         };
+     }
+ 
+     pub fn unload(k: *Kernels) void {
++        k.nv_mod.unload();
+         k.mod.unload();
+     }
+ };
+@@ -248,11 +330,168 @@ fn projectionTc(s: cuda.Stream, fn_: cuda.Function, coop: bool, xc: u64, xsc: u6
+     try cuda.launch.launch(fn_, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = if (coop) 256 else 128 } }, s, &a);
+ }
+ 
++fn runPackedNvfp4(k: *const Kernels, s: cuda.Stream, l: Layer, p: PackedNvfp4, caps: experts.Caps, x: u64, x_stride: usize, pick: u64, weights: u64, rows: usize, slots: usize, out: u64, scratch: u64) !void {
++    const hidden: usize = l.w2.n;
++    const intermediate: usize = l.w2.k;
++    const pairs = rows * slots;
++    const b = layout(scratch, rows, slots, hidden, intermediate);
++    const listed = rows >= 32;
++    const use_tc = rows >= verifyTcRows() and k.tc_ok and prefillTcMode() != 0 and hidden % 64 == 0 and intermediate % 64 == 0;
++    const tile: usize = if (listed) 64 else 16;
++    const item_bound = maxItems(pairs, l.experts, tile);
++
++    var g: cuda.Args = .{};
++    for ([_]u64{ pick, b.items, b.members, b.item_count }) |v| g.add(v);
++    for ([_]usize{ rows, slots, l.experts, tile }) |v| g.add(i32d(v));
++    try cuda.launch.launch(k.plan, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 512 } }, s, &g);
++
++    const nb_up = intermediate / 32;
++    const kg_up = hidden / 32;
++    const nb_down = hidden / 32;
++    const kg_down = intermediate / 32;
++    // Negative up_cap selects BF16 rounding of gate and up before softcap_swiglu (matching modelopt.cu act).
++    const up_cap_bf16 = -caps.up;
++
++    if (use_tc) {
++        try quantX(k, s, .nvfp4, x, x_stride, rows, hidden, b.x_tc_codes, b.x_tc_scales);
++        {
++            var a: cuda.Args = .{};
++            a.add(b.x_tc_codes);
++            a.add(b.x_tc_scales);
++            a.add(i32d(hidden));
++            a.add(i32d(slots));
++            a.add(p.up);
++            a.add(p.up_scale);
++            a.add(i32d(kg_up));
++            a.add(i32d(nb_up));
++            for ([_]u64{ b.items, b.item_count, b.members, b.act }) |v| a.add(v);
++            a.add(i32d(intermediate));
++            a.add(caps.gate);
++            a.add(up_cap_bf16);
++            a.add(@as(i32, -1));
++            const grid = item_bound * ((nb_up + 3) / 4);
++            if (grid > 0) try cuda.launch.launch(k.nv_prompt_softcap_tc_q, .{ .grid = .{ .x = @intCast(grid) }, .block = .{ .x = 128 }, .shared = promptQSmem(2, 4) }, s, &a);
++        }
++        try quantX(k, s, .nvfp4, b.act, intermediate, pairs, intermediate, b.x_tc_codes, b.x_tc_scales);
++        {
++            var a: cuda.Args = .{};
++            a.add(b.x_tc_codes);
++            a.add(b.x_tc_scales);
++            a.add(i32d(intermediate));
++            a.add(@as(i32, 0));
++            a.add(p.down);
++            a.add(p.down_scale);
++            a.add(i32d(kg_down));
++            a.add(i32d(nb_down));
++            for ([_]u64{ b.items, b.item_count, b.members, b.down }) |v| a.add(v);
++            a.add(i32d(hidden));
++            a.add(@as(f32, 0.0));
++            a.add(@as(i32, -1));
++            const grid = item_bound * ((nb_down + 7) / 8);
++            if (grid > 0) try cuda.launch.launch(k.nv_prompt_down_tc_q, .{ .grid = .{ .x = @intCast(grid) }, .block = .{ .x = 256 }, .shared = promptQSmem(1, 8) }, s, &a);
++        }
++    } else if (listed) {
++        {
++            var a: cuda.Args = .{};
++            a.add(x);
++            a.add(i32d(x_stride));
++            a.add(i32d(slots));
++            a.add(p.up);
++            a.add(p.up_scale);
++            a.add(i32d(kg_up));
++            a.add(i32d(nb_up));
++            for ([_]u64{ b.items, b.item_count, b.members, b.act }) |v| a.add(v);
++            a.add(i32d(intermediate));
++            a.add(caps.gate);
++            a.add(up_cap_bf16);
++            a.add(@as(i32, -1));
++            const grid = item_bound * ((nb_up + 3) / 4);
++            if (grid > 0) try cuda.launch.launch(k.nv_prompt_softcap, .{ .grid = .{ .x = @intCast(grid) }, .block = .{ .x = 128 }, .shared = cuda.experts.Nvfp4Experts.promptSmem(2, 4) }, s, &a);
++        }
++        {
++            var a: cuda.Args = .{};
++            a.add(b.act);
++            a.add(i32d(intermediate));
++            a.add(@as(i32, 0));
++            a.add(p.down);
++            a.add(p.down_scale);
++            a.add(i32d(kg_down));
++            a.add(i32d(nb_down));
++            for ([_]u64{ b.items, b.item_count, b.members, b.down }) |v| a.add(v);
++            a.add(i32d(hidden));
++            a.add(@as(f32, 0.0));
++            a.add(@as(i32, -1));
++            const grid = item_bound * ((nb_down + 7) / 8);
++            if (grid > 0) try cuda.launch.launch(k.nv_prompt_down, .{ .grid = .{ .x = @intCast(grid) }, .block = .{ .x = 256 }, .shared = cuda.experts.Nvfp4Experts.promptSmem(1, 8) }, s, &a);
++        }
++    } else {
++        const use_waves = moeWavesEnabled();
++        {
++            var a: cuda.Args = .{};
++            a.add(x);
++            a.add(i32d(x_stride));
++            a.add(i32d(slots));
++            a.add(p.up);
++            a.add(p.up_scale);
++            a.add(i32d(kg_up));
++            a.add(i32d(nb_up));
++            for ([_]u64{ b.items, b.item_count, b.members, b.act }) |v| a.add(v);
++            a.add(i32d(intermediate));
++            a.add(caps.gate);
++            a.add(up_cap_bf16);
++            a.add(@as(i32, -1));
++            const half_units = 2 * item_bound * nb_up;
++            const full_grid = (item_bound * nb_up + 3) / 4;
++            if (half_units <= k.nv_softcap_half_resident * 4) {
++                const grid = (half_units + 3) / 4;
++                if (grid > 0) try cuda.launch.launch(k.nv_softcap_half, .{ .grid = .{ .x = @intCast(grid) }, .block = .{ .x = 128 } }, s, &a);
++            } else if (use_waves) {
++                const grid = @min(full_grid, k.nv_softcap_waves_resident);
++                if (grid > 0) try cuda.launch.launch(k.nv_softcap_waves, .{ .grid = .{ .x = @intCast(grid) }, .block = .{ .x = 128 } }, s, &a);
++            } else {
++                if (full_grid > 0) try cuda.launch.launch(k.nv_softcap, .{ .grid = .{ .x = @intCast(full_grid) }, .block = .{ .x = 128 } }, s, &a);
++            }
++        }
++        {
++            var a: cuda.Args = .{};
++            a.add(b.act);
++            a.add(i32d(intermediate));
++            a.add(@as(i32, 0));
++            a.add(p.down);
++            a.add(p.down_scale);
++            a.add(i32d(kg_down));
++            a.add(i32d(nb_down));
++            for ([_]u64{ b.items, b.item_count, b.members, b.down }) |v| a.add(v);
++            a.add(i32d(hidden));
++            a.add(@as(f32, 0.0));
++            a.add(@as(i32, -1));
++            const half_units = 2 * item_bound * nb_down;
++            const full_grid = (item_bound * nb_down + 3) / 4;
++            if (splitDownEnabled() and half_units <= k.nv_down_half_resident * 4) {
++                const grid = (half_units + 3) / 4;
++                if (grid > 0) try cuda.launch.launch(k.nv_down_bf16_half, .{ .grid = .{ .x = @intCast(grid) }, .block = .{ .x = 128 } }, s, &a);
++            } else if (use_waves) {
++                const grid = @min(full_grid, k.nv_down_waves_resident);
++                if (grid > 0) try cuda.launch.launch(k.nv_down_bf16_waves, .{ .grid = .{ .x = @intCast(grid) }, .block = .{ .x = 128 } }, s, &a);
++            } else {
++                if (full_grid > 0) try cuda.launch.launch(k.nv_down_bf16, .{ .grid = .{ .x = @intCast(full_grid) }, .block = .{ .x = 128 } }, s, &a);
++            }
++        }
++    }
++
++    var ca: cuda.Args = .{};
++    for ([_]u64{ pick, weights, b.down, out }) |v| ca.add(v);
++    for ([_]i32{ i32d(rows), i32d(hidden), i32d(slots), i32d(l.experts) }) |v| ca.add(v);
++    const count = rows * hidden;
++    try cuda.launch.launch(k.combine, .{ .grid = .{ .x = @intCast((count + 255) / 256), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &ca);
++}
++
+ /// Run one MoE layer. `pick` is row-major int32 expert IDs; routing `weights` are fp32.
+ pub fn run(k: *const Kernels, s: cuda.Stream, l: Layer, caps: experts.Caps, x: u64, x_stride: usize, pick: u64, weights: u64, rows: usize, slots: usize, out: u64, scratch: u64) !void {
+     if (rows == 0 or rows > max_rows or slots == 0 or slots > max_slots or l.experts == 0 or l.experts > max_experts) return error.BadExperts;
+     if (l.w13.n % 64 != 0 or l.w13.k % 32 != 0 or l.w2.n % 32 != 0 or l.w2.k % 32 != 0) return error.BadExperts;
+     if (l.w13.k != l.w2.n or l.w13.n / 2 != l.w2.k or x_stride < l.w13.k) return error.BadExperts;
++    if (l.packed_nvfp4) |p| return runPackedNvfp4(k, s, l, p, caps, x, x_stride, pick, weights, rows, slots, out, scratch);
+     const hidden: usize = l.w2.n;
+     const intermediate: usize = l.w2.k;
+     const pairs = rows * slots;
+@@ -340,6 +579,134 @@ fn loadProjection(e: anytype, ck: *core.Checkpoint, prefix: []const u8, name: []
+     return p;
+ }
+ 
++pub fn outerScale(amax: f32, denominator: f32) f32 {
++    const a = core.bf16_round.value(core.bf16_round.bits(amax));
++    const d = core.bf16_round.value(core.bf16_round.bits(denominator));
++    return a / d;
++}
++
++/// Reusable load-time GPU repacker for NVFP4 experts into Nvfp4Experts BLOCK4 layout.
++/// Staging memory is owned here and freed before KV pool sizing.
++pub const Packer = struct {
++    d: *const cuda.Driver,
++    mod: cuda.Module,
++    pack_fn: cuda.Function,
++    stream: cuda.Stream,
++    stage: ?cuda.DeviceBuffer = null,
++
++    pub fn init(d: *const cuda.Driver) !Packer {
++        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
++        var mod = try cuda.Module.load(d, cuda.kernels.inkling2_modelopt);
++        errdefer mod.unload();
++        const pack_fn = try mod.function("tf_ink2_pack_fp4_experts");
++        var stream = try cuda.Stream.init(d, false);
++        errdefer stream.deinit();
++        return .{ .d = d, .mod = mod, .pack_fn = pack_fn, .stream = stream };
++    }
++
++    pub fn deinit(p: *Packer) void {
++        if (p.stage) |*b| b.free();
++        p.stream.deinit();
++        p.mod.unload();
++        p.* = undefined;
++    }
++
++    fn ensureStage(p: *Packer, bytes: usize) !*cuda.DeviceBuffer {
++        if (p.stage) |*b| {
++            if (b.len >= bytes) return b;
++            b.free();
++            p.stage = null;
++        }
++        p.stage = try cuda.DeviceBuffer.alloc(p.d, bytes);
++        return &p.stage.?;
++    }
++
++    fn launchPack(p: *const Packer, codes: u64, scales: u64, out: u64, count: usize, n_src: usize, n_out: usize, k: usize, row0: usize, row_step: usize, parts: usize, m: usize) !void {
++        var a: cuda.Args = .{};
++        for ([_]u64{ codes, scales, out }) |v| a.add(v);
++        for ([_]usize{ n_src, n_out, k, row0, row_step, parts, m }) |v| a.add(i32d(v));
++        try cuda.launch.launch(p.pack_fn, .{ .grid = .{ .x = @intCast(k / 32), .y = @intCast(n_out / 32), .z = @intCast(count) }, .block = .{ .x = 144 } }, p.stream, &a);
++    }
++};
++
++fn loadPackedNvfp4(e: anytype, packer: *Packer, ck: *core.Checkpoint, prefix: []const u8, count: usize, hidden: usize, intermediate: usize) !Layer {
++    var wb: [256]u8 = undefined;
++    var sb: [256]u8 = undefined;
++    var ab: [256]u8 = undefined;
++    var db: [256]u8 = undefined;
++
++    // Pack interleaved w13 (gate: row0=0, step=2 -> m=0; up: row0=1, step=2 -> m=1).
++    const w13_codes = try ck.expect(try std.fmt.bufPrint(&wb, "{s}w13_weight", .{prefix}), .u8, &.{ count, 2 * intermediate, hidden / 2 });
++    const w13_scales = try ck.expect(try std.fmt.bufPrint(&sb, "{s}w13_weight_scale", .{prefix}), .f8_e4m3, &.{ count, 2 * intermediate, hidden / 16 });
++    const w13_amax = try ck.expect(try std.fmt.bufPrint(&ab, "{s}w13_weight_amax", .{prefix}), .f32, &.{count});
++    const w13_den = try ck.expect(try std.fmt.bufPrint(&db, "{s}w13_weight_outer_scale_denominator", .{prefix}), .f32, &.{1});
++
++    const w13_sc_off = aligned(w13_codes.bytes.len);
++    const stage13 = try packer.ensureStage(w13_sc_off + w13_scales.bytes.len);
++    try stage13.upload(0, w13_codes.bytes);
++    try stage13.upload(w13_sc_off, w13_scales.bytes);
++    const up_ptr = try e.alloc(cuda.experts.Nvfp4Experts.bytes(count, intermediate, hidden, 2));
++    try packer.launchPack(stage13.ptr, stage13.ptr + w13_sc_off, up_ptr, count, 2 * intermediate, intermediate, hidden, 0, 2, 2, 0);
++    try packer.launchPack(stage13.ptr, stage13.ptr + w13_sc_off, up_ptr, count, 2 * intermediate, intermediate, hidden, 1, 2, 2, 1);
++    try packer.stream.synchronize();
++
++    var up_scales_host: [256]f32 = undefined;
++    const den13 = std.mem.bytesToValue(f32, w13_den.bytes[0..4]);
++    for (0..count) |i| {
++        const amax = std.mem.bytesToValue(f32, w13_amax.bytes[i * 4 ..][0..4]);
++        const s = outerScale(amax, den13);
++        up_scales_host[2 * i] = s;
++        up_scales_host[2 * i + 1] = s;
++    }
++    const up_scale_ptr = try put(e, std.mem.sliceAsBytes(up_scales_host[0 .. count * 2]));
++
++    // Pack contiguous w2 (row0=0, step=1 -> parts=1, m=0).
++    const w2_codes = try ck.expect(try std.fmt.bufPrint(&wb, "{s}w2_weight", .{prefix}), .u8, &.{ count, hidden, intermediate / 2 });
++    const w2_scales = try ck.expect(try std.fmt.bufPrint(&sb, "{s}w2_weight_scale", .{prefix}), .f8_e4m3, &.{ count, hidden, intermediate / 16 });
++    const w2_amax = try ck.expect(try std.fmt.bufPrint(&ab, "{s}w2_weight_amax", .{prefix}), .f32, &.{count});
++    const w2_den = try ck.expect(try std.fmt.bufPrint(&db, "{s}w2_weight_outer_scale_denominator", .{prefix}), .f32, &.{1});
++
++    const w2_sc_off = aligned(w2_codes.bytes.len);
++    const stage2 = try packer.ensureStage(w2_sc_off + w2_scales.bytes.len);
++    try stage2.upload(0, w2_codes.bytes);
++    try stage2.upload(w2_sc_off, w2_scales.bytes);
++    const down_ptr = try e.alloc(cuda.experts.Nvfp4Experts.bytes(count, hidden, intermediate, 1));
++    try packer.launchPack(stage2.ptr, stage2.ptr + w2_sc_off, down_ptr, count, hidden, hidden, intermediate, 0, 1, 1, 0);
++    try packer.stream.synchronize();
++
++    var down_scales_host: [128]f32 = undefined;
++    const den2 = std.mem.bytesToValue(f32, w2_den.bytes[0..4]);
++    for (0..count) |i| {
++        const amax = std.mem.bytesToValue(f32, w2_amax.bytes[i * 4 ..][0..4]);
++        down_scales_host[i] = outerScale(amax, den2);
++    }
++    const down_scale_ptr = try put(e, std.mem.sliceAsBytes(down_scales_host[0..count]));
++
++    return .{
++        .format = .nvfp4,
++        .experts = @intCast(count),
++        .w13 = .{ .codes = 0, .scales = 0, .n = @intCast(2 * intermediate), .k = @intCast(hidden) },
++        .w2 = .{ .codes = 0, .scales = 0, .n = @intCast(hidden), .k = @intCast(intermediate) },
++        .packed_nvfp4 = .{
++            .up = up_ptr,
++            .up_scale = up_scale_ptr,
++            .down = down_ptr,
++            .down_scale = down_scale_ptr,
++        },
++    };
++}
++
++/// Upload experts, repacking NVFP4 layers on GPU into Nvfp4Experts BLOCK4 layout when `packer` is active.
++pub fn loadPacked(e: anytype, packer: ?*Packer, ck: *core.Checkpoint, prefix: []const u8, format: Format, count: usize, hidden: usize, intermediate: usize) !Layer {
++    if (count == 0 or count > max_experts or hidden % 32 != 0 or intermediate % 32 != 0) return error.BadExperts;
++    if (packer) |p| {
++        if (format == .nvfp4 and count <= 128) {
++            return loadPackedNvfp4(e, p, ck, prefix, count, hidden, intermediate);
++        }
++    }
++    return load(e, ck, prefix, format, count, hidden, intermediate);
++}
++
+ /// Upload the checkpoint's two stored projections without a repack or an activation-quantization side input.
+ pub fn load(e: anytype, ck: *core.Checkpoint, prefix: []const u8, format: Format, count: usize, hidden: usize, intermediate: usize) !Layer {
+     if (count == 0 or count > max_experts or hidden % 32 != 0 or intermediate % 32 != 0) return error.BadExperts;
+@@ -351,6 +718,28 @@ pub fn load(e: anytype, ck: *core.Checkpoint, prefix: []const u8, format: Format
+     };
+ }
+ 
++test "packed NVFP4 layout matches raw arena byte count and exact item bounds" {
++    // Inkling 2 Mini NVFP4 layer: 128 experts, hidden 2304, intermediate 1152.
++    const raw_w13 = 128 * 2304 * (2304 / 2) + 128 * 2304 * (2304 / 16);
++    const raw_w2 = 128 * 2304 * (1152 / 2) + 128 * 2304 * (1152 / 16);
++    try std.testing.expectEqual(@as(usize, raw_w13), cuda.experts.Nvfp4Experts.bytes(128, 1152, 2304, 2));
++    try std.testing.expectEqual(@as(usize, raw_w2), cuda.experts.Nvfp4Experts.bytes(128, 2304, 1152, 1));
++    // Scales fit within raw amax + denominator aligned slots for every count in 1..128.
++    for (1..129) |cnt| {
++        const raw_sc = 2 * (aligned(cnt * 4) + aligned(4));
++        const packed_sc = aligned(cnt * 8) + aligned(cnt * 4);
++        try std.testing.expect(packed_sc <= raw_sc);
++    }
++    try std.testing.expectEqual(@as(usize, 8), maxItems(8, 128, 16));
++    try std.testing.expectEqual(@as(usize, 16), maxItems(16, 128, 16));
++    try std.testing.expectEqual(@as(usize, 64), maxItems(64, 128, 16));
++    try std.testing.expectEqual(@as(usize, 128), maxItems(128, 128, 16));
++    try std.testing.expectEqual(@as(usize, 130), maxItems(256, 128, 64));
++    try std.testing.expectEqual(@as(u32, 46080), promptQSmem(2, 4));
++    try std.testing.expectEqual(@as(u32, 46080), promptQSmem(1, 8));
++    try std.testing.expectEqual(@as(f32, 0.5), outerScale(3.0, 6.0));
++}
++
+ test "Mini's expert scratch holds all tensor-core stages and the group plan" {
+     const bytes = try scratchBytes(2048, 8, 2304, 1152);
+     try std.testing.expectEqual(@as(usize, 72), @sizeOf(Weight));
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index c7006a7..36191a1 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -59,6 +59,9 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_INKLING2_PREFILL_TC", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 enables Blackwell sm_121a native block-scaled MoE TC prefill)" },
+     .{ .name = "TF_INKLING2_VERIFY_TC_ROWS", .scope = .cuda, .kind = .u32, .min = 1, .max = 64, .forms = "1 to 64 (minimum MoE rows for Blackwell verify TC dispatch; default 32)" },
+     .{ .name = "TF_INKLING2_WIDE_ROWS", .scope = .cuda, .kind = .u32, .min = 0, .max = 64, .forms = "0 to 64 (minimum MoE rows for 32-col wide decode dispatch, 0 disables; default 4)" },
++    .{ .name = "TF_INKLING2_FAST_MOE", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 repacks Mini NVFP4 experts into BLOCK4 with fused softcap SwiGLU; default 1)" },
++    .{ .name = "TF_INKLING2_MOE_WAVES", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 caps Mini NVFP4 decode/verify grids to resident CTAs with equal-waves scheduling; default 0)" },
++    .{ .name = "TF_NVFP4_SPLIT_DOWN", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 splits Mini NVFP4 down projection into 16-column half units when resident; default 0)" },
+     .{ .name = "TF_INKLING2_TOPK_WARP", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 uses the Mini warp router)" },
+     .{ .name = "TF_INKLING2_LAZY_HEAD", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 prunes certified losers in Mini greedy decode)" },
+     .{ .name = "TF_INKLING2_ATTN_FP8_PREFETCH", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 prefetches Mini FP8 KV in decode)" },

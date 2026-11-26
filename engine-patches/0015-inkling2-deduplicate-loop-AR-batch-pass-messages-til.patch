@@ -1,0 +1,409 @@
+From edb3883b78ec90960343315031524b728823db0a Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+Date: Thu, 26 Nov 2026 12:24:34 +0000
+Subject: [PATCH] inkling2: deduplicate loop AR, batch pass messages, tile
+ small-M gates, use mix_rows
+
+Commit 1 (Lever 5, 100% lossless, zero extra VRAM):
+- Deduplicate 40 sliding tf_ink2_loop_ar launches per round on core passes 2 and 3
+  by running attention controller roles in reverse order (2, 1, 0) against shared AR output
+  (inspired by MiaAI-Lab commit 9e3cf20b patch 0005-mini-speed.patch).
+- Batch tf_ink2_loop_messages once per core pass (12 layers in 1 launch instead of 24)
+  when rows * core_layers <= prompt_rows, gated by TF_INKLING2_PASS_MESSAGES (default 1).
+- Default ops.mix to tf_ink2_mix_rows (with TF_INKLING2_MIX_NARROW=1 opt-in, adapted from
+  MiaAI-Lab 0005-mini-speed.patch) and add a 1-pass 5-register FP32 RMSNorm fast path in
+  tf_ink2_mix_rows for the 96 query==0 post-gate calls per round.
+- Add bit-exact 8-row tiled tf_ink2_loop_gate_down_tiled for 2 <= rows <= 128 (leaving
+  rows == 1 on gateDown and rows > 128 on existing 2-row gateDownPrepared so 4K/32K prefill
+  is untouched) and lower gateUpTiled threshold from rows >= 8 to rows >= 2.
+- Vectorize tf_ink2_rel_table with uint4 16-byte loads/stores at 128 threads/block
+  (adapted from MiaAI-Lab 0005-mini-speed.patch).
+---
+ zig/kernels/cuda/inkling2/attention.cu       | 22 +++++++--
+ zig/kernels/cuda/inkling2/loop_math.cu       | 51 ++++++++++++++++++++
+ zig/kernels/cuda/inkling2/ops.cu             | 25 ++++++++++
+ zig/src/families/inkling2/kernels.zig        |  2 +-
+ zig/src/families/inkling2/loop_math_cuda.zig | 40 +++++++++++++--
+ zig/src/families/inkling2/loop_round.zig     | 34 +++++++++----
+ zig/src/families/inkling2/ops.zig            |  5 +-
+ zig/src/platform/environment.zig             |  2 +
+ 8 files changed, 162 insertions(+), 19 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/attention.cu b/zig/kernels/cuda/inkling2/attention.cu
+index 39bb54e..ea4941c 100644
+--- a/zig/kernels/cuda/inkling2/attention.cu
++++ b/zig/kernels/cuda/inkling2/attention.cu
+@@ -118,16 +118,30 @@ extern "C" __global__ void tf_ink2_prep_fp8(TF_INK2_PREP_ARGS(uint8_t)) {
+ }
+ 
+ // tab[row, head, d] = bf16(rel[row, head, :] . proj[:, d]) for d < 1024, fp32 sums in tap order (rel_logits_proj).
++// Vectorized 8-col uint4 path adapted from MiaAI-Lab patch 0005. Copyright 2026 MiaAI-Lab.
+ extern "C" __global__ void tf_ink2_rel_table(const uint16_t* __restrict__ rel, const uint16_t* __restrict__ proj,
+                                              uint16_t* __restrict__ tab) {
+     using namespace ink2;
+     const size_t rh = blockIdx.x;
+     float r[kRel];
+     for (int j = 0; j < kRel; ++j) r[j] = bf(rel[rh * kRel + j]);
+-    for (int d = threadIdx.x; d < kExtent; d += blockDim.x) {
+-        float acc = 0.0f;
+-        for (int j = 0; j < kRel; ++j) acc += r[j] * bf(proj[j * kExtent + d]);
+-        tab[rh * kExtent + d] = tobf(acc);
++    for (int d0 = threadIdx.x * 8; d0 < kExtent; d0 += blockDim.x * 8) {
++        float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
++        for (int j = 0; j < kRel; ++j) {
++            const uint4 pv = *reinterpret_cast<const uint4*>(proj + j * kExtent + d0);
++            const uint32_t pw[4] = {pv.x, pv.y, pv.z, pv.w};
++#pragma unroll
++            for (int e = 0; e < 4; ++e) {
++                acc[2 * e] += r[j] * bf(static_cast<uint16_t>(pw[e] & 0xffff));
++                acc[2 * e + 1] += r[j] * bf(static_cast<uint16_t>(pw[e] >> 16));
++            }
++        }
++        uint4 o;
++        o.x = static_cast<uint32_t>(tobf(acc[0])) | (static_cast<uint32_t>(tobf(acc[1])) << 16);
++        o.y = static_cast<uint32_t>(tobf(acc[2])) | (static_cast<uint32_t>(tobf(acc[3])) << 16);
++        o.z = static_cast<uint32_t>(tobf(acc[4])) | (static_cast<uint32_t>(tobf(acc[5])) << 16);
++        o.w = static_cast<uint32_t>(tobf(acc[6])) | (static_cast<uint32_t>(tobf(acc[7])) << 16);
++        *reinterpret_cast<uint4*>(tab + rh * kExtent + d0) = o;
+     }
+ }
+ 
+diff --git a/zig/kernels/cuda/inkling2/loop_math.cu b/zig/kernels/cuda/inkling2/loop_math.cu
+index c66e4b4..9277217 100644
+--- a/zig/kernels/cuda/inkling2/loop_math.cu
++++ b/zig/kernels/cuda/inkling2/loop_math.cu
+@@ -484,6 +484,51 @@ __device__ void gateDownPrepared(const uint16_t* __restrict__ prepared, const ui
+     }
+ }
+ 
++// Small-M row-tiled gateDown: shares down across up to RT prepared rows per block with exact 256-thread reduction order.
++template <int RT>
++__device__ void gateDownTiled(const uint16_t* __restrict__ prepared, const uint16_t* __restrict__ down,
++                              uint16_t* __restrict__ zeta, int rows, int c) {
++    __shared__ float sh[2 * RT * 32];
++    const int row0 = static_cast<int>(blockIdx.x) * RT;
++    const int r = 2 * static_cast<int>(blockIdx.y);
++    const int width = 2 * c;
++    const int active = rows - row0 < RT ? rows - row0 : RT;
++    const uint16_t* d0 = down + static_cast<size_t>(r) * width;
++    const uint16_t* d1 = d0 + width;
++    float acc[2 * RT];
++#pragma unroll
++    for (int k = 0; k < 2 * RT; ++k) acc[k] = 0.0f;
++    if (active == RT) {
++        for (int i = threadIdx.x; i < width; i += blockDim.x) {
++            const float w0 = bf(__ldg(d0 + i));
++            const float w1 = bf(__ldg(d1 + i));
++#pragma unroll
++            for (int k = 0; k < RT; ++k) {
++                const float n = bf(__ldg(prepared + static_cast<size_t>(row0 + k) * width + i));
++                acc[2 * k] = __fmaf_rn(w0, n, acc[2 * k]);
++                acc[2 * k + 1] = __fmaf_rn(w1, n, acc[2 * k + 1]);
++            }
++        }
++    } else {
++        for (int i = threadIdx.x; i < width; i += blockDim.x) {
++            const float w0 = bf(__ldg(d0 + i));
++            const float w1 = bf(__ldg(d1 + i));
++            for (int k = 0; k < active; ++k) {
++                const float n = bf(__ldg(prepared + static_cast<size_t>(row0 + k) * width + i));
++                acc[2 * k] = __fmaf_rn(w0, n, acc[2 * k]);
++                acc[2 * k + 1] = __fmaf_rn(w1, n, acc[2 * k + 1]);
++            }
++        }
++    }
++    blockSums<2 * RT>(acc, sh);
++    if (threadIdx.x == 0) {
++        for (int k = 0; k < active; ++k) {
++            zeta[static_cast<size_t>(row0 + k) * kRank + r] = tobf(acc[2 * k]);
++            zeta[static_cast<size_t>(row0 + k) * kRank + r + 1] = tobf(acc[2 * k + 1]);
++        }
++    }
++}
++
+ // A gate's up half: a thread an output column, forget/gain FP32 through tanh (A7(a)), the same ascending rank chains.
+ __device__ void gateUp(const float* h, const float* __restrict__ m, const uint16_t* __restrict__ zeta,
+                        const uint16_t* __restrict__ forget, const uint16_t* __restrict__ gain, float* out, int c) {
+@@ -610,6 +655,12 @@ extern "C" __global__ void __launch_bounds__(256)
+     ink2l::gateDownPrepared(prepared, down, zeta, rows, c);
+ }
+ 
++extern "C" __global__ void __launch_bounds__(256)
++    tf_ink2_loop_gate_down_tiled(const uint16_t* __restrict__ prepared, const uint16_t* __restrict__ down,
++                                 uint16_t* __restrict__ zeta, int rows, int c) {
++    ink2l::gateDownTiled<8>(prepared, down, zeta, rows, c);
++}
++
+ extern "C" __global__ void __launch_bounds__(64)
+     tf_ink2_loop_gate_up(const float* h, const float* __restrict__ m, const uint16_t* __restrict__ zeta,
+                          const uint16_t* __restrict__ forget, const uint16_t* __restrict__ gain, float* out, int c) {
+diff --git a/zig/kernels/cuda/inkling2/ops.cu b/zig/kernels/cuda/inkling2/ops.cu
+index b7f3003..a478e3b 100644
+--- a/zig/kernels/cuda/inkling2/ops.cu
++++ b/zig/kernels/cuda/inkling2/ops.cu
+@@ -201,6 +201,31 @@ extern "C" __global__ void __launch_bounds__(512) tf_ink2_mix_rows(const MixArgs
+         return a.partial_bf16 ? bf(static_cast<const uint16_t*>(a.partial)[row * C + c])
+                               : static_cast<const float*>(a.partial)[row * C + c];
+     };
++    if (!a.query && a.nq == 1 && !a.partial_bf16 && C <= 5 * 512) {
++        // Post-gate RMSNorm fast path: single global read into 5 registers/thread with identical reduction order.
++        float hc[5];
++        float s[1] = {0.0f};
++        const float* src = static_cast<const float*>(a.partial) + row * C;
++#pragma unroll
++        for (int k = 0; k < 5; ++k) {
++            const int c = threadIdx.x + k * 512;
++            float h = 0.0f;
++            if (c < C) {
++                h = src[c];
++                s[0] += h * h;
++            }
++            hc[k] = h;
++        }
++        blockSums<1>(s, sh);
++        const float r = rsqrtf(s[0] / C + a.eps);
++        uint16_t* o = a.out + row * C;
++#pragma unroll
++        for (int k = 0; k < 5; ++k) {
++            const int c = threadIdx.x + k * 512;
++            if (c < C) o[c] = tobf(bf(a.norm[0][c]) * (hc[k] * r));
++        }
++        return;
++    }
+     if (a.query) {
+         for (int j = 0; j < n; ++j) {
+             float ss[1] = {0.0f};
+diff --git a/zig/src/families/inkling2/kernels.zig b/zig/src/families/inkling2/kernels.zig
+index 914c07c..ded3d7f 100644
+--- a/zig/src/families/inkling2/kernels.zig
++++ b/zig/src/families/inkling2/kernels.zig
+@@ -213,7 +213,7 @@ pub fn prep(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, c: Prep, raw:
+ pub fn relTable(k: *const Kernels, s: cuda.Stream, r: Rows, rel: u64, proj: u64, tab: u64) !void {
+     var a: cuda.Args = .{};
+     for ([_]u64{ rel, proj, tab }) |v| a.add(v);
+-    try go(k.rel_table, s, .{ .x = r.rows * r.heads }, 256, &a);
++    try go(k.rel_table, s, .{ .x = r.rows * r.heads }, 128, &a);
+ }
+ 
+ /// Attention into chunk partials (`stride` a row and head; a split call's sub-chunks), then the ordered merge.
+diff --git a/zig/src/families/inkling2/loop_math_cuda.zig b/zig/src/families/inkling2/loop_math_cuda.zig
+index 3a80eab..75c2765 100644
+--- a/zig/src/families/inkling2/loop_math_cuda.zig
++++ b/zig/src/families/inkling2/loop_math_cuda.zig
+@@ -34,16 +34,19 @@ pub const Kernels = struct {
+     gate_down_fn: cuda.Function,
+     gate_prepare_fn: cuda.Function,
+     gate_prepared_fn: cuda.Function,
++    gate_down_tiled_fn: cuda.Function,
+     gate_up_fn: cuda.Function,
+     gate_up_tiled_fn: cuda.Function,
+     copy_spans_fn: cuda.Function,
+     project_qkv_fn: cuda.Function,
+     round_bf16_fn: cuda.Function,
++    pass_messages: bool,
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+         var mod = try cuda.Module.load(d, cuda.kernels.inkling2_loop_math);
+         errdefer mod.unload();
++        const pass_messages = try @import("sys").environment.read(bool, "TF_INKLING2_PASS_MESSAGES", true);
+         return .{
+             .mod = mod,
+             .ar_fn = try mod.function("tf_ink2_loop_ar"),
+@@ -52,11 +55,13 @@ pub const Kernels = struct {
+             .gate_down_fn = try mod.function("tf_ink2_loop_gate_down"),
+             .gate_prepare_fn = try mod.function("tf_ink2_loop_gate_prepare"),
+             .gate_prepared_fn = try mod.function("tf_ink2_loop_gate_down_prepared"),
++            .gate_down_tiled_fn = try mod.function("tf_ink2_loop_gate_down_tiled"),
+             .gate_up_fn = try mod.function("tf_ink2_loop_gate_up"),
+             .gate_up_tiled_fn = try mod.function("tf_ink2_loop_gate_up_tiled"),
+             .copy_spans_fn = try mod.function("tf_ink2_copy_spans"),
+             .project_qkv_fn = try mod.function("tf_ink2_loop_project_qkv"),
+             .round_bf16_fn = try mod.function("tf_ink2_loop_round_bf16"),
++            .pass_messages = pass_messages,
+         };
+     }
+ 
+@@ -121,15 +126,44 @@ pub fn gate(
+     c: usize,
+     eps: f32,
+ ) !void {
+-    // Shared decode rounds contain at most 128 rows.
++    // Prompt chunks (>128 rows) use 2-row SMEM prepared down; small batches (2..128) share down across 8 rows/block.
+     if (prepared_bf16 != 0 and rows > 128) {
+         try gateDownPrepared(k, s, state_f32, message_f32, prepared_bf16, down_bf16, zeta_bf16, rows, c, eps);
++    } else if (prepared_bf16 != 0 and rows >= 2) {
++        try gateDownTiled(k, s, state_f32, message_f32, prepared_bf16, down_bf16, zeta_bf16, rows, c, eps);
+     } else {
+         try gateDown(k, s, state_f32, message_f32, down_bf16, zeta_bf16, rows, rank / 2, c, eps);
+     }
+     try gateUp(k, s, state_f32, message_f32, zeta_bf16, forget_bf16, gain_bf16, out_f32, rows, c);
+ }
+ 
++/// Normalize each row once, then share down across up to 8 rows per block and 32 rank-pair blocks.
++pub fn gateDownTiled(
++    k: *const Kernels,
++    s: cuda.Stream,
++    state: u64,
++    message: u64,
++    prepared: u64,
++    down: u64,
++    zeta: u64,
++    rows: usize,
++    c: usize,
++    eps: f32,
++) !void {
++    if (rows == 0 or c == 0) return error.Inkling2LoopGateShape;
++    var a: cuda.Args = .{};
++    for ([_]u64{ state, message, prepared }) |v| a.add(v);
++    a.add(int(c));
++    a.add(eps);
++    try go(k.gate_prepare_fn, s, .{ .x = @intCast(rows) }, 256, &a);
++
++    var b: cuda.Args = .{};
++    for ([_]u64{ prepared, down, zeta }) |v| b.add(v);
++    b.add(int(rows));
++    b.add(int(c));
++    try go(k.gate_down_tiled_fn, s, .{ .x = @intCast((rows + 7) / 8), .y = rank / 2 }, 256, &b);
++}
++
+ /// The down half alone: `pairs` rank pairs from the first (all 32 in `gate`; fewer only for a contract control).
+ pub fn gateDown(k: *const Kernels, s: cuda.Stream, state_f32: u64, message_f32: u64, down_bf16: u64, zeta_bf16: u64, rows: usize, pairs: usize, c: usize, eps: f32) !void {
+     if (rows == 0 or c == 0 or pairs == 0 or pairs > rank / 2) return error.Inkling2LoopGateShape;
+@@ -169,12 +203,12 @@ pub fn gateDownPrepared(
+     try go(k.gate_prepared_fn, s, prepared_grid, 256, &b);
+ }
+ 
+-/// The up half: forget/gain from zeta and the four-step output, 64 columns a block (8-row tiled when rows >= 8).
++/// The up half: forget/gain from zeta and the four-step output, 64 columns a block (8-row tiled when rows >= 2).
+ pub fn gateUp(k: *const Kernels, s: cuda.Stream, state_f32: u64, message_f32: u64, zeta_bf16: u64, forget_bf16: u64, gain_bf16: u64, out_f32: u64, rows: usize, c: usize) !void {
+     if (rows == 0 or c == 0) return error.Inkling2LoopGateShape;
+     var a: cuda.Args = .{};
+     for ([_]u64{ state_f32, message_f32, zeta_bf16, forget_bf16, gain_bf16, out_f32 }) |v| a.add(v);
+-    if (rows >= 8) {
++    if (rows >= 2) {
+         a.add(int(rows));
+         a.add(int(c));
+         try go(k.gate_up_tiled_fn, s, .{ .x = @intCast((rows + 7) / 8), .y = @intCast((c + 63) / 64) }, 64, &a);
+diff --git a/zig/src/families/inkling2/loop_round.zig b/zig/src/families/inkling2/loop_round.zig
+index e44b28a..e6c76f8 100644
+--- a/zig/src/families/inkling2/loop_round.zig
++++ b/zig/src/families/inkling2/loop_round.zig
+@@ -144,6 +144,8 @@ pub fn executePrompt(m: *Model, k: *Kernels, s: cuda.Stream, shape: Shape, image
+     var next = m.s.partial_b;
+     var n_blocks: usize = 0;
+     const lp = c.loop.?;
++    const core_layers: usize = lp.core_end - lp.core_start;
++    const batch_messages = k.loop.pass_messages and rows * core_layers <= m.promptRows();
+     const taps = if (shape.taps) m.taps else null;
+ 
+     for (m.w.p.visits[0..m.w.p.n_visits]) |visit| {
+@@ -162,28 +164,40 @@ pub fn executePrompt(m: *Model, k: *Kernels, s: cuda.Stream, shape: Shape, image
+             try m.copy(s, partial, m.s.prelude, rows * h * 2);
+             n_blocks = 1; // block zero is the embedding; later passes never inherit completed blocks
+         }
++        const raw_stride = rows * h * 4;
++        const norm_stride = rows * h * 2;
+         const messages = visit.hasMessages();
++        const core_j: usize = if (messages) visit.layer - lp.core_start else 0;
+         if (messages) {
+-            const core_j = visit.layer - lp.core_start;
+-            try loop_math.messages(&k.loop, s, m.s.bank0, m.s.bank1, m.w.cross_qm + 2 * core_j * h * 4, m.w.cross_kv + 2 * core_j * h * 4, m.s.messages, rows, 1, h, c.eps);
++            if (batch_messages) {
++                if (visit.layer == lp.core_start) {
++                    try loop_math.messages(&k.loop, s, m.s.bank0, m.s.bank1, m.w.cross_qm, m.w.cross_kv, m.s.messages, rows, core_layers, h, c.eps);
++                }
++            } else {
++                try loop_math.messages(&k.loop, s, m.s.bank0, m.s.bank1, m.w.cross_qm + 2 * core_j * h * 4, m.w.cross_kv + 2 * core_j * h * 4, m.s.messages, rows, 1, h, c.eps);
++            }
+         }
++        const msg_base = if (batch_messages) m.s.messages + core_j * 4 * raw_stride else m.s.messages;
+         const nq: usize = if (layer.kind == .global) 3 else 1;
+         const query = m.w.attn_queries[visit.layer];
+         const blocks = m.s.blocks[0..n_blocks];
+-        const raw_stride = rows * h * 4;
+-        const norm_stride = rows * h * 2;
+         if (messages) {
+             if (nq == 3) {
+                 try loop_math.ar(&k.loop, s, m.arBlocks(blocks, partial, query, m.s.raw, 3, true, rows));
+             } else {
+-                // A sliding layer stores one query; each gated role gets its own AR result from that query.
+-                for (0..3) |role| try loop_math.ar(&k.loop, s, m.arBlocks(blocks, partial, query, m.s.raw + role * raw_stride, 1, true, rows));
++                // Sliding layers share one AR query across Q, K, and V controllers (adapted from MiaAI-Lab 0005).
++                try loop_math.ar(&k.loop, s, m.arBlocks(blocks, partial, query, m.s.raw, 1, true, rows));
+             }
+-            for (0..3) |role| {
++            var rev: usize = 3;
++            while (rev > 0) {
++                rev -= 1;
++                const role = rev;
+                 const ctl = lw.controllers[role];
+-                try loop_math.gate(&k.loop, s, m.s.raw + role * raw_stride, m.s.messages + role * raw_stride, ctl.down, ctl.forget, ctl.gain, m.s.zeta, m.s.gate_inputs, m.s.raw + role * raw_stride, rows, h, c.eps);
++                const state_in = if (nq == 3) m.s.raw + role * raw_stride else m.s.raw;
++                const state_out = m.s.raw + role * raw_stride;
++                try loop_math.gate(&k.loop, s, state_in, msg_base + role * raw_stride, ctl.down, ctl.forget, ctl.gain, m.s.zeta, m.s.gate_inputs, state_out, rows, h, c.eps);
+                 const norms = [3]u64{ lw.attn.norms[role], lw.attn.norms[role], lw.attn.norms[role] };
+-                try ops.mix(&k.glue, s, m.mixArgs(&.{}, m.s.raw + role * raw_stride, 0, norms, m.s.normalized + role * norm_stride, 1, false, rows));
++                try ops.mix(&k.glue, s, m.mixArgs(&.{}, state_out, 0, norms, m.s.normalized + role * norm_stride, 1, false, rows));
+             }
+         } else {
+             try ops.mix(&k.glue, s, m.mixArgs(blocks, partial, query, lw.attn.norms, m.s.normalized, nq, true, rows));
+@@ -287,7 +301,7 @@ pub fn executePrompt(m: *Model, k: *Kernels, s: cuda.Stream, shape: Shape, image
+         if (messages) {
+             try loop_math.ar(&k.loop, s, m.arBlocks(mlp_blocks, m.s.t, mlp_query, m.s.raw, 1, false, rows));
+             const ctl = lw.controllers[3];
+-            try loop_math.gate(&k.loop, s, m.s.raw, m.s.messages + 3 * raw_stride, ctl.down, ctl.forget, ctl.gain, m.s.zeta, m.s.gate_inputs, m.s.raw, rows, h, c.eps);
++            try loop_math.gate(&k.loop, s, m.s.raw, msg_base + 3 * raw_stride, ctl.down, ctl.forget, ctl.gain, m.s.zeta, m.s.gate_inputs, m.s.raw, rows, h, c.eps);
+             try ops.mix(&k.glue, s, m.mixArgs(&.{}, m.s.raw, 0, .{ lw.mlp_norm, lw.mlp_norm, lw.mlp_norm }, m.s.normalized, 1, false, rows));
+         } else {
+             try ops.mix(&k.glue, s, m.mixArgs(mlp_blocks, m.s.t, mlp_query, .{ lw.mlp_norm, lw.mlp_norm, lw.mlp_norm }, m.s.normalized, 1, false, rows));
+diff --git a/zig/src/families/inkling2/ops.zig b/zig/src/families/inkling2/ops.zig
+index 28ceed2..0b87210 100644
+--- a/zig/src/families/inkling2/ops.zig
++++ b/zig/src/families/inkling2/ops.zig
+@@ -66,6 +66,7 @@ pub const Kernels = struct {
+     embed: cuda.Function,
+     mix: cuda.Function,
+     mix_rows: cuda.Function,
++    mix_narrow: bool,
+     rowdot: cuda.Function,
+     topk: cuda.Function,
+     topk_warp: ?cuda.Function,
+@@ -87,6 +88,7 @@ pub const Kernels = struct {
+         var rows_mod = try cuda.Module.load(d, cuda.kernels.inkling2_rows);
+         errdefer rows_mod.unload();
+         const warp_router = try @import("sys").environment.read(bool, "TF_INKLING2_TOPK_WARP", true);
++        const mix_narrow = try @import("sys").environment.read(bool, "TF_INKLING2_MIX_NARROW", false);
+         return .{
+             .mod = mod,
+             .rows_mod = rows_mod,
+@@ -95,6 +97,7 @@ pub const Kernels = struct {
+             .embed = try mod.function("tf_ink2_embed"),
+             .mix = try mod.function("tf_ink2_mix"),
+             .mix_rows = try mod.function("tf_ink2_mix_rows"),
++            .mix_narrow = mix_narrow,
+             .rowdot = try mod.function("tf_ink2_rowdot"),
+             .topk = try mod.function("tf_ink2_topk"),
+             .topk_warp = mod.function("tf_ink2_topk_warp") catch null,
+@@ -140,7 +143,7 @@ pub fn mix(k: *const Kernels, s: cuda.Stream, m: MixArgs) !void {
+     if (m.c > 10 * 512 or @rem(m.c, 128) != 0) return error.Inkling2MixWidth; // ops.cu: kMixCache x 512 columns, 16-byte copies
+     var a: cuda.Args = .{};
+     a.add(m);
+-    try go(if (m.rows <= 16) k.mix else k.mix_rows, s, .{ .x = @intCast(m.rows) }, 512, &a); // equal bits either way
++    try go(if (k.mix_narrow and m.rows <= 16) k.mix else k.mix_rows, s, .{ .x = @intCast(m.rows) }, 512, &a); // equal bits either way
+ }
+ 
+ /// out[row, j] = x[row] . w[j] over `c` (bf16 in), `j` outputs a row, bf16 or fp32 out, sigmoid when `sigmoid`.
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 5a83602..c7006a7 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -54,6 +54,8 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_INKLING2_QMMF", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 packs Mini attention weights onto qmmf lanes)" },
+     .{ .name = "TF_INKLING2_ATTN_FP8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 packs Mini wq/wk/wv/wo as FP8 qmmf weights)" },
+     .{ .name = "TF_INKLING2_GATE_FP8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 packs Mini gate_attn as FP8 qmmf weights)" },
++    .{ .name = "TF_INKLING2_PASS_MESSAGES", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 batches Mini core-pass loop messages into one launch; default 1)" },
++    .{ .name = "TF_INKLING2_MIX_NARROW", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 forces legacy narrow tf_ink2_mix kernel instead of tf_ink2_mix_rows; default 0)" },
+     .{ .name = "TF_INKLING2_PREFILL_TC", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 enables Blackwell sm_121a native block-scaled MoE TC prefill)" },
+     .{ .name = "TF_INKLING2_VERIFY_TC_ROWS", .scope = .cuda, .kind = .u32, .min = 1, .max = 64, .forms = "1 to 64 (minimum MoE rows for Blackwell verify TC dispatch; default 32)" },
+     .{ .name = "TF_INKLING2_WIDE_ROWS", .scope = .cuda, .kind = .u32, .min = 0, .max = 64, .forms = "0 to 64 (minimum MoE rows for 32-col wide decode dispatch, 0 disables; default 4)" },

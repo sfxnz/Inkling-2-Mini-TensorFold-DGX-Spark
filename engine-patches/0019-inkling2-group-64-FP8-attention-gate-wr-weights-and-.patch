@@ -1,0 +1,319 @@
+From 32736e24bfbee9865ddaaaa7f7db9c359934afff Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+Date: Thu, 26 Nov 2026 12:40:07 +0000
+Subject: [PATCH] inkling2: group-64 FP8 attention/gate/wr weights and
+ qmmf_group dense projection fusion
+
+Commit 4 (Lever 6 + Lever 10, zero extra VRAM):
+- Add tf_qmmf_group_fp8g and tf_qmmf_group_fp8g_c entries in qmmf.cu and .fp8g support
+  in qmmf_group.zig (with updated unit tests).
+- Upgrade ATTN_FP8 / GATE_FP8 (and opt-in TF_INKLING2_WR_FP8=1, default 0) from single
+  global power-of-2 scale to group-64 FP8 (.fp8g via tf_ink2_draft_pack_layers, gated by
+  TF_INKLING2_ATTN_FP8_GROUP=1 default; 0 reverts to single-scale .fp8 for A/B). Fits
+  within existing weight arena (1.0625 B/weight vs 2 B/weight BF16), zero extra VRAM.
+- Fuse same-input dense attention projections at M <= 16 via cuda.qmmf_group.Group
+  (TF_INKLING2_QMMF_GROUP=1 default): (wq, wk, wv, gate) on non-message sliding visits
+  and (wq, gate[, wr]) on global/message visits, cutting 88-116 launches/round and
+  sharing u_q loads across projections.
+- Distinguish .fp8g vs .fp8 vs .bf16 in loop_backend.zig warmCacheKey.
+---
+ zig/kernels/cuda/qmmf.cu                   |  2 +
+ zig/src/cuda/qmmf_group.zig                | 17 ++++++---
+ zig/src/families/inkling2/loop_backend.zig | 11 +++++-
+ zig/src/families/inkling2/loop_kernels.zig | 13 +++++++
+ zig/src/families/inkling2/loop_round.zig   | 34 ++++++++++++++---
+ zig/src/families/inkling2/loop_weights.zig | 44 +++++++++++++++++++---
+ zig/src/platform/environment.zig           |  3 ++
+ 7 files changed, 105 insertions(+), 19 deletions(-)
+
+diff --git a/zig/kernels/cuda/qmmf.cu b/zig/kernels/cuda/qmmf.cu
+index 6c6a4a4..c90101f 100644
+--- a/zig/kernels/cuda/qmmf.cu
++++ b/zig/kernels/cuda/qmmf.cu
+@@ -336,6 +336,8 @@ TF_QMMF_GROUP_ENTRY(tf_qmmf_group_fp4, FP4, 64, false)
+ TF_QMMF_GROUP_ENTRY(tf_qmmf_group_fp4_c, FP4, 64, true)
+ TF_QMMF_GROUP_ENTRY(tf_qmmf_group_fp8, FP8, 64, false)
+ TF_QMMF_GROUP_ENTRY(tf_qmmf_group_fp8_c, FP8, 64, true)
++TF_QMMF_GROUP_ENTRY(tf_qmmf_group_fp8g, FP8G, 64, false)
++TF_QMMF_GROUP_ENTRY(tf_qmmf_group_fp8g_c, FP8G, 64, true)
+ TF_QMMF_GROUP_ENTRY(tf_qmmf_group_bf16, BF16, 64, false)
+ TF_QMMF_GROUP_ENTRY(tf_qmmf_group_bf16_c, BF16, 64, true)
+ TF_QMMF_GROUP_ENTRY(tf_qmmf_group_bf16_half, BF16, 32, false)
+diff --git a/zig/src/cuda/qmmf_group.zig b/zig/src/cuda/qmmf_group.zig
+index 65cc9a4..343ed9c 100644
+--- a/zig/src/cuda/qmmf_group.zig
++++ b/zig/src/cuda/qmmf_group.zig
+@@ -18,12 +18,13 @@ comptime {
+ }
+ 
+ /// The instance a group takes: its mode and column tile (64, or the 32-column half tile).
+-pub const Kind = enum { fp4, fp8, bf16, bf16_half };
+-const kinds = [4]Kind{ .fp4, .fp8, .bf16, .bf16_half };
++pub const Kind = enum { fp4, fp8, fp8g, bf16, bf16_half };
++const kinds = [5]Kind{ .fp4, .fp8, .fp8g, .bf16, .bf16_half };
+ 
+-const symbols = [4][2][:0]const u8{
++const symbols = [5][2][:0]const u8{
+     .{ "tf_qmmf_group_fp4", "tf_qmmf_group_fp4_c" },
+     .{ "tf_qmmf_group_fp8", "tf_qmmf_group_fp8_c" },
++    .{ "tf_qmmf_group_fp8g", "tf_qmmf_group_fp8g_c" },
+     .{ "tf_qmmf_group_bf16", "tf_qmmf_group_bf16_c" },
+     .{ "tf_qmmf_group_bf16_half", "tf_qmmf_group_bf16_half_c" },
+ };
+@@ -32,6 +33,7 @@ fn shared(kind: Kind) u32 {
+     return switch (kind) {
+         .fp4 => q.sharedBytes(.fp4, 16),
+         .fp8 => q.sharedBytes(.fp8, 16),
++        .fp8g => q.sharedBytes(.fp8g, 16),
+         .bf16 => q.sharedBytes(.bf16, 16),
+         .bf16_half => q.halfShared(.bf16),
+     };
+@@ -45,7 +47,7 @@ pub fn plan(l: q.Lane, ws: []const q.Weight, outs: []const u64, m: usize) ?Shape
+     if (ws.len < 2 or ws.len > most or ws.len != outs.len or m == 0 or m > max_rows) return null;
+     if (!l.clusters or l.fuse_split_n != 0) return null; // pre-sm_90 slices meet in reduce_kernel; fused calls differ
+     const mode = ws[0].mode;
+-    if (mode != .fp4 and mode != .fp8 and mode != .bf16) return null;
++    if (mode != .fp4 and mode != .fp8 and mode != .fp8g and mode != .bf16) return null;
+     var half: ?bool = null;
+     var widest: u32 = 1;
+     for (ws, 0..) |w, i| {
+@@ -71,6 +73,7 @@ pub fn plan(l: q.Lane, ws: []const q.Weight, outs: []const u64, m: usize) ?Shape
+     const kind: Kind = switch (mode) {
+         .fp4 => .fp4,
+         .fp8 => .fp8,
++        .fp8g => .fp8g,
+         else => if (half.?) .bf16_half else .bf16,
+     };
+     return .{ .kind = kind, .cluster = widest, .blocks = first, .segs = segs };
+@@ -78,7 +81,7 @@ pub fn plan(l: q.Lane, ws: []const q.Weight, outs: []const u64, m: usize) ?Shape
+ 
+ /// The grouped instances, from the lane's module.
+ pub const Group = struct {
+-    fns: [4][2]Function,
++    fns: [5][2]Function,
+ 
+     pub fn load(l: *const q.Lane) !Group {
+         var g: Group = undefined;
+@@ -152,7 +155,9 @@ test "grouped projections refuse what their own launches would run another way"
+     try t.expect(plan(l, &.{ gate, gate }, &.{ 0x10, 0x10 }, 1) == null); // one output twice
+     try t.expect(plan(l, &.{ gate, weight(.fp8, 17408, 5120) }, outs[0..2], 1) == null); // two modes
+     try t.expect(plan(l, &.{ gate, weight(.fp4, 17408, 4096) }, outs[0..2], 1) == null); // two inputs' widths
+-    try t.expect(plan(l, &.{ weight(.fp8g, 1024, 5120), weight(.fp8g, 1024, 5120) }, outs[0..2], 1) == null);
++    try t.expect(plan(l, &.{ weight(.mxfp8, 1024, 5120), weight(.mxfp8, 1024, 5120) }, outs[0..2], 1) == null);
++    const fp8g = plan(l, &.{ weight(.fp8g, 3072, 2304), weight(.fp8g, 1024, 2304), weight(.fp8g, 1024, 2304), weight(.fp8g, 3072, 2304) }, outs[0..4], 4).?;
++    try t.expect(fp8g.kind == .fp8g and fp8g.cluster == 4 and fp8g.segs.count == 4);
+     try t.expect(plan(testLane(false), &.{ gate, gate }, outs[0..2], 1) == null); // slices meet in reduce_kernel
+     var fused = testLane(true);
+     fused.fuse_split_n = 1;
+diff --git a/zig/src/families/inkling2/loop_backend.zig b/zig/src/families/inkling2/loop_backend.zig
+index 0ef880e..5cb5645 100644
+--- a/zig/src/families/inkling2/loop_backend.zig
++++ b/zig/src/families/inkling2/loop_backend.zig
+@@ -115,9 +115,16 @@ pub const Backend = struct {
+         const ctx_str = std.fmt.bufPrint(&ctx_buf, "ctx{d}", .{b.m.context}) catch return null;
+         const attn_str: []const u8 = if (b.m.w.layers.len > 0)
+             if (b.m.w.layers[0].attn.qmmf) |qa|
+-                if (qa.wq.mode == .fp8)
++                if (qa.wq.mode == .fp8g)
++                    if (qa.gate.mode == .fp8g) "attn_fp8g_gate_fp8g" else "attn_fp8g"
++                else if (qa.wq.mode == .fp8)
+                     if (qa.gate.mode == .fp8) "attn_fp8_gate_fp8" else "attn_fp8"
+-                else if (qa.gate.mode == .fp8) "attn_bf16_gate_fp8" else "attn_bf16"
++                else if (qa.gate.mode == .fp8g)
++                    "attn_bf16_gate_fp8g"
++                else if (qa.gate.mode == .fp8)
++                    "attn_bf16_gate_fp8"
++                else
++                    "attn_bf16"
+             else
+                 "attn_raw"
+         else
+diff --git a/zig/src/families/inkling2/loop_kernels.zig b/zig/src/families/inkling2/loop_kernels.zig
+index 34a35e9..aedc0c1 100644
+--- a/zig/src/families/inkling2/loop_kernels.zig
++++ b/zig/src/families/inkling2/loop_kernels.zig
+@@ -12,6 +12,7 @@ pub const Kernels = struct {
+     attn: attention.Kernels,
+     moe: modelopt.Kernels,
+     qmmf: cuda.qmmf.Lane,
++    qmmf_group: ?cuda.qmmf_group.Group = null,
+     loop: loop_math.Kernels,
+     sample_mod: cuda.Module,
+     draws: cuda.sample.Draws,
+@@ -28,6 +29,8 @@ pub const Kernels = struct {
+         var qmmf = try cuda.qmmf.Lane.load(d, cap / 10);
+         errdefer qmmf.unload();
+         try qmmf.loadPrompt(d);
++        const group_on = try @import("sys").environment.read(bool, "TF_INKLING2_QMMF_GROUP", true);
++        const qmmf_group: ?cuda.qmmf_group.Group = if (group_on and qmmf.clusters) try cuda.qmmf_group.Group.load(&qmmf) else null;
+         var lm = try loop_math.Kernels.load(d);
+         errdefer lm.unload();
+         var sample_mod = try cuda.Module.load(d, cuda.kernels.sample);
+@@ -37,6 +40,7 @@ pub const Kernels = struct {
+             .attn = attn,
+             .moe = moe,
+             .qmmf = qmmf,
++            .qmmf_group = qmmf_group,
+             .loop = lm,
+             .sample_mod = sample_mod,
+             .draws = try cuda.sample.Draws.resolve(sample_mod),
+@@ -61,6 +65,15 @@ pub const Kernels = struct {
+         try k.qmmf.matmul(s, x, w.k, rows, w, out, part);
+     }
+ 
++    pub fn projectQmmfGroup(k: *const Kernels, s: cuda.Stream, ws: []const cuda.qmmf.Weight, x: u64, rows: usize, outs: []const u64, part: u64) !void {
++        if (k.qmmf_group) |grp| {
++            if (cuda.qmmf_group.plan(k.qmmf, ws, outs, rows)) |sh| {
++                return grp.launch(s, x, rows, ws[0].k, sh, k.qmmf.pdl);
++            }
++        }
++        for (ws, outs) |w, o| try k.projectQmmf(s, w, x, rows, o, part);
++    }
++
+     pub fn deinit(k: *Kernels) void {
+         k.sample_mod.unload();
+         k.loop.unload();
+diff --git a/zig/src/families/inkling2/loop_round.zig b/zig/src/families/inkling2/loop_round.zig
+index ff2b8ea..e80072c 100644
+--- a/zig/src/families/inkling2/loop_round.zig
++++ b/zig/src/families/inkling2/loop_round.zig
+@@ -234,11 +234,35 @@ pub fn executePrompt(m: *Model, k: *Kernels, s: cuda.Stream, shape: Shape, image
+         const q_width: usize = @as(usize, layer.heads.q) * layer.heads.dim;
+         const kv_width: usize = @as(usize, layer.heads.kv) * layer.heads.dim;
+         if (lw.attn.qmmf) |qa| {
+-            try k.projectQmmf(s, qa.wq, u_q, rows, m.s.q_raw, m.s.dense_part);
+-            try k.projectQmmf(s, qa.wk, u_k, rows, m.s.k_raw, m.s.dense_part);
+-            try k.projectQmmf(s, qa.wv, u_v, rows, m.s.v_raw, m.s.dense_part);
+-            try k.projectQmmf(s, qa.gate, u_q, rows, m.s.gate, m.s.dense_part);
+-            try k.projectQmmf(s, qa.wr, u_q, rows, m.s.rel_raw, m.s.dense_part);
++            const shared_kv = u_k == u_q and u_v == u_q;
++            if (shared_kv) {
++                if (qa.wq.mode == qa.gate.mode) {
++                    const all_ws = [_]cuda.qmmf.Weight{ qa.wq, qa.wk, qa.wv, qa.gate };
++                    const all_outs = [_]u64{ m.s.q_raw, m.s.k_raw, m.s.v_raw, m.s.gate };
++                    if (k.qmmf_group != null and cuda.qmmf_group.plan(k.qmmf, &all_ws, &all_outs, rows) != null) {
++                        try k.projectQmmfGroup(s, &all_ws, u_q, rows, &all_outs, m.s.dense_part);
++                    } else {
++                        try k.projectQmmfGroup(s, &.{ qa.wq, qa.gate }, u_q, rows, &.{ m.s.q_raw, m.s.gate }, m.s.dense_part);
++                        try k.projectQmmfGroup(s, &.{ qa.wk, qa.wv }, u_q, rows, &.{ m.s.k_raw, m.s.v_raw }, m.s.dense_part);
++                    }
++                    try k.projectQmmf(s, qa.wr, u_q, rows, m.s.rel_raw, m.s.dense_part);
++                } else {
++                    try k.projectQmmfGroup(s, &.{ qa.wq, qa.wk, qa.wv }, u_q, rows, &.{ m.s.q_raw, m.s.k_raw, m.s.v_raw }, m.s.dense_part);
++                    try k.projectQmmfGroup(s, &.{ qa.gate, qa.wr }, u_q, rows, &.{ m.s.gate, m.s.rel_raw }, m.s.dense_part);
++                }
++            } else {
++                if (qa.wq.mode == qa.gate.mode and qa.wq.mode == qa.wr.mode) {
++                    try k.projectQmmfGroup(s, &.{ qa.wq, qa.gate, qa.wr }, u_q, rows, &.{ m.s.q_raw, m.s.gate, m.s.rel_raw }, m.s.dense_part);
++                } else if (qa.wq.mode == qa.gate.mode) {
++                    try k.projectQmmfGroup(s, &.{ qa.wq, qa.gate }, u_q, rows, &.{ m.s.q_raw, m.s.gate }, m.s.dense_part);
++                    try k.projectQmmf(s, qa.wr, u_q, rows, m.s.rel_raw, m.s.dense_part);
++                } else {
++                    try k.projectQmmf(s, qa.wq, u_q, rows, m.s.q_raw, m.s.dense_part);
++                    try k.projectQmmfGroup(s, &.{ qa.gate, qa.wr }, u_q, rows, &.{ m.s.gate, m.s.rel_raw }, m.s.dense_part);
++                }
++                try k.projectQmmf(s, qa.wk, u_k, rows, m.s.k_raw, m.s.dense_part);
++                try k.projectQmmf(s, qa.wv, u_v, rows, m.s.v_raw, m.s.dense_part);
++            }
+         } else {
+             try loop_math.projectQkv(&k.loop, s, u_q, u_k, u_v, lw.attn.wq, lw.attn.wk, lw.attn.wv, m.s.q_raw, m.s.k_raw, m.s.v_raw, rows, h, q_width, kv_width);
+             try ops.rowdot(&k.glue, s, u_q, lw.attn.gate, m.s.gate, rows, q_width, h, true, false);
+diff --git a/zig/src/families/inkling2/loop_weights.zig b/zig/src/families/inkling2/loop_weights.zig
+index 87f4e6b..4adca00 100644
+--- a/zig/src/families/inkling2/loop_weights.zig
++++ b/zig/src/families/inkling2/loop_weights.zig
+@@ -29,6 +29,14 @@ pub fn gateFp8Enabled() bool {
+     return @import("sys").environment.read(bool, "TF_INKLING2_GATE_FP8", false) catch false;
+ }
+ 
++pub fn attnFp8GroupEnabled() bool {
++    return @import("sys").environment.read(bool, "TF_INKLING2_ATTN_FP8_GROUP", false) catch true;
++}
++
++pub fn wrFp8Enabled() bool {
++    return @import("sys").environment.read(bool, "TF_INKLING2_WR_FP8", false) catch false;
++}
++
+ pub const Controller = struct {
+     down: u64,
+     forget: u64,
+@@ -124,6 +132,7 @@ const Loader = struct {
+     fn qmmfWeight(
+         l: *Loader,
+         ops_k: *const ops.Kernels,
++        pack_fp8g: ?cuda.Function,
+         d: *const cuda.Driver,
+         s: cuda.Stream,
+         stage: *cuda.DeviceBuffer,
+@@ -139,6 +148,24 @@ const Loader = struct {
+         const bytes = (try ck.expect(name, .bf16, &.{ n, k })).bytes;
+         try stage.upload(0, bytes);
+         if (fp8) {
++            if (pack_fp8g) |pack_fn| {
++                const npad = cuda.fp8.padded(n);
++                const groups = k / cuda.qmmf.group;
++                const codes_dst = try l.alloc(npad * k);
++                const scales_dst = try l.alloc(npad * groups * 4);
++                var a: cuda.Args = .{};
++                a.add(stage.ptr);
++                a.add(codes_dst);
++                a.add(scales_dst);
++                a.add(@as(i32, @intCast(n)));
++                a.add(@as(i32, @intCast(k)));
++                const work = npad * groups;
++                try cuda.launch.launch(pack_fn, .{ .grid = .{ .x = @intCast((work + 7) / 8) }, .block = .{ .x = 256 } }, s, &a);
++                try s.synchronize();
++                var w = cuda.fp8.weight(codes_dst, scales_dst, n, k);
++                w.sk = 0; // Allow split-K cluster schedules for decode and fused tiles for prefill.
++                return w;
++            }
+             const dst = try l.alloc(cuda.fp8.padded(n) * k);
+             var w = try lazy_head.pack(d, s, stage.ptr, dst, n, k);
+             w.sk = 0; // Allow split-K cluster schedules for decode and fused tiles for prefill.
+@@ -212,8 +239,13 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, ck: *core.Checkpoint,
+     const use_qmmf = qmmfEnabled() and h % 64 == 0 and q_max % 128 == 0;
+     const use_attn_fp8 = use_qmmf and attnFp8Enabled();
+     const use_gate_fp8 = use_qmmf and gateFp8Enabled();
++    const use_wr_fp8 = use_qmmf and wrFp8Enabled();
++    const use_fp8_group = (use_attn_fp8 or use_gate_fp8 or use_wr_fp8) and attnFp8GroupEnabled();
+     var ops_k: ?ops.Kernels = if (use_qmmf) try ops.Kernels.load(d) else null;
+     defer if (ops_k) |*ok| ok.unload();
++    var pack_mod: ?cuda.Module = if (use_fp8_group) try cuda.Module.load(d, cuda.kernels.inkling2_dspark) else null;
++    defer if (pack_mod) |*pm| pm.unload();
++    const pack_fp8g: ?cuda.Function = if (pack_mod) |pm| try pm.function("tf_ink2_draft_pack_layers") else null;
+     var pack_stream: ?cuda.Stream = if (use_qmmf) try cuda.Stream.init(d, false) else null;
+     defer if (pack_stream) |*ps| ps.deinit();
+     var stage: ?cuda.DeviceBuffer = if (use_qmmf) try cuda.DeviceBuffer.alloc(d, @max(q_max * h, h * q_max) * 2) else null;
+@@ -252,12 +284,12 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, ck: *core.Checkpoint,
+             const ok = &ops_k.?;
+             const ps = pack_stream.?;
+             const sb = &stage.?;
+-            const qw = try l.qmmfWeight(ok, d, ps, sb, ck, "model.llm.layers.{d}.attn.wq_du.weight", L, q, h, use_attn_fp8);
+-            const kw = try l.qmmfWeight(ok, d, ps, sb, ck, "model.llm.layers.{d}.attn.wk_dv.weight", L, kv, h, use_attn_fp8);
+-            const vw = try l.qmmfWeight(ok, d, ps, sb, ck, "model.llm.layers.{d}.attn.wv_dv.weight", L, kv, h, use_attn_fp8);
+-            const rw = try l.qmmfWeight(ok, d, ps, sb, ck, "model.llm.layers.{d}.attn.wr_du.weight", L, @as(usize, hd.q) * c.text.d_rel, h, false);
+-            const ow = try l.qmmfWeight(ok, d, ps, sb, ck, "model.llm.layers.{d}.attn.wo_ud.weight", L, h, q, use_attn_fp8);
+-            const gw = try l.qmmfWeight(ok, d, ps, sb, ck, "model.llm.layers.{d}.attn.gate_attn.weight", L, q, h, use_gate_fp8);
++            const qw = try l.qmmfWeight(ok, pack_fp8g, d, ps, sb, ck, "model.llm.layers.{d}.attn.wq_du.weight", L, q, h, use_attn_fp8);
++            const kw = try l.qmmfWeight(ok, pack_fp8g, d, ps, sb, ck, "model.llm.layers.{d}.attn.wk_dv.weight", L, kv, h, use_attn_fp8);
++            const vw = try l.qmmfWeight(ok, pack_fp8g, d, ps, sb, ck, "model.llm.layers.{d}.attn.wv_dv.weight", L, kv, h, use_attn_fp8);
++            const rw = try l.qmmfWeight(ok, pack_fp8g, d, ps, sb, ck, "model.llm.layers.{d}.attn.wr_du.weight", L, @as(usize, hd.q) * c.text.d_rel, h, use_wr_fp8);
++            const ow = try l.qmmfWeight(ok, pack_fp8g, d, ps, sb, ck, "model.llm.layers.{d}.attn.wo_ud.weight", L, h, q, use_attn_fp8);
++            const gw = try l.qmmfWeight(ok, pack_fp8g, d, ps, sb, ck, "model.llm.layers.{d}.attn.gate_attn.weight", L, q, h, use_gate_fp8);
+             break :blk .{
+                 .wq = 0,
+                 .wk = 0,
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 07ea1ed..419d507 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -54,6 +54,9 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_INKLING2_QMMF", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 packs Mini attention weights onto qmmf lanes)" },
+     .{ .name = "TF_INKLING2_ATTN_FP8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 packs Mini wq/wk/wv/wo as FP8 qmmf weights)" },
+     .{ .name = "TF_INKLING2_GATE_FP8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 packs Mini gate_attn as FP8 qmmf weights)" },
++    .{ .name = "TF_INKLING2_ATTN_FP8_GROUP", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 packs Mini ATTN_FP8/GATE_FP8 as group-64 fp8g instead of per-tensor fp8; default 0)" },
++    .{ .name = "TF_INKLING2_WR_FP8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 packs Mini wr projection as group-64 fp8g; default 0)" },
++    .{ .name = "TF_INKLING2_QMMF_GROUP", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 fuses Mini dense qmmf projections at M<=16 via qmmf_group; default 1)" },
+     .{ .name = "TF_INKLING2_PASS_MESSAGES", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 batches Mini core-pass loop messages into one launch; default 1)" },
+     .{ .name = "TF_INKLING2_MIX_NARROW", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 forces legacy narrow tf_ink2_mix kernel instead of tf_ink2_mix_rows; default 0)" },
+     .{ .name = "TF_INKLING2_PREFILL_TC", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 enables Blackwell sm_121a native block-scaled MoE TC prefill)" },

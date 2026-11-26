@@ -12,3 +12,12 @@
 0012-inkling2-batch-prefix-StateCopy-spans-8-row-32-row-l.patch
 0013-inkling2-restore-loop_ar-gateUpTiled-occupancy-and-u.patch
 0014-inkling2-8-warp-2x4-prompt_tc_coop-with-RT-2-and-2-r.patch
+0015-inkling2-deduplicate-loop-AR-batch-pass-messages-til.patch
+0016-inkling2-batch-multi-stream-conv-attn-bucket-global-.patch
+0017-inkling2-pack-NVFP4-experts-into-BLOCK4-with-fused-s.patch
+0018-inkling2-lossless-BF16-TC-unembed-with-fused-softcap.patch
+0019-inkling2-group-64-FP8-attention-gate-wr-weights-and-.patch
+0020-inkling2-fix-shared_guard-policy-and-measure-multi-s.patch
+0021-inkling2-fuse-keyed-DFlash2-selector-fix-graph-key-a.patch
+0022-inkling2-add-vocab-pruned-FP8-draft-head-and-wire-dr.patch
+0023-inkling2-rewrite-tf_ink2_df_attn_batch-with-BF16-Ten.patch

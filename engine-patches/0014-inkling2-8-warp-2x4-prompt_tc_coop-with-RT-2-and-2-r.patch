@@ -1,8 +1,8 @@
 From 48f5781fbaf96ed4fc378e313317bc68ddc0d15a Mon Sep 17 00:00:00 2001
-From: sfxnz <sfxnz@users.noreply.github.com>
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
 Date: Thu, 26 Nov 2026 00:57:22 +0000
-Subject: [PATCH 14/14] inkling2: 8-warp 2x4 prompt_tc_coop with RT=2 and 2-row
- r+=8 gateDownPrepared
+Subject: [PATCH] inkling2: 8-warp 2x4 prompt_tc_coop with RT=2 and 2-row r+=8
+ gateDownPrepared
 
 ---
  zig/kernels/cuda/inkling2/loop_math.cu       | 60 ++++++++-----
@@ -316,6 +316,3 @@ index 2c5296c..605650b 100644
  }
  
  /// Run one MoE layer. `pick` is row-major int32 expert IDs; routing `weights` are fp32.
--- 
-2.43.0
-
