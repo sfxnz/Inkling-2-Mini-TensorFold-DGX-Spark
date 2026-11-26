@@ -1,0 +1,586 @@
+From 296d55af36f9b0f1b6a227bb0b85d1cf9cb017a3 Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+Date: Wed, 25 Nov 2026 23:27:31 +0000
+Subject: [PATCH 12/14] inkling2: batch prefix StateCopy spans, 8-row/32-row
+ loop gates, and reg-cached ar/messages
+
+---
+ zig/kernels/cuda/inkling2/loop_math.cu       | 278 ++++++++++++++++---
+ zig/src/families/inkling2/loop_backend.zig   |  16 ++
+ zig/src/families/inkling2/loop_math_cuda.zig |  28 +-
+ zig/src/families/inkling2/loop_pages.zig     |  18 +-
+ zig/src/families/inkling2/loop_prompt.zig    |  10 +-
+ 5 files changed, 306 insertions(+), 44 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/loop_math.cu b/zig/kernels/cuda/inkling2/loop_math.cu
+index e941f7f..0003c6d 100644
+--- a/zig/kernels/cuda/inkling2/loop_math.cu
++++ b/zig/kernels/cuda/inkling2/loop_math.cu
+@@ -72,6 +72,64 @@ __device__ void arBody(const ArArgs a) {
+         return a.partial_bf16 ? bf(static_cast<const uint16_t*>(a.partial)[row * a.C + c])
+                               : static_cast<const float*>(a.partial)[row * a.C + c];
+     };
++    if (!CACHED && a.C <= 2560 && a.n_blocks <= kMaxBlocks) {
++        float xreg[kMaxBlocks + 1][5];
++        for (int j = 0; j < n; ++j) {
++            float ss[1] = {0.0f};
++#pragma unroll
++            for (int s = 0; s < 5; ++s) {
++                const int c = threadIdx.x + 512 * s;
++                if (c < a.C) {
++                    const float x = entry_global(j, c);
++                    xreg[j][s] = x;
++                    ss[0] = __fmaf_rn(x, x, ss[0]);
++                }
++            }
++            blockSums<1>(ss, sh);
++            if (threadIdx.x == 0) rr[j] = rsqrtf(__fadd_rn(__fdiv_rn(ss[0], static_cast<float>(a.C)), a.eps));
++        }
++        __syncthreads();
++        for (int j = 0; j < n; ++j) {
++            float dots[kMaxQueries] = {0.0f, 0.0f, 0.0f};
++#pragma unroll
++            for (int s = 0; s < 5; ++s) {
++                const int c = threadIdx.x + 512 * s;
++                if (c < a.C) {
++                    const float normalized = __fmul_rn(xreg[j][s], rr[j]);
++                    for (int q = 0; q < a.nq; ++q)
++                        dots[q] = __fmaf_rn(a.query[static_cast<size_t>(q) * a.C + c], normalized, dots[q]);
++                }
++            }
++            blockSums<kMaxQueries>(dots, sh);
++            if (threadIdx.x == 0)
++                for (int q = 0; q < a.nq; ++q) wts[q][j] = __fmul_rn(dots[q], queryScale(a.C));
++        }
++        __syncthreads();
++        if (threadIdx.x < a.nq) {
++            float* l = wts[threadIdx.x];
++            float m = -INFINITY, d = 0.0f;
++            for (int j = 0; j < n; ++j) m = fmaxf(m, l[j]);
++            for (int j = 0; j < n; ++j) d = __fadd_rn(d, expf(l[j] - m));
++            for (int j = 0; j < n; ++j) l[j] = __fdiv_rn(expf(l[j] - m), d);
++        }
++        __syncthreads();
++        for (int q = 0; q < a.nq; ++q) {
++            float* out = a.out + (static_cast<size_t>(q) * a.rows + row) * a.C;
++#pragma unroll
++            for (int s = 0; s < 5; ++s) {
++                const int c = threadIdx.x + 512 * s;
++                if (c < a.C) {
++                    float h = 0.0f;
++                    for (int j = 0; j < n; ++j) {
++                        const float z = __fmul_rn(xreg[j][s], rr[j]);
++                        h = __fmaf_rn(wts[q][j], z, h);
++                    }
++                    out[c] = h;
++                }
++            }
++        }
++        return;
++    }
+     auto entry_cached = [&](int j, int c) -> float {
+         if (j < a.n_blocks) return bf(s_blk[static_cast<size_t>(j) * a.C + c]);
+         return a.partial_bf16 ? bf(s_part_bf[c]) : s_part[c];
+@@ -159,6 +217,58 @@ __device__ void messages(const uint16_t* __restrict__ bank0, const uint16_t* __r
+     const uint16_t* banks[2] = {bank0 + row * c, bank1 + row * c};
+     const float* role_queries = role == 0 || role == 3 ? qm : qkv;
+     const int odd = role == 3 || role == 2;
++    if (c <= 2304) {
++        float b0_reg[9], b1_reg[9];
++        float ss[2] = {0.0f, 0.0f};
++#pragma unroll
++        for (int s = 0; s < 9; ++s) {
++            const int i = threadIdx.x + 256 * s;
++            if (i < c) {
++                const float x0 = bf(banks[0][i]), x1 = bf(banks[1][i]);
++                b0_reg[s] = x0;
++                b1_reg[s] = x1;
++                ss[0] = __fmaf_rn(x0, x0, ss[0]);
++                ss[1] = __fmaf_rn(x1, x1, ss[1]);
++            }
++        }
++        blockSums<2>(ss, sh);
++        if (threadIdx.x == 0) {
++            inv[0] = rsqrtf(__fadd_rn(__fdiv_rn(ss[0], static_cast<float>(c)), eps));
++            inv[1] = rsqrtf(__fadd_rn(__fdiv_rn(ss[1], static_cast<float>(c)), eps));
++        }
++        __syncthreads();
++        for (int j = 0; j < core_layers; ++j) {
++            const float* query = role_queries + static_cast<size_t>(2 * j + odd) * c;
++            float dots[2] = {0.0f, 0.0f};
++#pragma unroll
++            for (int s = 0; s < 9; ++s) {
++                const int i = threadIdx.x + 256 * s;
++                if (i < c) {
++                    const float q = query[i];
++                    const float b0 = __fmul_rn(b0_reg[s], inv[0]);
++                    const float b1 = __fmul_rn(b1_reg[s], inv[1]);
++                    dots[0] = __fmaf_rn(q, b0, dots[0]);
++                    dots[1] = __fmaf_rn(q, b1, dots[1]);
++                }
++            }
++            blockSums<2>(dots, sh);
++            if (threadIdx.x == 0)
++                softmax2(__fmul_rn(dots[0], queryScale(c)), __fmul_rn(dots[1], queryScale(c)), w);
++            __syncthreads();
++            float* dst = out + ((static_cast<size_t>(j) * 4 + role) * rows + row) * static_cast<size_t>(c);
++#pragma unroll
++            for (int s = 0; s < 9; ++s) {
++                const int i = threadIdx.x + 256 * s;
++                if (i < c) {
++                    const float b0 = __fmul_rn(b0_reg[s], inv[0]);
++                    const float b1 = __fmul_rn(b1_reg[s], inv[1]);
++                    const float m0 = __fmul_rn(w[0], b0), m1 = __fmul_rn(w[1], b1);
++                    dst[i] = __fadd_rn(m0, m1);
++                }
++            }
++        }
++        return;
++    }
+     float ss[2] = {0.0f, 0.0f};
+     for (int i = threadIdx.x; i < c; i += blockDim.x) {
+         const float x0 = bf(banks[0][i]), x1 = bf(banks[1][i]);
+@@ -279,8 +389,39 @@ __device__ void gatePrepare(const float* __restrict__ h, const float* __restrict
+     const size_t row = blockIdx.x;
+     const float* hr = h + row * c;
+     const float* mr = m + row * c;
+-    const float2 inv = gateNorms(hr, mr, c, eps, sh);
+     uint16_t* dst = prepared + row * (2 * c);
++    if (c <= 2304) {
++        __shared__ float2 inv;
++        float h_reg[9], m_reg[9];
++        float ss[2] = {0.0f, 0.0f};
++#pragma unroll
++        for (int s = 0; s < 9; ++s) {
++            const int i = threadIdx.x + 256 * s;
++            if (i < c) {
++                const float hv = hr[i], mv = mr[i];
++                h_reg[s] = hv;
++                m_reg[s] = mv;
++                ss[0] = __fmaf_rn(hv, hv, ss[0]);
++                ss[1] = __fmaf_rn(mv, mv, ss[1]);
++            }
++        }
++        blockSums<2>(ss, sh);
++        if (threadIdx.x == 0) {
++            inv.x = rsqrtf(__fadd_rn(__fdiv_rn(ss[0], static_cast<float>(c)), eps));
++            inv.y = rsqrtf(__fadd_rn(__fdiv_rn(ss[1], static_cast<float>(c)), eps));
++        }
++        __syncthreads();
++#pragma unroll
++        for (int s = 0; s < 9; ++s) {
++            const int i = threadIdx.x + 256 * s;
++            if (i < c) {
++                dst[i] = tobf(__fmul_rn(h_reg[s], inv.x));
++                dst[c + i] = tobf(__fmul_rn(m_reg[s], inv.y));
++            }
++        }
++        return;
++    }
++    const float2 inv = gateNorms(hr, mr, c, eps, sh);
+     for (int i = threadIdx.x; i < c; i += blockDim.x) {
+         dst[i] = tobf(__fmul_rn(hr[i], inv.x));
+         dst[c + i] = tobf(__fmul_rn(mr[i], inv.y));
+@@ -324,47 +465,66 @@ __device__ void gateDown(const float* __restrict__ h, const float* __restrict__
+     }
+ }
+ 
+-// Reuse the prepared BF16 row, retaining the original gateDown dot and reduction order.
++// Reuse the prepared BF16 row across 8 rows in registers, retaining the original gateDown dot and reduction order.
+ __device__ void gateDownPrepared(const uint16_t* __restrict__ prepared, const uint16_t* __restrict__ down,
+                                  uint16_t* __restrict__ zeta, int rows, int c) {
+     if (c <= 2304) {
+-        __shared__ float sh[8 * 32];
+-        __shared__ uint16_t s_src[2 * 4608];
+-        const int row0 = static_cast<int>(blockIdx.x) * 2;
++        __shared__ float sh[32 * 32];
++        const int row0 = static_cast<int>(blockIdx.x) * 8;
++        const int count = rows - row0 < 8 ? rows - row0 : 8;
+         const int width = 2 * c;
+-        const bool has1 = row0 + 1 < rows;
+-        const uint16_t* src0 = prepared + static_cast<size_t>(row0) * width;
+-        const uint16_t* src1 = prepared + static_cast<size_t>(row0 + 1) * width;
+-        for (int i = threadIdx.x; i < width; i += blockDim.x) {
+-            s_src[i] = src0[i];
+-            if (has1) s_src[width + i] = src1[i];
++        uint32_t xr[8][9];
++#pragma unroll
++        for (int row = 0; row < 8; ++row) {
++            const uint16_t* src = row < count ? (prepared + static_cast<size_t>(row0 + row) * width) : nullptr;
++#pragma unroll
++            for (int p = 0; p < 9; ++p) {
++                const int i0 = threadIdx.x + 256 * (2 * p);
++                const int i1 = i0 + 256;
++                const uint32_t v0 = (src && i0 < width) ? static_cast<uint32_t>(src[i0]) : 0u;
++                const uint32_t v1 = (src && i1 < width) ? static_cast<uint32_t>(src[i1]) : 0u;
++                xr[row][p] = v0 | (v1 << 16);
++            }
+         }
+-        __syncthreads();
+         for (int r = 0; r < kRank; r += 4) {
+             const uint16_t* d0 = down + static_cast<size_t>(r) * width;
+             const uint16_t* d1 = d0 + width;
+             const uint16_t* d2 = d1 + width;
+             const uint16_t* d3 = d2 + width;
+-            float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+-            for (int i = threadIdx.x; i < width; i += blockDim.x) {
+-                const float n0 = bf(s_src[i]);
+-                const float n1 = has1 ? bf(s_src[width + i]) : 0.0f;
+-                const float w0 = bf(d0[i]), w1 = bf(d1[i]), w2 = bf(d2[i]), w3 = bf(d3[i]);
+-                acc[0] = __fmaf_rn(w0, n0, acc[0]);
+-                acc[1] = __fmaf_rn(w1, n0, acc[1]);
+-                acc[2] = __fmaf_rn(w2, n0, acc[2]);
+-                acc[3] = __fmaf_rn(w3, n0, acc[3]);
+-                acc[4] = __fmaf_rn(w0, n1, acc[4]);
+-                acc[5] = __fmaf_rn(w1, n1, acc[5]);
+-                acc[6] = __fmaf_rn(w2, n1, acc[6]);
+-                acc[7] = __fmaf_rn(w3, n1, acc[7]);
++            float acc[32];
++#pragma unroll
++            for (int k = 0; k < 32; ++k) acc[k] = 0.0f;
++#pragma unroll
++            for (int p = 0; p < 9; ++p) {
++                const int i0 = threadIdx.x + 256 * (2 * p);
++                if (i0 >= width) break;
++                const float w00 = bf(d0[i0]), w10 = bf(d1[i0]), w20 = bf(d2[i0]), w30 = bf(d3[i0]);
++#pragma unroll
++                for (int row = 0; row < 8; ++row) {
++                    const float n = bf(static_cast<uint16_t>(xr[row][p] & 0xFFFFu));
++                    acc[4 * row + 0] = __fmaf_rn(w00, n, acc[4 * row + 0]);
++                    acc[4 * row + 1] = __fmaf_rn(w10, n, acc[4 * row + 1]);
++                    acc[4 * row + 2] = __fmaf_rn(w20, n, acc[4 * row + 2]);
++                    acc[4 * row + 3] = __fmaf_rn(w30, n, acc[4 * row + 3]);
++                }
++                const int i1 = i0 + 256;
++                if (i1 < width) {
++                    const float w01 = bf(d0[i1]), w11 = bf(d1[i1]), w21 = bf(d2[i1]), w31 = bf(d3[i1]);
++#pragma unroll
++                    for (int row = 0; row < 8; ++row) {
++                        const float n = bf(static_cast<uint16_t>(xr[row][p] >> 16));
++                        acc[4 * row + 0] = __fmaf_rn(w01, n, acc[4 * row + 0]);
++                        acc[4 * row + 1] = __fmaf_rn(w11, n, acc[4 * row + 1]);
++                        acc[4 * row + 2] = __fmaf_rn(w21, n, acc[4 * row + 2]);
++                        acc[4 * row + 3] = __fmaf_rn(w31, n, acc[4 * row + 3]);
++                    }
++                }
+             }
+-            blockSums<8>(acc, sh);
++            blockSums<32>(acc, sh);
+             if (threadIdx.x == 0) {
+-                for (int k = 0; k < 4; ++k) zeta[static_cast<size_t>(row0) * kRank + r + k] = tobf(acc[k]);
+-                if (has1) {
+-                    for (int k = 0; k < 4; ++k) zeta[static_cast<size_t>(row0 + 1) * kRank + r + k] = tobf(acc[4 + k]);
+-                }
++                for (int row = 0; row < count; ++row)
++                    for (int k = 0; k < 4; ++k)
++                        zeta[static_cast<size_t>(row0 + row) * kRank + r + k] = tobf(acc[4 * row + k]);
+             }
+         }
+         return;
+@@ -421,14 +581,15 @@ __device__ void gateUp(const float* h, const float* __restrict__ m, const uint16
+     out[row * c + i] = __fadd_rn(old, added);
+ }
+ 
+-// 8-row tiled gateUp: reuses forget/gain across 8 rows with exact per-row FP32 rounding order.
++// RT-row tiled gateUp: reuses forget/gain across RT rows with exact per-row FP32 rounding order.
++template <int RT>
+ __device__ void gateUpTiled(const float* h, const float* __restrict__ m, const uint16_t* __restrict__ zeta,
+                             const uint16_t* __restrict__ forget, const uint16_t* __restrict__ gain, float* out,
+                             int rows, int c) {
+-    __shared__ float z[8][kRank];
+-    const int row0 = static_cast<int>(blockIdx.x) * 8;
++    __shared__ float z[RT][kRank];
++    const int row0 = static_cast<int>(blockIdx.x) * RT;
+ #pragma unroll
+-    for (int r = 0; r < 8; ++r) {
++    for (int r = 0; r < RT; ++r) {
+         const int row = row0 + r;
+         z[r][threadIdx.x] = row < rows ? bf(zeta[static_cast<size_t>(row) * kRank + threadIdx.x]) : 0.0f;
+     }
+@@ -437,8 +598,9 @@ __device__ void gateUpTiled(const float* h, const float* __restrict__ m, const u
+     if (i >= c) return;
+     const uint4* f = reinterpret_cast<const uint4*>(forget + static_cast<size_t>(i) * kRank);
+     const uint4* g = reinterpret_cast<const uint4*>(gain + static_cast<size_t>(i) * kRank);
+-    float sf[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+-    float sg[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
++    float sf[RT], sg[RT];
++#pragma unroll
++    for (int r = 0; r < RT; ++r) sf[r] = sg[r] = 0.0f;
+ #pragma unroll
+     for (int q = 0; q < kRank / 8; ++q) {
+         const uint4 fq = __ldg(f + q), gq = __ldg(g + q);
+@@ -450,7 +612,7 @@ __device__ void gateUpTiled(const float* h, const float* __restrict__ m, const u
+             const float fval = bf(fb), gval = bf(gb);
+             const int rank_idx = 8 * q + t;
+ #pragma unroll
+-            for (int r = 0; r < 8; ++r) {
++            for (int r = 0; r < RT; ++r) {
+                 const float zr = z[r][rank_idx];
+                 sf[r] = __fmaf_rn(fval, zr, sf[r]);
+                 sg[r] = __fmaf_rn(gval, zr, sg[r]);
+@@ -458,7 +620,7 @@ __device__ void gateUpTiled(const float* h, const float* __restrict__ m, const u
+         }
+     }
+ #pragma unroll
+-    for (int r = 0; r < 8; ++r) {
++    for (int r = 0; r < RT; ++r) {
+         const int row = row0 + r;
+         if (row >= rows) break;
+         const float fg = tanhf(sf[r]), gg = tanhf(sg[r]);
+@@ -470,6 +632,12 @@ __device__ void gateUpTiled(const float* h, const float* __restrict__ m, const u
+     }
+ }
+ 
++struct CopySpan {
++    uint64_t dst;
++    uint64_t src;
++    uint64_t bytes;
++};
++
+ }  // namespace ink2l
+ 
+ extern "C" __global__ void __launch_bounds__(256)
+@@ -516,7 +684,14 @@ extern "C" __global__ void __launch_bounds__(64)
+     tf_ink2_loop_gate_up_tiled(const float* h, const float* __restrict__ m, const uint16_t* __restrict__ zeta,
+                                const uint16_t* __restrict__ forget, const uint16_t* __restrict__ gain, float* out,
+                                int rows, int c) {
+-    ink2l::gateUpTiled(h, m, zeta, forget, gain, out, rows, c);
++    ink2l::gateUpTiled<8>(h, m, zeta, forget, gain, out, rows, c);
++}
++
++extern "C" __global__ void __launch_bounds__(64)
++    tf_ink2_loop_gate_up_tiled32(const float* h, const float* __restrict__ m, const uint16_t* __restrict__ zeta,
++                                 const uint16_t* __restrict__ forget, const uint16_t* __restrict__ gain, float* out,
++                                 int rows, int c) {
++    ink2l::gateUpTiled<32>(h, m, zeta, forget, gain, out, rows, c);
+ }
+ 
+ // Mini QKV launch uses three independently normalized inputs; other kernels and cache/partial layouts are unchanged.
+@@ -560,3 +735,28 @@ extern "C" __global__ void __launch_bounds__(256)
+     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+     if (i < n) out[i] = ink2l::bf(ink2l::tobf(in[i]));
+ }
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ink2_copy_spans(const ink2l::CopySpan* __restrict__ spans, int n) {
++    const int idx = blockIdx.x;
++    if (idx >= n) return;
++    const ink2l::CopySpan sp = spans[idx];
++    uint8_t* dst = reinterpret_cast<uint8_t*>(sp.dst);
++    const uint8_t* src = reinterpret_cast<const uint8_t*>(sp.src);
++    const size_t bytes = static_cast<size_t>(sp.bytes);
++    if (((sp.dst | sp.src) & 15u) == 0u) {
++        const size_t vecs = bytes >> 4;
++        uint4* d4 = reinterpret_cast<uint4*>(dst);
++        const uint4* s4 = reinterpret_cast<const uint4*>(src);
++        for (size_t i = threadIdx.x; i < vecs; i += 128) d4[i] = s4[i];
++        for (size_t i = (vecs << 4) + threadIdx.x; i < bytes; i += 128) dst[i] = src[i];
++    } else if (((sp.dst | sp.src) & 3u) == 0u) {
++        const size_t words = bytes >> 2;
++        uint32_t* d4 = reinterpret_cast<uint32_t*>(dst);
++        const uint32_t* s4 = reinterpret_cast<const uint32_t*>(src);
++        for (size_t i = threadIdx.x; i < words; i += 128) d4[i] = s4[i];
++        for (size_t i = (words << 2) + threadIdx.x; i < bytes; i += 128) dst[i] = src[i];
++    } else {
++        for (size_t i = threadIdx.x; i < bytes; i += 128) dst[i] = src[i];
++    }
++}
+diff --git a/zig/src/families/inkling2/loop_backend.zig b/zig/src/families/inkling2/loop_backend.zig
+index 6286b79..0585227 100644
+--- a/zig/src/families/inkling2/loop_backend.zig
++++ b/zig/src/families/inkling2/loop_backend.zig
+@@ -70,6 +70,7 @@ pub const Backend = struct {
+     drafter: ?draft_runtime.Drafter = null,
+     vision: ?*@import("mini_vision.zig").Images = null,
+     image_rows: [engine.max_slots]?cuda.DeviceBuffer = @splat(null),
++    copy_spans_buf: ?cuda.DeviceBuffer = null,
+     prompts: ?core.kv_prompts.Prompts = null,
+     costs: [dspark.depth + 1]lanes.config.Cost = undefined,
+     shared_costs: [dspark.depth + 1]lanes.config.Cost = undefined,
+@@ -294,6 +295,7 @@ pub const Backend = struct {
+         for (b.streams) |stream| if (stream) |s| release(b, s);
+         for (b.slot[0..b.held]) |*pair| for (pair) |*x| x.free();
+         for (&b.image_rows) |*slot| if (slot.*) |*rows| rows.free();
++        if (b.copy_spans_buf) |*buf| buf.free();
+         if (b.graphs) |*g| g.deinit();
+         if (b.drafter) |*d| d.deinit();
+         b.meta.free();
+@@ -363,6 +365,20 @@ pub const Backend = struct {
+         try cuda.copy_source.enqueue(b.d, dst, bytes, b.s);
+     }
+ 
++    pub fn ensureCopySpans(b: *Backend, count: usize) !u64 {
++        const span_bytes = @sizeOf(@import("loop_math_cuda.zig").CopySpan);
++        const need = @max(count, 4096) * span_bytes;
++        if (b.copy_spans_buf) |*buf| {
++            if (buf.len >= count * span_bytes) return buf.ptr;
++            try b.s.synchronize();
++            buf.free();
++            b.copy_spans_buf = null;
++        }
++        const buf = try cuda.DeviceBuffer.alloc(b.d, need);
++        b.copy_spans_buf = buf;
++        return buf.ptr;
++    }
++
+     /// `s`'s lane, its model slot selected for the calls that follow.
+     fn laneOf(b: *Backend, s: *const lanes.Stream) !*Lane {
+         const i = b.slotOf(s) orelse return error.UnknownStream;
+diff --git a/zig/src/families/inkling2/loop_math_cuda.zig b/zig/src/families/inkling2/loop_math_cuda.zig
+index 40abbe7..d57cc8c 100644
+--- a/zig/src/families/inkling2/loop_math_cuda.zig
++++ b/zig/src/families/inkling2/loop_math_cuda.zig
+@@ -20,6 +20,12 @@ pub const ArArgs = extern struct {
+     eps: f32,
+ };
+ 
++pub const CopySpan = extern struct {
++    dst: u64,
++    src: u64,
++    bytes: u64,
++};
++
+ pub const Kernels = struct {
+     mod: cuda.Module,
+     ar_fn: cuda.Function,
+@@ -30,6 +36,8 @@ pub const Kernels = struct {
+     gate_prepared_fn: cuda.Function,
+     gate_up_fn: cuda.Function,
+     gate_up_tiled_fn: cuda.Function,
++    gate_up_tiled32_fn: cuda.Function,
++    copy_spans_fn: cuda.Function,
+     project_qkv_fn: cuda.Function,
+     round_bf16_fn: cuda.Function,
+ 
+@@ -47,6 +55,8 @@ pub const Kernels = struct {
+             .gate_prepared_fn = try mod.function("tf_ink2_loop_gate_down_prepared"),
+             .gate_up_fn = try mod.function("tf_ink2_loop_gate_up"),
+             .gate_up_tiled_fn = try mod.function("tf_ink2_loop_gate_up_tiled"),
++            .gate_up_tiled32_fn = try mod.function("tf_ink2_loop_gate_up_tiled32"),
++            .copy_spans_fn = try mod.function("tf_ink2_copy_spans"),
+             .project_qkv_fn = try mod.function("tf_ink2_loop_project_qkv"),
+             .round_bf16_fn = try mod.function("tf_ink2_loop_round_bf16"),
+         };
+@@ -157,16 +167,20 @@ pub fn gateDownPrepared(
+     for ([_]u64{ prepared, down, zeta }) |v| b.add(v);
+     b.add(int(rows));
+     b.add(int(c));
+-    const prepared_grid: cuda.Dim3 = if (c <= 2304) .{ .x = @intCast((rows + 1) / 2), .y = 1 } else .{ .x = grid, .y = rank / 2 };
++    const prepared_grid: cuda.Dim3 = if (c <= 2304) .{ .x = @intCast((rows + 7) / 8), .y = 1 } else .{ .x = grid, .y = rank / 2 };
+     try go(k.gate_prepared_fn, s, prepared_grid, 256, &b);
+ }
+ 
+-/// The up half: forget/gain from zeta and the four-step output, 64 columns a block (8-row tiled when rows >= 8).
++/// The up half: forget/gain from zeta and the four-step output, 64 columns a block (8-row or 32-row tiled).
+ pub fn gateUp(k: *const Kernels, s: cuda.Stream, state_f32: u64, message_f32: u64, zeta_bf16: u64, forget_bf16: u64, gain_bf16: u64, out_f32: u64, rows: usize, c: usize) !void {
+     if (rows == 0 or c == 0) return error.Inkling2LoopGateShape;
+     var a: cuda.Args = .{};
+     for ([_]u64{ state_f32, message_f32, zeta_bf16, forget_bf16, gain_bf16, out_f32 }) |v| a.add(v);
+-    if (rows >= 8) {
++    if (rows >= 32) {
++        a.add(int(rows));
++        a.add(int(c));
++        try go(k.gate_up_tiled32_fn, s, .{ .x = @intCast((rows + 31) / 32), .y = @intCast((c + 63) / 64) }, 64, &a);
++    } else if (rows >= 8) {
+         a.add(int(rows));
+         a.add(int(c));
+         try go(k.gate_up_tiled_fn, s, .{ .x = @intCast((rows + 7) / 8), .y = @intCast((c + 63) / 64) }, 64, &a);
+@@ -176,6 +190,14 @@ pub fn gateUp(k: *const Kernels, s: cuda.Stream, state_f32: u64, message_f32: u6
+     }
+ }
+ 
++pub fn copySpans(k: *const Kernels, s: cuda.Stream, spans_dev: u64, count: usize) !void {
++    if (count == 0) return;
++    var a: cuda.Args = .{};
++    a.add(spans_dev);
++    a.add(int(count));
++    try go(k.copy_spans_fn, s, .{ .x = @intCast(count) }, 128, &a);
++}
++
+ /// Mini QKV: normalized BF16 uq/uk/uv, query-side u_q; per-visit K/V conv/cache, then wo/post-conv; no history.
+ pub fn projectQkv(
+     k: *const Kernels,
+diff --git a/zig/src/families/inkling2/loop_pages.zig b/zig/src/families/inkling2/loop_pages.zig
+index 024b83c..77c5dad 100644
+--- a/zig/src/families/inkling2/loop_pages.zig
++++ b/zig/src/families/inkling2/loop_pages.zig
+@@ -3,6 +3,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const kv = @import("core").kv_pool;
+ const loop = @import("loop.zig");
++const loop_math = @import("loop_math_cuda.zig");
+ const engine = @import("loop_engine.zig");
+ 
+ pub const page_tokens: u32 = 256; // cache_rows.cuh; a whole number of 64-key attention tiles
+@@ -72,6 +73,8 @@ pub const StateCopy = struct {
+     geometry: StateGeometry,
+     out: bool,
+     offset: usize = 0,
++    gpa: ?std.mem.Allocator = null,
++    spans: ?*std.ArrayList(loop_math.CopySpan) = null,
+ 
+     pub fn init(m: *const engine.Model, s: cuda.Stream, ids: []const u32, out: bool) StateCopy {
+         const p = &m.pages.?;
+@@ -92,6 +95,13 @@ pub const StateCopy = struct {
+         };
+     }
+ 
++    pub fn initBatch(m: *const engine.Model, s: cuda.Stream, ids: []const u32, out: bool, gpa: std.mem.Allocator, spans: *std.ArrayList(loop_math.CopySpan)) StateCopy {
++        var c = init(m, s, ids, out);
++        c.gpa = gpa;
++        c.spans = spans;
++        return c;
++    }
++
+     pub fn span(w: *StateCopy, ptr: u64, size: usize) !void {
+         const arena = w.m.pages.?.memory.ptr;
+         var copied: usize = 0;
+@@ -100,7 +110,13 @@ pub const StateCopy = struct {
+             const n = @min(size - copied, piece.len);
+             const dev = ptr + copied;
+             const blob = arena + piece.offset;
+-            try w.m.copy(w.s, if (w.out) blob else dev, if (w.out) dev else blob, n);
++            const dst = if (w.out) blob else dev;
++            const src = if (w.out) dev else blob;
++            if (w.spans) |list| {
++                try list.append(w.gpa.?, .{ .dst = dst, .src = src, .bytes = n });
++            } else {
++                try w.m.copy(w.s, dst, src, n);
++            }
+             w.offset += n;
+             copied += n;
+         }
+diff --git a/zig/src/families/inkling2/loop_prompt.zig b/zig/src/families/inkling2/loop_prompt.zig
+index fef8438..98b0ba6 100644
+--- a/zig/src/families/inkling2/loop_prompt.zig
++++ b/zig/src/families/inkling2/loop_prompt.zig
+@@ -7,6 +7,7 @@ const engine = @import("loop_engine.zig");
+ const backend = @import("loop_backend.zig");
+ const page = @import("loop_pages.zig");
+ const draft = @import("loop_drafter.zig");
++const loop_math = @import("loop_math_cuda.zig");
+ const kv = core.kv_pool;
+ const prompts = core.kv_prompts;
+ 
+@@ -33,10 +34,17 @@ pub const Checkpoint = struct {
+         const session = if (d) |active| active.session(b.m.slot) else null;
+         if (session) |state| if (out and (state.end != at or state.pending != 0)) return error.DraftContextGap;
+ 
+-        var writer = page.StateCopy.init(b.m, b.s, ids, out);
++        var spans: std.ArrayList(loop_math.CopySpan) = .empty;
++        defer spans.deinit(b.gpa);
++        var writer = page.StateCopy.initBatch(b.m, b.s, ids, out, b.gpa, &spans);
+         try b.m.eachState(at, &writer);
+         if (d) |active| try active.eachSnapshot(b.m.slot, at, &writer);
+         std.debug.assert(writer.offset == size);
++        if (spans.items.len > 0) {
++            const dev = try b.ensureCopySpans(spans.items.len);
++            try cuda.copy_source.enqueue(b.d, dev, std.mem.sliceAsBytes(spans.items), b.s);
++            try loop_math.copySpans(&b.k.loop, b.s, dev, spans.items.len);
++        }
+         if (!out) {
+             if (session) |state| {
+                 state.reset();
+-- 
+2.43.0
+

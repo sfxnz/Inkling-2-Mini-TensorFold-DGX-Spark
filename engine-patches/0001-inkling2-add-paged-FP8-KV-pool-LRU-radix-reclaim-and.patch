@@ -1,0 +1,1913 @@
+From 48328bff7a64d37350eedf2316a6c3e5e97004ad Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+Date: Wed, 25 Nov 2026 17:08:43 +0000
+Subject: [PATCH 01/14] inkling2: add paged FP8 KV pool, LRU radix reclaim, and
+ capacity options
+
+---
+ zig/kernels/cuda/inkling2/attention.cu        | 154 ++++++++--
+ zig/kernels/cuda/inkling2/cache_rows.cuh      |  21 ++
+ zig/kernels/cuda/inkling2/prompt_attention.cu | 289 ++++++++++++++++--
+ zig/kernels/cuda/kv_fp8.cuh                   |  28 ++
+ zig/src/core/engine_api.zig                   |   3 +-
+ zig/src/core/kv_pool_parts_test.zig           |   2 +-
+ zig/src/core/kv_pool_tail_test.zig            |   2 +-
+ zig/src/core/kv_prompts.zig                   |  24 +-
+ zig/src/core/prompt_radix.zig                 |   7 +-
+ zig/src/core/prompt_radix_evict.zig           |  13 +-
+ zig/src/core/prompt_radix_make.zig            |   4 +-
+ zig/src/core/prompt_radix_parts.zig           |   2 +-
+ zig/src/core/prompt_radix_tail_test.zig       |   2 +-
+ zig/src/core/prompt_radix_test.zig            |  28 ++
+ zig/src/core/prompt_radix_tree.zig            |  16 +-
+ zig/src/families/inkling2/cuda_native.zig     |   2 +-
+ zig/src/families/inkling2/kernels.zig         |  74 ++++-
+ zig/src/families/inkling2/kernels_test.zig    |  48 ++-
+ zig/src/families/inkling2/loop.zig            |  91 +++++-
+ zig/src/families/inkling2/loop_engine.zig     |   4 +-
+ zig/src/families/inkling2/loop_pages.zig      | 152 +++++++++
+ zig/src/native/cuda_options.zig               |  20 +-
+ zig/src/native/cuda_prompt_pages.zig          |  70 ++++-
+ zig/src/native/cuda_streams.zig               |   3 +
+ zig/src/native/cuda_window.zig                |   4 +
+ zig/src/server/cli.zig                        |   4 +-
+ zig/src/server/cli_args.zig                   |   2 +-
+ zig/src/server/cli_test.zig                   |   2 +-
+ zig/src/server/witness.zig                    |   2 +-
+ 29 files changed, 949 insertions(+), 124 deletions(-)
+ create mode 100644 zig/kernels/cuda/inkling2/cache_rows.cuh
+ create mode 100644 zig/src/families/inkling2/loop_pages.zig
+
+diff --git a/zig/kernels/cuda/inkling2/attention.cu b/zig/kernels/cuda/inkling2/attention.cu
+index 7ad9a17..39bb54e 100644
+--- a/zig/kernels/cuda/inkling2/attention.cu
++++ b/zig/kernels/cuda/inkling2/attention.cu
+@@ -2,7 +2,10 @@
+ #include <cstdint>
+ #include <cuda_bf16.h>
+ 
++#include "common/cp_async.cuh"
+ #include "common/qmm_frag.cuh"
++#include "kv_fp8.cuh"
++#include "cache_rows.cuh"
+ 
+ namespace ink2 {
+ 
+@@ -13,14 +16,7 @@ constexpr int kKeys = 64;
+ constexpr int kPad = kDim + 8;
+ constexpr float kLog2e = 1.4426950408889634f;
+ 
+-// One stream's rows in a call: rows row0..row0+n-1 sit at positions p0..p0+n-1; `off` is its cache's element offset.
+-struct Seg {
+-    int row0;
+-    int n;
+-    int p0;
+-    int pad;
+-    long long off;
+-};
++using Seg = Ink2Segment;
+ 
+ __device__ __forceinline__ float bf(uint16_t u) { return __uint_as_float(static_cast<uint32_t>(u) << 16); }
+ 
+@@ -43,13 +39,14 @@ __device__ __forceinline__ void clip(float* x, float thr) {
+ }
+ 
+ // Per row and head: q = clip(q * q_scale) (* tau), rel = clip(rel * rel_scale) (* tau), k = clip(k), v = rms(v).
++template <typename Cache>
+ __device__ __forceinline__ void prepRow(const uint16_t* __restrict__ q_raw, const uint16_t* __restrict__ k_raw,
+                                         const uint16_t* __restrict__ v_raw, const uint16_t* __restrict__ rel_raw,
+                                         const uint16_t* __restrict__ q_scale, const uint16_t* __restrict__ rel_scale,
+                                         const int* __restrict__ rpos, const int* __restrict__ rseg,
+                                         const Seg* __restrict__ segs, uint16_t* __restrict__ q_out,
+-                                        uint16_t* __restrict__ rel_out, uint16_t* __restrict__ kc,
+-                                        uint16_t* __restrict__ vc, int heads, int kv_heads, int ring, int global,
++                                        uint16_t* __restrict__ rel_out, Cache* __restrict__ kc,
++                                        Cache* __restrict__ vc, int heads, int kv_heads, int ring, int global,
+                                         float qk_clip, float rel_clip, float floor_pos, float alpha, float eps) {
+ 
+     const int row = blockIdx.x, y = blockIdx.y, lane = threadIdx.x;
+@@ -84,26 +81,39 @@ __device__ __forceinline__ void prepRow(const uint16_t* __restrict__ q_raw, cons
+         for (int i = 0; i < 4; ++i) x[i] *= r;
+     }
+     const Seg s = segs[rseg[row]];
+-    uint16_t* dst = (key ? kc : vc) + s.off + (static_cast<size_t>(h) * ring + pos % ring) * kDim;
+-    for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = tobf(x[i]);
++    Cache* base = (key ? kc : vc) + s.offset();
++    const size_t slot = static_cast<size_t>(h) * ring + s.physical(pos, ring);
++    Cache* dst = base + slot * kDim;
++    if constexpr (sizeof(Cache) == 1) {
++        // Keep the BF16 preparation boundary before compressing a cache row.
++        for (int i = 0; i < 4; ++i) x[i] = bf(tobf(x[i]));
++        auto* scales = reinterpret_cast<float*>(base + static_cast<size_t>(kv_heads) * ring * kDim);
++        tf_kv_fp8::quant_warp(x, lane, dst, scales + slot);
++    } else {
++        for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = tobf(x[i]);
++    }
+ }
+ 
+ }  // namespace ink2
+ 
+ using ink2::Seg;
+ 
+-#define TF_INK2_PREP_ARGS                                                                                          \
++#define TF_INK2_PREP_ARGS(Cache)                                                                                          \
+     const uint16_t *__restrict__ q_raw, const uint16_t *__restrict__ k_raw, const uint16_t *__restrict__ v_raw,    \
+         const uint16_t *__restrict__ rel_raw, const uint16_t *__restrict__ q_scale,                                \
+         const uint16_t *__restrict__ rel_scale, const int *__restrict__ rpos, const int *__restrict__ rseg,        \
+         const Seg *__restrict__ segs, uint16_t *__restrict__ q_out, uint16_t *__restrict__ rel_out,                \
+-        uint16_t *__restrict__ kc, uint16_t *__restrict__ vc, int heads, int kv_heads, int ring, int global,       \
++        Cache *__restrict__ kc, Cache *__restrict__ vc, int heads, int kv_heads, int ring, int global,       \
+         float qk_clip, float rel_clip, float floor_pos, float alpha, float eps
+ #define TF_INK2_PREP_PASS                                                                                          \
+     q_raw, k_raw, v_raw, rel_raw, q_scale, rel_scale, rpos, rseg, segs, q_out, rel_out, kc, vc, heads, kv_heads,   \
+         ring, global, qk_clip, rel_clip, floor_pos, alpha, eps
+ 
+-extern "C" __global__ void tf_ink2_prep(TF_INK2_PREP_ARGS) {
++extern "C" __global__ void tf_ink2_prep(TF_INK2_PREP_ARGS(uint16_t)) {
++    ink2::prepRow(TF_INK2_PREP_PASS);
++}
++
++extern "C" __global__ void tf_ink2_prep_fp8(TF_INK2_PREP_ARGS(uint8_t)) {
+     ink2::prepRow(TF_INK2_PREP_PASS);
+ }
+ 
+@@ -139,14 +149,47 @@ __device__ __forceinline__ float scaled(float o, float a, float p, float b) {
+     return __fadd_rn(__fmul_rn(o, a), __fmul_rn(p, b));
+ }
+ 
++// FP8 prefetch adapted from MiaAI-Lab's Mini patch 0011. Copyright 2026 MiaAI-Lab.
++struct alignas(16) Fp8Tile {
++    uint8_t k[kKeys * kDim], v[kKeys * kDim];
++    float k_scale[kKeys], v_scale[kKeys];
++};
++
++__device__ __forceinline__ void prefetchFp8(Fp8Tile& tile, const uint8_t* kc, const uint8_t* vc,
++                                          size_t head_base, size_t scales, size_t head_row,
++                                          size_t slot0, int kt, int lo, int hi) {
++    const size_t src = head_base + slot0 * kDim;
++    for (int col = threadIdx.x * 16; col < kKeys * kDim; col += 128 * 16) {
++        const int pos = kt + col / kDim;
++        const bool live = pos >= lo && pos <= hi;
++        tf_common::cp16z(tile.k + col, kc + src + col, live);
++        tf_common::cp16z(tile.v + col, vc + src + col, live);
++    }
++    if (threadIdx.x < 2 * (kKeys / 4)) {
++        const bool is_key = threadIdx.x < kKeys / 4;
++        const int key = (threadIdx.x % (kKeys / 4)) * 4;
++        const float* scale = reinterpret_cast<const float*>((is_key ? kc : vc) + scales);
++        scale += head_row + slot0 + key;
++        float* dest = (is_key ? tile.k_scale : tile.v_scale) + key;
++        const int pos = kt + key;
++        if (pos >= lo && pos + 3 <= hi) {
++            tf_common::cp16(dest, scale);
++        } else {
++            for (int i = 0; i < 4; ++i) dest[i] = pos + i >= lo && pos + i <= hi ? scale[i] : 0.0f;
++        }
++    }
++    tf_common::cp_commit();
++}
++
+ // 64 (row, head) pairs of a key head over a block's keys (FOLD: a global chunk, split: a sub-chunk, else a chunk).
+-template <bool FOLD>
+-__device__ __forceinline__ void attnTile(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc,
+-                                         const uint16_t* __restrict__ vc, const uint16_t* __restrict__ tab,
++template <bool FOLD, bool PREFETCH = false, typename Cache>
++__device__ __forceinline__ void attnTile(const uint16_t* __restrict__ q, const Cache* __restrict__ kc,
++                                         const Cache* __restrict__ vc, const uint16_t* __restrict__ tab,
+                                          const Seg* __restrict__ segs, const int2* __restrict__ tiles,
+                                          float* __restrict__ part_o, float2* __restrict__ part_ml, int heads,
+                                          int kv_heads, int ring, int window, int chunk, int c0, int chunks,
+-                                         float scale, int split, uint16_t* ks, uint16_t* vs) {
++                                         float scale, int split, uint16_t* ks, uint16_t* vs, Fp8Tile* input = nullptr) {
++    static_assert(!PREFETCH || (!FOLD && sizeof(Cache) == 1));
+     const int2 tile = tiles[blockIdx.x];
+     const Seg s = segs[tile.x];
+     const int group = heads / kv_heads;
+@@ -194,7 +237,9 @@ __device__ __forceinline__ void attnTile(const uint16_t* __restrict__ q, const u
+     float M[2] = {-INFINITY, -INFINITY}, L[2] = {0.0f, 0.0f};
+     if (FOLD)
+         for (int n = 0; n < 16; ++n) O[n][0] = O[n][1] = O[n][2] = O[n][3] = 0.0f;
+-    const size_t head_base = s.off + static_cast<size_t>(kvh) * ring * kDim;
++    const size_t head_row = static_cast<size_t>(kvh) * ring;
++    const size_t head_base = s.offset() + head_row * kDim;
++    const size_t scales = s.offset() + static_cast<size_t>(kv_heads) * ring * kDim;
+     const int step = FOLD ? kSub : b_hi - b_lo + 1;
+     for (int s_lo = b_lo; s_lo <= b_hi && s_lo <= tile_hi; s_lo += step) {
+         const int s_hi = s_lo + step - 1;
+@@ -202,22 +247,42 @@ __device__ __forceinline__ void attnTile(const uint16_t* __restrict__ q, const u
+         m[0] = m[1] = -INFINITY;
+         l[0] = l[1] = 0.0f;
+         const int k_lo = max(s_lo, tile_lo), k_hi = min(s_hi, tile_hi);
+-        for (int kt = k_lo & ~(kKeys - 1); kt <= k_hi; kt += kKeys) {
++        const int first = k_lo & ~(kKeys - 1);
++        if constexpr (PREFETCH)
++            prefetchFp8(*input, kc, vc, head_base, scales, head_row, s.physical(first, ring), first, k_lo, k_hi);
++        for (int kt = first; kt <= k_hi; kt += kKeys) {
++            if constexpr (PREFETCH) tf_common::cp_wait<0>();
+             __syncthreads();
+-            const size_t slot0 = static_cast<size_t>(kt % ring);
++            // Both rings and pages are multiples of kKeys, so an aligned tile stays contiguous.
++            const size_t slot0 = PREFETCH ? 0 : s.physical(kt, ring);
+             for (int e = threadIdx.x; e < kKeys * (kDim / 8); e += 128) {
+                 const int key = e >> 4, col = (e & 15) * 8;
+                 const int kp = kt + key;
+                 uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+-                if (kp >= k_lo && kp <= k_hi) {
++                if constexpr (PREFETCH) {
++                    kv = tf_kv_fp8::bf16x8(input->k + key * kDim + col, input->k_scale[key]);
++                    vv = tf_kv_fp8::bf16x8(input->v + key * kDim + col, input->v_scale[key]);
++                } else if (kp >= k_lo && kp <= k_hi) {
+                     const size_t at = head_base + (slot0 + key) * kDim + col;
+-                    kv = *reinterpret_cast<const uint4*>(kc + at);
+-                    vv = *reinterpret_cast<const uint4*>(vc + at);
++                    if constexpr (sizeof(Cache) == 1) {
++                        const size_t row = head_row + slot0 + key;
++                        kv = tf_kv_fp8::bf16x8(kc + at, reinterpret_cast<const float*>(kc + scales)[row]);
++                        vv = tf_kv_fp8::bf16x8(vc + at, reinterpret_cast<const float*>(vc + scales)[row]);
++                    } else {
++                        kv = *reinterpret_cast<const uint4*>(kc + at);
++                        vv = *reinterpret_cast<const uint4*>(vc + at);
++                    }
+                 }
+                 *reinterpret_cast<uint4*>(ks + key * kPad + col) = kv;
+                 *reinterpret_cast<uint4*>(vs + key * kPad + col) = vv;
+             }
+             __syncthreads();
++            if constexpr (PREFETCH) {
++                // The current FP8 tile is fully expanded. Reuse its staging bytes while the BF16 MMAs run.
++                if (kt + kKeys <= k_hi)
++                    prefetchFp8(*input, kc, vc, head_base, scales, head_row, s.physical(kt + kKeys, ring),
++                                kt + kKeys, k_lo, k_hi);
++            }
+             if (!busy) continue;
+             float sc[8][4];
+             for (int j = 0; j < 8; ++j) {
+@@ -337,6 +402,45 @@ extern "C" __global__ void __launch_bounds__(128)
+                    0, ks, vs);
+ }
+ 
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ink2_attn_fp8(const uint16_t* __restrict__ q, const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
++                 const uint16_t* __restrict__ tab, const Seg* __restrict__ segs, const int2* __restrict__ tiles,
++                 float* __restrict__ part_o, float2* __restrict__ part_ml, int heads, int kv_heads, int ring,
++                 int window, int chunk, int c0, int chunks, float scale, int split) {
++    using namespace ink2;
++    __shared__ __align__(16) uint16_t ks[kKeys * kPad];
++    __shared__ __align__(16) uint16_t vs[kKeys * kPad];
++    attnTile<false>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, window, chunk, c0, chunks,
++                    scale, split, ks, vs);
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ink2_attn_fp8_prefetch(const uint16_t* __restrict__ q, const uint8_t* __restrict__ kc,
++                            const uint8_t* __restrict__ vc, const uint16_t* __restrict__ tab,
++                            const Seg* __restrict__ segs, const int2* __restrict__ tiles, float* __restrict__ part_o,
++                            float2* __restrict__ part_ml, int heads, int kv_heads, int ring, int window,
++                            int chunk, int c0, int chunks, float scale, int split) {
++    using namespace ink2;
++    extern __shared__ __align__(16) uint16_t scratch[];
++    uint16_t* ks = scratch;
++    uint16_t* vs = ks + kKeys * kPad;
++    auto* stage = reinterpret_cast<Fp8Tile*>(vs + kKeys * kPad);
++    attnTile<false, true>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, window, chunk, c0,
++                         chunks, scale, split, ks, vs, stage);
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ink2_attn_fold_fp8(const uint16_t* __restrict__ q, const uint8_t* __restrict__ kc,
++                      const uint8_t* __restrict__ vc, const uint16_t* __restrict__ tab, const Seg* __restrict__ segs,
++                      const int2* __restrict__ tiles, float* __restrict__ part_o, float2* __restrict__ part_ml,
++                      int heads, int kv_heads, int ring, int chunk, int c0, int chunks, float scale) {
++    using namespace ink2;
++    __shared__ __align__(16) uint16_t ks[kKeys * kPad];
++    __shared__ __align__(16) uint16_t vs[kKeys * kPad];
++    attnTile<true>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, 0, chunk, c0, chunks, scale,
++                   0, ks, vs);
++}
++
+ // Per (row, head): its chunks folded in order (subs > 1: each from its sub-chunks first), the sink, then the gate.
+ extern "C" __global__ void tf_ink2_merge(const float* __restrict__ part_o, const float2* __restrict__ part_ml,
+                                          const uint16_t* __restrict__ sink, const uint16_t* __restrict__ gate,
+diff --git a/zig/kernels/cuda/inkling2/cache_rows.cuh b/zig/kernels/cuda/inkling2/cache_rows.cuh
+new file mode 100644
+index 0000000..3b481d7
+--- /dev/null
++++ b/zig/kernels/cuda/inkling2/cache_rows.cuh
+@@ -0,0 +1,21 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++// A segment has either a contiguous cache offset or the address of its global KV page table.
++struct Ink2Segment {
++    int row0;
++    int n;
++    int p0;
++    int paged;
++    long long off;
++
++    __device__ __forceinline__ size_t offset() const { return paged ? 0 : off; }
++    __device__ __forceinline__ size_t physical(int pos, int ring) const {
++        constexpr int page_rows = 256; // loop_pages.zig
++        if (!paged) return pos % ring;
++        const auto* table = reinterpret_cast<const uint32_t*>(off);
++        return static_cast<size_t>(table[pos / page_rows]) * page_rows + pos % page_rows;
++    }
++};
+diff --git a/zig/kernels/cuda/inkling2/prompt_attention.cu b/zig/kernels/cuda/inkling2/prompt_attention.cu
+index 97a0365..b1ba750 100644
+--- a/zig/kernels/cuda/inkling2/prompt_attention.cu
++++ b/zig/kernels/cuda/inkling2/prompt_attention.cu
+@@ -3,6 +3,8 @@
+ #include <cuda_bf16.h>
+ 
+ #include "common/qmm_frag.cuh"
++#include "kv_fp8.cuh"
++#include "cache_rows.cuh"
+ 
+ namespace ink2p {
+ 
+@@ -18,13 +20,7 @@ constexpr int kTile = kKeys * kDim;  // halves in a K or V tile: [key][128], 16-
+ constexpr int kStage = 2 * kTile;    // a stage: its K tile, then its V tile
+ constexpr float kLog2e = 1.4426950408889634f;
+ 
+-struct Seg {
+-    int row0;
+-    int n;
+-    int p0;
+-    int pad;
+-    long long off;
+-};
++using Seg = Ink2Segment;
+ 
+ __device__ __forceinline__ float bf(uint16_t u) { return __uint_as_float(static_cast<uint32_t>(u) << 16); }
+ 
+@@ -51,9 +47,8 @@ __device__ __forceinline__ int piece(int key, int c) { return key * kDim + ((c ^
+ 
+ // The K/V tile load: keys kt..kt+63 of a key head into the stage's bf16 tiles, zeros outside [k_lo, k_hi] (async).
+ __device__ __forceinline__ void loadTile(uint16_t* ks, uint16_t* vs, const uint16_t* __restrict__ kc,
+-                                         const uint16_t* __restrict__ vc, size_t head_base, int ring, int kt,
++                                         const uint16_t* __restrict__ vc, size_t head_base, size_t slot0, int kt,
+                                          int k_lo, int k_hi) {
+-    const size_t slot0 = static_cast<size_t>(kt % ring);
+     for (int e = threadIdx.x; e < kKeys * (kDim / 8); e += kThreads) {
+         const int key = e >> 4, col = (e & 15) * 8;
+         const int kp = kt + key;
+@@ -65,9 +60,29 @@ __device__ __forceinline__ void loadTile(uint16_t* ks, uint16_t* vs, const uint1
+     tf_common::cp_commit();
+ }
+ 
++// Expand only the current FP8 tile, without a widened global cache.
++template <bool BoundLow = false>
++__device__ __forceinline__ void loadTile8(uint16_t* ks, uint16_t* vs, const uint8_t* __restrict__ kc,
++                                          const uint8_t* __restrict__ vc, size_t head_base, size_t scale_base,
++                                          size_t slot0, int kt, int k_hi, int k_lo = 0) {
++    for (int e = threadIdx.x; e < kKeys * (kDim / 8); e += kThreads) {
++        const int key = e >> 4, col = (e & 15) * 8;
++        uint4 k = make_uint4(0, 0, 0, 0), v = make_uint4(0, 0, 0, 0);
++        if ((!BoundLow || kt + key >= k_lo) && kt + key <= k_hi) {
++            const size_t slot = slot0 + key;
++            const size_t at = head_base + slot * kDim + col;
++            k = tf_kv_fp8::bf16x8(kc + at, reinterpret_cast<const float*>(kc + scale_base)[slot]);
++            v = tf_kv_fp8::bf16x8(vc + at, reinterpret_cast<const float*>(vc + scale_base)[slot]);
++        }
++        *reinterpret_cast<uint4*>(ks + piece(key, e & 15)) = k;
++        *reinterpret_cast<uint4*>(vs + piece(key, e & 15)) = v;
++    }
++}
++
+ // A block's prompt pairs (tile of kPairs pairs, key head, chunk).
+-__device__ __forceinline__ void promptTile(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc,
+-                                           const uint16_t* __restrict__ vc, const uint16_t* __restrict__ tab,
++template <typename Cache>
++__device__ __forceinline__ void promptTile(const uint16_t* __restrict__ q, const Cache* __restrict__ kc,
++                                           const Cache* __restrict__ vc, const uint16_t* __restrict__ tab,
+                                            const Seg* __restrict__ segs, float* __restrict__ part_o,
+                                            float2* __restrict__ part_ml, int heads, int kv_heads, int ring,
+                                            int chunk, int c0, int chunks, float scale, uint16_t* smem) {
+@@ -111,16 +126,17 @@ __device__ __forceinline__ void promptTile(const uint16_t* __restrict__ q, const
+     float O[16][4];
+     float M[2] = {-INFINITY, -INFINITY}, L[2] = {0.0f, 0.0f};
+     for (int n = 0; n < 16; ++n) O[n][0] = O[n][1] = O[n][2] = O[n][3] = 0.0f;
+-    const size_t head_base = s.off + static_cast<size_t>(kvh) * ring * kDim;
++    const size_t head_base = s.offset() + static_cast<size_t>(kvh) * ring * kDim;
+     // ldmatrix lanes: K rows 8j + (lane & 7), pieces 2k + lane / 8; V rows 16u + lane % 16, pieces n + lane / 16
+     const int k_row = lane & 7, k_pc = lane >> 3;
+     const int v_row = lane & 15, v_pc = lane >> 4;
+-    const uint16_t* k16 = kc;
+-    const uint16_t* v16 = vc;
+-    for (int st = 0; st < kStages - 1; ++st) {
+-        if (st < n_tiles) loadTile(smem + st * kStage, smem + st * kStage + kTile, k16, v16, head_base, ring,
+-                                   b_lo + st * kKeys, b_lo, k_hi);
+-        else tf_common::cp_commit();
++    constexpr bool fp8 = sizeof(Cache) == 1;
++    if constexpr (!fp8) {
++        for (int st = 0; st < kStages - 1; ++st) {
++            if (st < n_tiles) loadTile(smem + st * kStage, smem + st * kStage + kTile, kc, vc, head_base,
++                                       s.physical(b_lo + st * kKeys, ring), b_lo + st * kKeys, b_lo, k_hi);
++            else tf_common::cp_commit();
++        }
+     }
+     for (int it = 0; it < n_tiles; ++it) {
+         const int kt = b_lo + it * kKeys;
+@@ -130,15 +146,24 @@ __device__ __forceinline__ void promptTile(const uint16_t* __restrict__ q, const
+             m[0] = m[1] = -INFINITY;
+             l[0] = l[1] = 0.0f;
+         }
+-        tf_common::cp_wait<kStages - 2>();
+-        __syncthreads();  // tile `it` is in; every warp is past tile it-1, whose stage the next load takes
+-        if (it + kStages - 1 < n_tiles) {
+-            uint16_t* nx = smem + ((it + kStages - 1) % kStages) * kStage;
+-            loadTile(nx, nx + kTile, k16, v16, head_base, ring, kt + (kStages - 1) * kKeys, b_lo, k_hi);
++        if constexpr (fp8) {
++            const size_t scale_base = s.offset() + static_cast<size_t>(kv_heads) * ring * kDim * sizeof(Cache)
++                + static_cast<size_t>(kvh) * ring * sizeof(float);
++            __syncthreads();
++            loadTile8(smem, smem + kTile, kc, vc, head_base, scale_base, s.physical(kt, ring), kt, k_hi);
++            __syncthreads();
+         } else {
+-            tf_common::cp_commit();
++            tf_common::cp_wait<kStages - 2>();
++            __syncthreads();  // tile `it` is in; every warp is past tile it-1, whose stage the next load takes
++            if (it + kStages - 1 < n_tiles) {
++                uint16_t* nx = smem + ((it + kStages - 1) % kStages) * kStage;
++                loadTile(nx, nx + kTile, kc, vc, head_base,
++                         s.physical(kt + (kStages - 1) * kKeys, ring), kt + (kStages - 1) * kKeys, b_lo, k_hi);
++            } else {
++                tf_common::cp_commit();
++            }
+         }
+-        const uint16_t* ks = smem + (it % kStages) * kStage;
++        const uint16_t* ks = smem + (fp8 ? 0 : (it % kStages) * kStage);
+         const uint16_t* vs = ks + kTile;
+         if (busy && kt <= w_last) {  // a tile past all of a warp's rows is an exact no-op
+             float sc[8][4];
+@@ -236,15 +261,223 @@ __device__ __forceinline__ void promptTile(const uint16_t* __restrict__ q, const
+     }
+ }
+ 
++// Copyright 2026 MiaAI-Lab (Apache-2.0), adapted from patch 0009.
++
++// One sliding prompt CTA shares K/V tiles across 128 row/head pairs and merges its own chunks, sink and gate.
++template <typename Cache>
++__device__ __forceinline__ void slideTile(const uint16_t* __restrict__ q, const Cache* __restrict__ kc,
++                                          const Cache* __restrict__ vc, const uint16_t* __restrict__ tab,
++                                          const Seg* __restrict__ segs, const uint16_t* __restrict__ sink,
++                                          const uint16_t* __restrict__ gate, uint16_t* __restrict__ out, int heads,
++                                          int kv_heads, int ring, int window, int chunk, float scale, uint16_t* smem) {
++    const Seg s = segs[0];
++    const int group = heads / kv_heads;
++    const int total = s.n * group;
++    const int m0 = static_cast<int>(blockIdx.x) * kPairs;
++    if (m0 >= total) return;
++    const int tile_hi = s.p0 + min(m0 + kPairs - 1, total - 1) / group;
++    const int tile_lo = max(0, s.p0 + m0 / group - window + 1);
++    const int kvh = blockIdx.y;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++    const int w0 = m0 + warp * 16;
++    const bool busy = w0 < total;
++    const int w_last = s.p0 + min(w0 + 15, total - 1) / group;
++    int pos[2], lo[2];
++    bool ok[2];
++    size_t prow[2];
++    uint32_t qa[8][4];
++    for (int i = 0; i < 2; ++i) {
++        const int mr = w0 + g + i * 8;
++        ok[i] = mr < total;
++        const int lr = ok[i] ? mr / group : 0;
++        pos[i] = ok[i] ? s.p0 + lr : -1;
++        lo[i] = max(0, pos[i] - window + 1);
++        prow[i] = static_cast<size_t>(s.row0 + lr) * heads + kvh * group + (ok[i] ? mr % group : 0);
++    }
++    for (int k = 0; k < 8; ++k) {
++        for (int i = 0; i < 2; ++i) {
++            const uint32_t* src = reinterpret_cast<const uint32_t*>(q + prow[i] * kDim + 16 * k + 2 * t);
++            qa[k][i] = ok[i] ? src[0] : 0u;
++            qa[k][i + 2] = ok[i] ? src[4] : 0u;
++        }
++    }
++    float acc[16][4];
++    float m[2], l[2];
++    float O[16][4];  // the merge's running o, ll and mm a row
++    float MM[2] = {-INFINITY, -INFINITY}, LL[2] = {0.0f, 0.0f};
++    for (int n = 0; n < 16; ++n) O[n][0] = O[n][1] = O[n][2] = O[n][3] = 0.0f;
++    const size_t head_base = s.off + static_cast<size_t>(kvh) * ring * kDim;
++    const int k_row = lane & 7, k_pc = lane >> 3;
++    const int v_row = lane & 15, v_pc = lane >> 4;
++    constexpr bool fp8 = sizeof(Cache) == 1;
++    const size_t scale_base = s.off + static_cast<size_t>(kv_heads) * ring * kDim
++        + static_cast<size_t>(kvh) * ring * sizeof(float);
++    const int first = tile_lo & ~(kKeys - 1);
++    const int n_tiles = (tile_hi - first) / kKeys + 1;
++    if constexpr (!fp8) {
++        for (int st = 0; st < kStages - 1; ++st) {
++            if (st < n_tiles) loadTile(smem + st * kStage, smem + st * kStage + kTile, kc, vc, head_base,
++                                       (first + st * kKeys) % ring, first + st * kKeys, tile_lo, tile_hi);
++            else tf_common::cp_commit();
++        }
++    }
++    for (int it = 0; it < n_tiles; ++it) {
++        const int kt = first + it * kKeys;
++        const int c = kt / chunk;
++        const int s_lo = c * chunk, s_hi = s_lo + chunk - 1;
++        if (it == 0 || kt == s_lo) {
++            for (int n = 0; n < 16; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
++            m[0] = m[1] = -INFINITY;
++            l[0] = l[1] = 0.0f;
++        }
++        if constexpr (fp8) {
++            __syncthreads();
++            loadTile8<true>(smem, smem + kTile, kc, vc, head_base, scale_base, kt % ring, kt, tile_hi, tile_lo);
++            __syncthreads();
++        } else {
++            tf_common::cp_wait<kStages - 2>();
++            __syncthreads();
++            if (it + kStages - 1 < n_tiles) {
++                uint16_t* next = smem + ((it + kStages - 1) % kStages) * kStage;
++                loadTile(next, next + kTile, kc, vc, head_base,
++                         (kt + (kStages - 1) * kKeys) % ring, kt + (kStages - 1) * kKeys, tile_lo, tile_hi);
++            } else {
++                tf_common::cp_commit();
++            }
++        }
++        const uint16_t* ks = smem + (fp8 ? 0 : (it % kStages) * kStage);
++        const uint16_t* vs = ks + kTile;
++        if (busy && kt <= w_last) {
++            float sc[8][4];
++            for (int j = 0; j < 8; ++j) {
++                sc[j][0] = sc[j][1] = sc[j][2] = sc[j][3] = 0.0f;
++                for (int k = 0; k < 8; k += 2) {
++                    uint32_t b[4];
++                    qmm_frag::ldmatrix4(b, tf_common::smem(ks + piece(8 * j + k_row, 2 * k + k_pc)));
++                    qmm_frag::mma(sc[j], qa[k][0], qa[k][1], qa[k][2], qa[k][3], b[0], b[1]);
++                    qmm_frag::mma(sc[j], qa[k + 1][0], qa[k + 1][1], qa[k + 1][2], qa[k + 1][3], b[2], b[3]);
++                }
++            }
++            float mx[2] = {-INFINITY, -INFINITY};
++            for (int j = 0; j < 8; ++j) {
++                for (int e = 0; e < 4; ++e) {
++                    const int i = e >> 1;
++                    const int kp = kt + 8 * j + 2 * t + (e & 1);
++                    const bool live = ok[i] && kp >= lo[i] && kp <= pos[i] && kp >= s_lo && kp <= s_hi;
++                    const int d = pos[i] - kp;
++                    const float bias = live && d < kExtent ? bf(tab[prow[i] * kExtent + d]) : 0.0f;
++                    sc[j][e] = live ? (sc[j][e] * scale + bias) * kLog2e : -INFINITY;
++                    mx[i] = fmaxf(mx[i], sc[j][e]);
++                }
++            }
++            float alpha[2], mu[2];
++            for (int i = 0; i < 2; ++i) {
++                mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffffu, mx[i], 1));
++                mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffffu, mx[i], 2));
++                const float mn = fmaxf(m[i], mx[i]);
++                mu[i] = mn == -INFINITY ? 0.0f : mn;
++                alpha[i] = exp2f(m[i] - mu[i]);
++                m[i] = mn;
++                l[i] *= alpha[i];
++            }
++            uint32_t pk[8][2];
++            for (int j = 0; j < 8; ++j) {
++                uint16_t p[4];
++                for (int e = 0; e < 4; ++e) {
++                    const int i = e >> 1;
++                    p[e] = tobf(exp2f(sc[j][e] - mu[i]));
++                    l[i] += bf(p[e]);
++                }
++                pk[j][0] = pack(p[0], p[1]);
++                pk[j][1] = pack(p[2], p[3]);
++            }
++            for (int n = 0; n < 16; ++n) {
++                acc[n][0] *= alpha[0];
++                acc[n][1] *= alpha[0];
++                acc[n][2] *= alpha[1];
++                acc[n][3] *= alpha[1];
++            }
++            for (int u = 0; u < 4; ++u) {
++                const uint32_t a0 = pk[2 * u][0], a1 = pk[2 * u][1], a2 = pk[2 * u + 1][0], a3 = pk[2 * u + 1][1];
++                for (int n = 0; n < 16; n += 2) {
++                    uint32_t b[4];
++                    qmm_frag::ldmatrix4t(b, tf_common::smem(vs + piece(16 * u + v_row, n + v_pc)));
++                    qmm_frag::mma(acc[n], a0, a1, a2, a3, b[0], b[1]);
++                    qmm_frag::mma(acc[n + 1], a0, a1, a2, a3, b[2], b[3]);
++                }
++            }
++        }
++        if (kt + kKeys > s_hi || it + 1 == n_tiles) {  // Fold each chunk in the original merge order.
++            if (busy) {
++                for (int i = 0; i < 2; ++i) {
++                    l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
++                    l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
++                }
++                for (int i = 0; i < 2; ++i) {
++                    // the merge reads chunks lo / chunk .. pos / chunk of a row, and attnTile stored nothing else
++                    if (!ok[i] || c < lo[i] / chunk || c > pos[i] / chunk) continue;
++                    const float mn = fmaxf(MM[i], m[i]);
++                    const float a = exp2f(MM[i] - mn), b = exp2f(m[i] - mn);
++                    // tf_ink2_merge's (one chunk a slot) roundings: ll = fma(a, ll, l b), o = fma(a, o, po b)
++                    LL[i] = __fmaf_rn(a, LL[i], __fmul_rn(l[i], b));
++                    for (int n = 0; n < 16; ++n) {
++                        O[n][2 * i] = __fmaf_rn(a, O[n][2 * i], __fmul_rn(acc[n][2 * i], b));
++                        O[n][2 * i + 1] = __fmaf_rn(a, O[n][2 * i + 1], __fmul_rn(acc[n][2 * i + 1], b));
++                    }
++                    MM[i] = mn;
++                }
++            }
++        }
++    }
++    if (!busy) return;
++    for (int i = 0; i < 2; ++i) {
++        if (!ok[i]) continue;
++        const size_t rh = prow[i];
++        const float sk = bf(sink[rh]) * kLog2e;
++        const float mf = fmaxf(MM[i], sk);
++        const float a = exp2f(MM[i] - mf);
++        // tf_ink2_merge's roundings: ll a + exp2(sk - mf) as one fma, then (o a) / den
++        const float den = __fmaf_rn(a, LL[i], exp2f(sk - mf));
++        for (int n = 0; n < 16; ++n)
++            for (int h = 0; h < 2; ++h) {
++                const int d = 8 * n + 2 * t + h;
++                const float y = __fdiv_rn(__fmul_rn(a, O[n][2 * i + h]), den);
++                const float gv = bf(gate[rh * kDim + d]);
++                out[rh * kDim + d] = tobf(y * (1.0f / (1.0f + expf(-gv))));
++            }
++    }
++}
+ }  // namespace ink2p
+ 
+-#define TF_INK2_PROMPT_ARGS                                                                                       \
+-    const uint16_t *__restrict__ q, const uint16_t *__restrict__ kc, const uint16_t *__restrict__ vc,             \
++#define TF_INK2_PROMPT_ARGS(Cache)                                                                                       \
++    const uint16_t *__restrict__ q, const Cache *__restrict__ kc, const Cache *__restrict__ vc,             \
+         const uint16_t *__restrict__ tab, const ink2p::Seg *__restrict__ segs, float *__restrict__ part_o,      \
+         float2 *__restrict__ part_ml, int heads, int kv_heads, int ring, int chunk, int c0, int chunks, float scale
+ 
+ // One stream's prompt rows on a global layer with bf16 caches.
+-extern "C" __global__ void __launch_bounds__(ink2p::kThreads, 1) tf_ink2_attn_prompt(TF_INK2_PROMPT_ARGS) {
++extern "C" __global__ void __launch_bounds__(ink2p::kThreads, 1) tf_ink2_attn_prompt(TF_INK2_PROMPT_ARGS(uint16_t)) {
++    extern __shared__ __align__(16) uint16_t smem[];
++    ink2p::promptTile(q, kc, vc, tab, segs, part_o, part_ml, heads, kv_heads, ring, chunk, c0, chunks, scale, smem);
++}
++
++extern "C" __global__ void __launch_bounds__(ink2p::kThreads, 1) tf_ink2_attn_prompt_fp8(TF_INK2_PROMPT_ARGS(uint8_t)) {
+     extern __shared__ __align__(16) uint16_t smem[];
+     ink2p::promptTile(q, kc, vc, tab, segs, part_o, part_ml, heads, kv_heads, ring, chunk, c0, chunks, scale, smem);
+ }
++
++#define TF_INK2_SLIDE_ARGS(Cache) \
++    const uint16_t* __restrict__ q, const Cache* __restrict__ kc, const Cache* __restrict__ vc, \
++    const uint16_t* __restrict__ tab, const ink2p::Seg* __restrict__ segs, const uint16_t* __restrict__ sink, \
++    const uint16_t* __restrict__ gate, uint16_t* __restrict__ out, int heads, int kv_heads, int ring, \
++    int window, int chunk, float scale
++
++extern "C" __global__ void __launch_bounds__(ink2p::kThreads, 1) tf_ink2_attn_slide(TF_INK2_SLIDE_ARGS(uint16_t)) {
++    extern __shared__ __align__(16) uint16_t smem[];
++    ink2p::slideTile(q, kc, vc, tab, segs, sink, gate, out, heads, kv_heads, ring, window, chunk, scale, smem);
++}
++
++extern "C" __global__ void __launch_bounds__(ink2p::kThreads, 1) tf_ink2_attn_slide_fp8(TF_INK2_SLIDE_ARGS(uint8_t)) {
++    extern __shared__ __align__(16) uint16_t smem[];
++    ink2p::slideTile(q, kc, vc, tab, segs, sink, gate, out, heads, kv_heads, ring, window, chunk, scale, smem);
++}
++#undef TF_INK2_SLIDE_ARGS
+diff --git a/zig/kernels/cuda/kv_fp8.cuh b/zig/kernels/cuda/kv_fp8.cuh
+index 49e65bb..30b70fa 100644
+--- a/zig/kernels/cuda/kv_fp8.cuh
++++ b/zig/kernels/cuda/kv_fp8.cuh
+@@ -1,8 +1,36 @@
+ // Shared E4M3 cache-row quantization: one thread per value, FP32 row scale, nearest-even saturated codes.
+ #pragma once
++#include <cuda_bf16.h>
+ #include <cuda_fp8.h>
+ 
+ namespace tf_kv_fp8 {
++// A warp owns a head row, with consecutive elements in each lane.
++template <int PER_LANE>
++__device__ __forceinline__ void quant_warp(const float (&x)[PER_LANE], int lane, unsigned char* q, float* s) {
++    float amax = 0.0f;
++    for (int i = 0; i < PER_LANE; ++i) amax = fmaxf(amax, fabsf(x[i]));
++    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
++    const float inv = amax > 0.0f ? __fdiv_rn(448.0f, amax) : 1.0f;
++    for (int i = 0; i < PER_LANE; ++i)
++        q[lane * PER_LANE + i] = __nv_cvt_float_to_fp8(__fmul_rn(x[i], inv), __NV_SATFINITE, __NV_E4M3);
++    if (lane == 0) *s = amax > 0.0f ? __fdiv_rn(amax, 448.0f) : 1.0f;
++}
++
++// Expand eight contiguous codes to the BF16 fragments used by BF16 tensor-core attention.
++__device__ __forceinline__ uint4 bf16x8(const unsigned char* q, float scale) {
++    const uint64_t codes = *reinterpret_cast<const uint64_t*>(q);
++    uint4 result;
++    auto* words = reinterpret_cast<unsigned*>(&result);
++    for (int i = 0; i < 4; ++i) {
++        const auto pair = static_cast<__nv_fp8x2_storage_t>(codes >> (i * 16));
++        const float2 x = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(pair, __NV_E4M3)));
++        const unsigned lo = __bfloat16_as_ushort(__float2bfloat16_rn(x.x * scale));
++        const unsigned hi = __bfloat16_as_ushort(__float2bfloat16_rn(x.y * scale));
++        words[i] = lo | (hi << 16);
++    }
++    return result;
++}
++
+ template <int WIDTH, bool FINITE_SCALE = false>
+ __device__ __forceinline__ void quant_row(float x, int d, unsigned char* q, float* s, float* red) {
+     static_assert(WIDTH % 32 == 0 && WIDTH <= 1024, "one whole-warp block owns a row");
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index a26c232..e7dd82a 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -142,6 +142,7 @@ pub const Info = struct {
+     /// The engine stops the reply after the think block at Request.answer_max (every lane engine: Info.ofLanes).
+     answer_limit: bool = false,
+     structures: bool = false,
++    framed_structures: bool = false, // constrain the model's own chat reply blocks
+     /// Requests may ask for ``logprobs`` (the engine's lanes give the target's rows).
+     logprobs: bool = false,
+     /// Requests' presence_penalty and frequency_penalty change the draws (false: nonzero is refused).
+@@ -233,7 +234,7 @@ pub const Family = struct {
+ pub const Precision = enum { checkpoint, full };
+ 
+ /// Which of --tp and --rank the command line named (a CUDA family's rank aliases fill the rest).
+-pub const Given = struct { tp: bool = false, rank: bool = false };
++pub const Given = struct { tp: bool = false, rank: bool = false, kv_cache: bool = false };
+ 
+ /// What a server asks of the engine it opens: the checkpoint, and the serve flags an engine reads.
+ pub const Open = struct {
+diff --git a/zig/src/core/kv_pool_parts_test.zig b/zig/src/core/kv_pool_parts_test.zig
+index 70a567f..3938f24 100644
+--- a/zig/src/core/kv_pool_parts_test.zig
++++ b/zig/src/core/kv_pool_parts_test.zig
+@@ -40,7 +40,7 @@ const Family = struct {
+         if (f.fail_copy) return error.CopyFailed; // after its work is queued
+         f.copies += 1;
+     }
+-    fn restore(p: *anyopaque, _: ?*anyopaque, group: u32, src: radix.Parts.Part) anyerror!void {
++    fn restore(p: *anyopaque, _: ?*anyopaque, group: u32, _: u32, src: radix.Parts.Part) anyerror!void {
+         const f = of(p);
+         if (f.hold_on_restore > 0) {
+             var ids: [8]u32 = undefined;
+diff --git a/zig/src/core/kv_pool_tail_test.zig b/zig/src/core/kv_pool_tail_test.zig
+index 55d1cc0..729c2a9 100644
+--- a/zig/src/core/kv_pool_tail_test.zig
++++ b/zig/src/core/kv_pool_tail_test.zig
+@@ -24,7 +24,7 @@ const Family = struct {
+         return 0;
+     }
+     fn copy(_: *anyopaque, _: ?*anyopaque, _: u32, _: u32, _: radix.Parts.Part) anyerror!void {}
+-    fn restore(_: *anyopaque, _: ?*anyopaque, _: u32, _: radix.Parts.Part) anyerror!void {}
++    fn restore(_: *anyopaque, _: ?*anyopaque, _: u32, _: u32, _: radix.Parts.Part) anyerror!void {}
+     fn copyRows(p: *anyopaque, _: ?*anyopaque, _: u32, src: u32, dst: u32, _: u32) anyerror!void {
+         const f = of(p);
+         f.mem[dst] = f.mem[src];
+diff --git a/zig/src/core/kv_prompts.zig b/zig/src/core/kv_prompts.zig
+index 8845798..cabc177 100644
+--- a/zig/src/core/kv_prompts.zig
++++ b/zig/src/core/kv_prompts.zig
+@@ -20,6 +20,7 @@ pub const Query = struct {
+     frame: u32 = 0,
+     /// What the rows depend on beyond key, images and frame (0: nothing).
+     namespace: u64 = 0,
++    salt: ?u64 = null,
+     /// The request's own chunk starts; empty: the store's grid.
+     starts: []const u32 = &.{},
+     /// Rows this pass prefills; null: the prompt's length.
+@@ -31,6 +32,8 @@ pub const Query = struct {
+     }
+ };
+ 
++pub const Kept = struct { held: bool = false, shared: usize = 0 };
++
+ /// The store as a family sees it: a prompt pass begins, keeps at its marks, and reports once its prompt is in.
+ pub const Prompts = struct {
+     ctx: *anyopaque,
+@@ -40,7 +43,7 @@ pub const Prompts = struct {
+         /// The deepest state `prompt` resumes: its pages into `adopt` (held once more), the rest restored into `owner`.
+         begin: *const fn (ctx: *anyopaque, q: Query, history_len: u32, shared: []const u32, owner: *anyopaque, adopt: *std.ArrayList(u32)) anyerror!Plan,
+         /// At `at` the store takes the pages of `mine` it lacks and the state; `path`'s first n replace the stream's.
+-        keep: *const fn (ctx: *anyopaque, q: Query, at: u32, owner: *anyopaque, mine: []const u32, path: []u32) usize,
++        keep: *const fn (ctx: *anyopaque, q: Query, at: u32, owner: *anyopaque, mine: []const u32, path: []u32) Kept,
+         /// One log line after a prompt pass: where it resumed and how many states it kept.
+         report: *const fn (ctx: *anyopaque, prompt: usize, from: u32, kept: u64) void,
+         free: *const fn (ctx: *anyopaque, marks: []const u32) void,
+@@ -50,7 +53,7 @@ pub const Prompts = struct {
+         return p.vtable.begin(p.ctx, q, history_len, shared, owner, adopt);
+     }
+ 
+-    pub fn keep(p: Prompts, q: Query, at: u32, owner: *anyopaque, mine: []const u32, path: []u32) usize {
++    pub fn keep(p: Prompts, q: Query, at: u32, owner: *anyopaque, mine: []const u32, path: []u32) Kept {
+         return p.vtable.keep(p.ctx, q, at, owner, mine, path);
+     }
+ 
+@@ -80,12 +83,13 @@ pub const Prompts = struct {
+         defer gpa.free(path);
+         const mine = try gpa.dupe(u32, l.ids.items);
+         defer gpa.free(mine);
+-        const shared = p.keep(q, @intCast(at), owner, mine[0..n], path);
+-        if (std.mem.eql(u32, mine[0..shared], path[0..shared])) return shared == n;
++        const kept = p.keep(q, @intCast(at), owner, mine[0..n], path);
++        const shared = kept.shared;
++        if (std.mem.eql(u32, mine[0..shared], path[0..shared])) return kept.held;
+         @memcpy(mine[0..shared], path[0..shared]); // the same tokens' rows: a resume from any row is exact
+         try table.write(table.ctx, mine, 0);
+         for (path[0..shared], 0..) |id, i| pool.share(l, i, id);
+-        return shared == n;
++        return kept.held;
+     }
+ };
+ 
+@@ -144,7 +148,11 @@ pub const Blob = struct {
+ 
+ /// TF_KV_SHARE=n: keep prompts as pool pages and at most n states past them (0, empty or unset: copies, as before).
+ pub fn sharing() error{BadKvShare}!usize {
+-    const v = @import("profile").given(.TF_KV_SHARE) orelse return 0;
++    return sharingDefault(0);
++}
++
++pub fn sharingDefault(default: usize) error{BadKvShare}!usize {
++    const v = @import("profile").given(.TF_KV_SHARE) orelse return default;
+     return std.fmt.parseInt(usize, v, 10) catch error.BadKvShare;
+ }
+ 
+@@ -192,9 +200,9 @@ const Stub = struct {
+     fn begin(_: *anyopaque, _: Query, _: u32, _: []const u32, _: *anyopaque, _: *std.ArrayList(u32)) anyerror!Plan {
+         return .{ .from = 256, .marks = try testing.allocator.dupe(u32, &.{512}) };
+     }
+-    fn keep(ctx: *anyopaque, _: Query, _: u32, _: *anyopaque, mine: []const u32, path: []u32) usize {
++    fn keep(ctx: *anyopaque, _: Query, _: u32, _: *anyopaque, mine: []const u32, path: []u32) Kept {
+         @memcpy(path, Stub.of(ctx).held[0..mine.len]);
+-        return mine.len;
++        return .{ .held = true, .shared = mine.len };
+     }
+     fn report(_: *anyopaque, _: usize, _: u32, _: u64) void {}
+     fn free(_: *anyopaque, marks: []const u32) void {
+diff --git a/zig/src/core/prompt_radix.zig b/zig/src/core/prompt_radix.zig
+index 9b65463..c5047e1 100644
+--- a/zig/src/core/prompt_radix.zig
++++ b/zig/src/core/prompt_radix.zig
+@@ -124,6 +124,7 @@ pub const Store = struct {
+     page_only: bool = false,
+     /// Checkpoints inside a page (C4): any row on the request's schedule, the partial page a held copy.
+     tails: bool = false,
++    reclaim_lru: bool = false,
+ 
+     const SHARED_KEYS = 64;
+ 
+@@ -322,7 +323,7 @@ pub const Store = struct {
+         defer n.pins -= 1;
+         const family = s.tree.family;
+         if (e.saved) |saved| try family.vtable.restore(family.ptr, owner, saved);
+-        try s.decl.restore(owner, e.parts);
++        try s.decl.restore(owner, f.at(), e.parts);
+     }
+ 
+     /// A resume's copies are done (the stream mapped its own pages from them): each source's hold goes back.
+@@ -543,9 +544,9 @@ pub const Store = struct {
+         const pages = s.tree.pages;
+         // parts and tails first: their path may be in use
+         if (s.decl.specs.len > 0 or s.tails) while (pages.vtable.available(pages.ptr) < want) {
+-            s.tree.evictAt(evict_mod.partVictim(&s.tree) orelse break);
++            s.tree.evictAt(evict_mod.partVictim(&s.tree, s.reclaim_lru) orelse break);
+         };
+-        while (pages.vtable.available(pages.ptr) < want) if (!s.tree.evictLeaf()) return false;
++        while (pages.vtable.available(pages.ptr) < want) if (!s.tree.evictLeafBy(s.reclaim_lru)) return false;
+         return true;
+     }
+ 
+diff --git a/zig/src/core/prompt_radix_evict.zig b/zig/src/core/prompt_radix_evict.zig
+index 52f9525..5029759 100644
+--- a/zig/src/core/prompt_radix_evict.zig
++++ b/zig/src/core/prompt_radix_evict.zig
+@@ -9,8 +9,8 @@ const Found = tree_mod.Found;
+ const Key = tree_mod.Key;
+ 
+ /// Whether `x` is a less valuable state than `y`: one never resumed before one that was, then the older.
+-fn worse(x: *const Entry, y: *const Entry) bool {
+-    if (x.hit != y.hit) return !x.hit;
++fn worse(x: *const Entry, y: *const Entry, lru: bool) bool {
++    if (!lru and x.hit != y.hit) return !x.hit;
+     return x.used < y.used;
+ }
+ 
+@@ -71,7 +71,7 @@ const Pick = struct {
+         // a state its conversation moved past goes first; a shared cut or a branch point only as the least valuable
+         const gone = !e.shared and !e.branched and ((prompt.len > e.born and prompt.len > f.at() and along and extends(f.node, p.k)) or supersededAt(f, e.born));
+         if (gone and (p.moved == null or e.used < p.moved.?.entry().used)) p.moved = f;
+-        if (p.oldest == null or worse(e, p.oldest.?.entry())) p.oldest = f;
++        if (p.oldest == null or worse(e, p.oldest.?.entry(), false)) p.oldest = f;
+     }
+ };
+ 
+@@ -89,11 +89,12 @@ pub fn victim(t: *const Tree, k: Key, skip: ?*Node) ?Found {
+ 
+ const Parts = struct {
+     t: *const Tree,
++    lru: bool,
+     best: ?Found = null,
+ 
+     fn consider(p: *Parts, f: Found) void {
+         const e = f.entry();
+-        if (p.frees(e) and (p.best == null or worse(e, p.best.?.entry()))) p.best = f;
++        if (p.frees(e) and (p.best == null or worse(e, p.best.?.entry(), p.lru))) p.best = f;
+     }
+ 
+     /// Whether `e` has a part or tail page only the store holds.
+@@ -111,8 +112,8 @@ fn pickParts(n: *Node, p: *Parts) void {
+ }
+ 
+ /// The least valuable state with a part or tail page only the store holds, never a pinned one.
+-pub fn partVictim(t: *const Tree) ?Found {
+-    var p: Parts = .{ .t = t };
++pub fn partVictim(t: *const Tree, lru: bool) ?Found {
++    var p: Parts = .{ .t = t, .lru = lru };
+     pickParts(t.root, &p);
+     return p.best;
+ }
+diff --git a/zig/src/core/prompt_radix_make.zig b/zig/src/core/prompt_radix_make.zig
+index e43a814..8bd9405 100644
+--- a/zig/src/core/prompt_radix_make.zig
++++ b/zig/src/core/prompt_radix_make.zig
+@@ -120,11 +120,11 @@ pub const Decl = struct {
+     }
+ 
+     /// The copied parts of `e` into the owner's live state, fenced; the store keeps their pages.
+-    pub fn restore(d: Decl, owner: ?*anyopaque, ps: []const Part) !void {
++    pub fn restore(d: Decl, owner: ?*anyopaque, at: u32, ps: []const Part) !void {
+         if (d.specs.len == 0) return;
+         const h = d.hooks.?;
+         defer h.vtable.fence(h.ptr, owner); // the copies out of the store's pages are done, failed or not
+-        for (d.specs, ps, 0..) |spec, part, g| if (spec.make == .copied) try h.vtable.restore(h.ptr, owner, @intCast(g), part);
++        for (d.specs, ps, 0..) |spec, part, g| if (spec.make == .copied) try h.vtable.restore(h.ptr, owner, @intCast(g), at, part);
+     }
+ 
+     /// The retained parts a resume at `at` maps: whole pages held for the stream, partial ones and `extra` as copies.
+diff --git a/zig/src/core/prompt_radix_parts.zig b/zig/src/core/prompt_radix_parts.zig
+index cf4c922..0733174 100644
+--- a/zig/src/core/prompt_radix_parts.zig
++++ b/zig/src/core/prompt_radix_parts.zig
+@@ -54,7 +54,7 @@ pub const PartHooks = struct {
+         /// The owner's live bytes of `group` after `at` tokens into the held pages of `dst`.
+         copy: *const fn (ptr: *anyopaque, owner: ?*anyopaque, group: u32, at: u32, dst: Part) anyerror!void,
+         /// The held pages of `src` into the owner's live `group` (the next prompt chunk starts at its position).
+-        restore: *const fn (ptr: *anyopaque, owner: ?*anyopaque, group: u32, src: Part) anyerror!void,
++        restore: *const fn (ptr: *anyopaque, owner: ?*anyopaque, group: u32, at: u32, src: Part) anyerror!void,
+         /// Rows [0, rows) of every layer of `group` (numbered as in Copy) from page `src` into page `dst`.
+         copy_rows: *const fn (ptr: *anyopaque, owner: ?*anyopaque, group: u32, src: u32, dst: u32, rows: u32) anyerror!void,
+         /// Every copy queued for `owner` has completed, on every rank that runs it.
+diff --git a/zig/src/core/prompt_radix_tail_test.zig b/zig/src/core/prompt_radix_tail_test.zig
+index e18744a..5c9fb41 100644
+--- a/zig/src/core/prompt_radix_tail_test.zig
++++ b/zig/src/core/prompt_radix_tail_test.zig
+@@ -64,7 +64,7 @@ const Fake = struct {
+         return 0;
+     }
+     fn copy(_: *anyopaque, _: ?*anyopaque, _: u32, _: u32, _: radix.Parts.Part) anyerror!void {}
+-    fn partRestore(_: *anyopaque, _: ?*anyopaque, _: u32, _: radix.Parts.Part) anyerror!void {}
++    fn partRestore(_: *anyopaque, _: ?*anyopaque, _: u32, _: u32, _: radix.Parts.Part) anyerror!void {}
+     fn copyRows(p: *anyopaque, _: ?*anyopaque, group: u32, src: u32, dst: u32, rows: u32) anyerror!void {
+         const f = of(p);
+         f.rows[f.nrows] = .{ group, src, dst, rows };
+diff --git a/zig/src/core/prompt_radix_test.zig b/zig/src/core/prompt_radix_test.zig
+index a6be73a..02a4eb3 100644
+--- a/zig/src/core/prompt_radix_test.zig
++++ b/zig/src/core/prompt_radix_test.zig
+@@ -305,6 +305,34 @@ test "reclaim frees the pages of the least valuable leaf nobody holds, and spare
+     try std.testing.expectEqual(@as(usize, 0), f.live);
+ }
+ 
++test "reclaim can prefer the oldest idle leaf even when it previously served a hit" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = std.testing.allocator };
++    var s = try newStore(&f, rules);
++    defer s.deinit();
++    s.reclaim_lru = true;
++    s.limit(.{ .pages = 40, .snaps = 4 });
++    var mine: std.ArrayList(u32) = .empty;
++    const x = seq(24, 0);
++    _ = try pass(&f, &s, a, &x, 20, &.{}, &mine);
++    f.leave(mine.items);
++    var adopt: std.ArrayList(u32) = .empty;
++    defer adopt.deinit(std.testing.allocator);
++    const hit = try s.begin(a, .of(&x), 20, &.{}, null, &adopt);
++    try std.testing.expectEqual(@as(u32, 20), hit.from);
++    f.leave(adopt.items);
++    const y = seq(24, 100);
++    _ = try pass(&f, &s, a, &y, 20, &.{}, &mine);
++    f.leave(mine.items);
++    var rest: [54]u32 = undefined;
++    f.lane(&rest);
++    try std.testing.expect(s.reclaim(3));
++    try std.testing.expect(s.find(.of(&x)) == null);
++    try std.testing.expect(s.find(.of(&y)) != null);
++}
++
+ test "a history every turn resumes again after one kept a longer state is a branch point: its turns never supersede it" {
+     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+     defer arena.deinit();
+diff --git a/zig/src/core/prompt_radix_tree.zig b/zig/src/core/prompt_radix_tree.zig
+index 8e7cb94..cea884c 100644
+--- a/zig/src/core/prompt_radix_tree.zig
++++ b/zig/src/core/prompt_radix_tree.zig
+@@ -443,23 +443,27 @@ pub const Tree = struct {
+     }
+ 
+     /// Whether leaf `a` is less valuable than `b`: never resumed before resumed, then the less recently used.
+-    fn lessValuable(a: *const Node, b: *const Node) bool {
++    fn lessValuable(a: *const Node, b: *const Node, lru: bool) bool {
+         const hit_a = if (a.entry) |e| e.hit else false;
+         const hit_b = if (b.entry) |e| e.hit else false;
+-        if (hit_a != hit_b) return !hit_a;
++        if (!lru and hit_a != hit_b) return !hit_a;
+         return a.used < b.used;
+     }
+ 
+-    fn weakestLeaf(t: *const Tree, n: *Node, best: *?*Node) void {
++    fn weakestLeaf(t: *const Tree, n: *Node, best: *?*Node, lru: bool) void {
+         // the root is a leaf only for its tails
+-        if ((n.parent != null or n.tails.items.len > 0) and n.kids.items.len == 0 and n.pins == 0 and t.idle(n) and (best.* == null or lessValuable(n, best.*.?))) best.* = n;
+-        for (n.kids.items) |k| t.weakestLeaf(k, best);
++        if ((n.parent != null or n.tails.items.len > 0) and n.kids.items.len == 0 and n.pins == 0 and t.idle(n) and (best.* == null or lessValuable(n, best.*.?, lru))) best.* = n;
++        for (n.kids.items) |k| t.weakestLeaf(k, best, lru);
+     }
+ 
+     /// Evicts the least valuable leaf nobody holds; false when there is none.
+     pub fn evictLeaf(t: *Tree) bool {
++        return t.evictLeafBy(false);
++    }
++
++    pub fn evictLeafBy(t: *Tree, lru: bool) bool {
+         var best: ?*Node = null;
+-        t.weakestLeaf(t.root, &best);
++        t.weakestLeaf(t.root, &best, lru);
+         const n = best orelse return false;
+         while (n.tails.items.len > 0) t.dropTail(n, n.tails.items.len - 1);
+         if (n.entry != null) t.evict(n) else t.prune(n);
+diff --git a/zig/src/families/inkling2/cuda_native.zig b/zig/src/families/inkling2/cuda_native.zig
+index 6bb3b8d..13b2043 100644
+--- a/zig/src/families/inkling2/cuda_native.zig
++++ b/zig/src/families/inkling2/cuda_native.zig
+@@ -202,7 +202,7 @@ test "stream_bytes is what an extra stream's slot and lane buffers allocate, 806
+     var m: engine.Model = undefined;
+     m.d = @ptrFromInt(0x1000); // never called: the hook answers every allocation
+     m.w = &w;
+-    m.layout = try loop.CacheLayout.init(&w.c.text, &w.p, 8192);
++    m.layout = try loop.CacheLayout.init(&w.c.text, &w.p, 8192, .bf16, engine.prompt_rows);
+     var b: backend.Backend = undefined;
+     b.d = m.d;
+     b.m = &m;
+diff --git a/zig/src/families/inkling2/kernels.zig b/zig/src/families/inkling2/kernels.zig
+index 42545e7..914c07c 100644
+--- a/zig/src/families/inkling2/kernels.zig
++++ b/zig/src/families/inkling2/kernels.zig
+@@ -19,10 +19,13 @@ pub const split_rows = 64;
+ /// A prompt block's (row, head) pairs (8 warps) and its three K/V tile stages.
+ pub const prompt_pairs = 128;
+ pub const prompt_threads = 256;
+-pub const prompt_shared = 3 * 2 * tile_keys * head_dim * 2;
++pub const prompt_shared_fp8 = 2 * tile_keys * head_dim * 2;
++pub const prompt_shared = 3 * prompt_shared_fp8;
++pub const sliding_prompt_min_rows = 64;
++pub const prefetch_shared_fp8 = 2 * tile_keys * ((head_dim + 8) * 2 + head_dim + @sizeOf(f32));
+ 
+-/// One stream's rows in a call (attention.cu's Seg): rows row0.. at positions p0.., its caches `off` elements in.
+-pub const Seg = extern struct { row0: i32, n: i32, p0: i32, pad: i32 = 0, off: i64 };
++/// A stream's rows. With paging, off is the global page table address. Otherwise it is an element offset.
++pub const Seg = extern struct { row0: i32, n: i32, p0: i32, paged: i32 = 0, off: i64 };
+ /// A block's (row, head) pairs: segment `seg`, pairs m0..m0+63 of it (attention.cu's int2).
+ pub const Tile = extern struct { seg: i32, m0: i32 };
+ 
+@@ -48,7 +51,11 @@ pub const Layer = struct {
+ };
+ 
+ /// A layer's caches (addresses): K and V rows.
+-pub const Cache = struct { k: u64, v: u64 };
++pub const Cache = struct {
++    k: u64,
++    v: u64,
++    format: @import("loop.zig").CacheFormat = .bf16,
++};
+ 
+ /// Sliding ring slots: the window plus a call's rows less one, so a chunk never overwrites keys it still reads.
+ pub fn ringFor(window: u32, rows: u32) u32 {
+@@ -90,12 +97,18 @@ pub fn partialBytes(rows: usize, heads: u32, n_chunks: u32) usize {
+ pub const Kernels = struct {
+     mod: cuda.Module,
+     prep: cuda.Function,
++    prep_fp8: cuda.Function,
+     rel_table: cuda.Function,
+     attn: cuda.Function,
++    attn_fp8: cuda.Function,
++    attn_fp8_prefetch: ?cuda.Function = null,
+     attn_fold: cuda.Function,
++    attn_fold_fp8: cuda.Function,
+     merge: cuda.Function,
+     pmod: cuda.Module,
+     attn_prompt: cuda.Function,
++    attn_prompt_fp8: cuda.Function,
++    attn_slide: ?[2]cuda.Function = null,
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -105,16 +118,36 @@ pub const Kernels = struct {
+         errdefer pmod.unload();
+         const attn_prompt = try pmod.function("tf_ink2_attn_prompt");
+         try attn_prompt.allowDynamicShared(prompt_shared);
+-        return .{
++        const attn_prompt_fp8 = try pmod.function("tf_ink2_attn_prompt_fp8");
++        const slide_on = try @import("sys").environment.read(bool, "TF_INKLING2_PREFILL_SLIDE", true);
++        const attn_slide: ?[2]cuda.Function = if (slide_on) .{
++            try pmod.function("tf_ink2_attn_slide"),
++            try pmod.function("tf_ink2_attn_slide_fp8"),
++        } else null;
++        if (attn_slide) |slide| try slide[0].allowDynamicShared(prompt_shared);
++        var k: Kernels = .{
+             .mod = mod,
+             .pmod = pmod,
+             .attn_prompt = attn_prompt,
++            .attn_prompt_fp8 = attn_prompt_fp8,
++            .attn_slide = attn_slide,
+             .prep = try mod.function("tf_ink2_prep"),
++            .prep_fp8 = try mod.function("tf_ink2_prep_fp8"),
+             .rel_table = try mod.function("tf_ink2_rel_table"),
+             .attn = try mod.function("tf_ink2_attn"),
++            .attn_fp8 = try mod.function("tf_ink2_attn_fp8"),
+             .attn_fold = try mod.function("tf_ink2_attn_fold"),
++            .attn_fold_fp8 = try mod.function("tf_ink2_attn_fold_fp8"),
+             .merge = try mod.function("tf_ink2_merge"),
+         };
++        if (try @import("sys").environment.read(bool, "TF_INKLING2_ATTN_FP8_PREFETCH", true)) try k.enableFp8Prefetch();
++        return k;
++    }
++
++    pub fn enableFp8Prefetch(k: *Kernels) !void {
++        const f = try k.mod.function("tf_ink2_attn_fp8_prefetch");
++        try f.allowDynamicShared(prefetch_shared_fp8);
++        k.attn_fp8_prefetch = f;
+     }
+ 
+     pub fn unload(k: *Kernels) void {
+@@ -139,6 +172,8 @@ pub const Rows = struct {
+     n_tiles: u32,
+     last_pos: u32, // the call's latest row position (a global layer's chunks run to it)
+     streams: u32 = 1, // segments in `segs`: one stream's prompt rows take the prompt kernel
++    sliding_prompt: bool = false,
++    decode: bool = false,
+ };
+ 
+ fn int(x: anytype) c_int {
+@@ -153,6 +188,13 @@ fn goShared(f: cuda.Function, s: cuda.Stream, grid: cuda.Dim3, threads: u32, sha
+     try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = threads }, .shared = shared }, s, a);
+ }
+ 
++fn chunkAttention(k: *const Kernels, s: cuda.Stream, r: Rows, kv: Cache, z: u32, a: *cuda.Args) !void {
++    const grid: cuda.Dim3 = .{ .x = r.n_tiles, .y = r.kv_heads, .z = z };
++    const prefetch = if (r.decode and kv.format == .fp8) k.attn_fp8_prefetch else null;
++    if (prefetch) |f| return goShared(f, s, grid, 128, prefetch_shared_fp8, a);
++    try go(if (kv.format == .fp8) k.attn_fp8 else k.attn, s, grid, 128, a);
++}
++
+ /// q, rel (per head) and k, v (per key head, written to the caches at pos % ring) from the projections' rows.
+ pub fn prep(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, c: Prep, raw: [4]u64, scales: [2]u64, q: u64, rel: u64, kv: Cache) !void {
+     var a: cuda.Args = .{};
+@@ -164,7 +206,7 @@ pub fn prep(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, c: Prep, raw:
+     a.add(int(l.ring));
+     a.add(int(@intFromBool(l.tau)));
+     for ([_]f32{ c.qk_clip, c.rel_clip, c.floor, c.alpha, c.eps }) |v| a.add(v);
+-    try go(k.prep, s, .{ .x = r.rows, .y = r.heads + 2 * r.kv_heads }, 32, &a);
++    try go(if (kv.format == .fp8) k.prep_fp8 else k.prep, s, .{ .x = r.rows, .y = r.heads + 2 * r.kv_heads }, 32, &a);
+ }
+ 
+ /// The bias table of each (row, head): its rel vector against the layer's rel_logits_proj [16][1024].
+@@ -178,6 +220,17 @@ pub fn relTable(k: *const Kernels, s: cuda.Stream, r: Rows, rel: u64, proj: u64,
+ pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32, slots: usize, q: u64, kv: Cache, tab: u64, part_o: u64, part_ml: u64, sink: u64, gate: u64, out: u64) !void {
+     if (slotsFor(l, r.last_pos + 1) > stride) return error.Inkling2Partials;
+     const scale: f32 = 1.0 / @sqrt(@as(f32, head_dim));
++    if (r.sliding_prompt and l.window != 0 and r.streams == 1) {
++        if (k.attn_slide) |slide| {
++            const fp8 = kv.format == .fp8;
++            var p: cuda.Args = .{};
++            for ([_]u64{ q, kv.k, kv.v, tab, r.segs, sink, gate, out }) |v| p.add(v);
++            for ([_]u32{ r.heads, r.kv_heads, l.ring, l.window, l.chunk }) |v| p.add(int(v));
++            p.add(scale);
++            const blocks = std.math.divCeil(u32, r.rows * (r.heads / r.kv_heads), prompt_pairs) catch unreachable;
++            return goShared(slide[@intFromBool(fp8)], s, .{ .x = blocks, .y = r.kv_heads }, prompt_threads, if (fp8) prompt_shared_fp8 else prompt_shared, &p);
++        }
++    }
+     var a: cuda.Args = .{};
+     for ([_]u64{ q, kv.k, kv.v, tab, r.segs, r.tiles, part_o, part_ml }) |v| a.add(v);
+     var slots_rh = stride; // partials a row and head
+@@ -186,7 +239,7 @@ pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32,
+         for ([_]u32{ r.heads, r.kv_heads, l.ring, l.window, l.chunk, 0, stride }) |v| a.add(int(v));
+         a.add(scale);
+         a.add(int(0));
+-        try go(k.attn, s, .{ .x = r.n_tiles, .y = r.kv_heads, .z = tileChunks(r.heads / r.kv_heads, l) }, 128, &a);
++        try chunkAttention(k, s, r, kv, tileChunks(r.heads / r.kv_heads, l), &a);
+     } else if (split(r, stride, slots)) {
+         // every sub-chunk of `stride` chunks (past the rows return at once), so graphs replay by stride
+         per = subs;
+@@ -194,18 +247,19 @@ pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32,
+         for ([_]u32{ r.heads, r.kv_heads, l.ring, 0, l.chunk, 0, slots_rh }) |v| a.add(int(v));
+         a.add(scale);
+         a.add(int(1));
+-        try go(k.attn, s, .{ .x = r.n_tiles, .y = r.kv_heads, .z = slots_rh }, 128, &a);
++        try chunkAttention(k, s, r, kv, slots_rh, &a);
+     } else if (r.streams == 1) { // one stream's rows: 128 pairs a block share each K/V tile, the fold's bits
+         var p: cuda.Args = .{};
+         for ([_]u64{ q, kv.k, kv.v, tab, r.segs, part_o, part_ml }) |v| p.add(v);
+         for ([_]u32{ r.heads, r.kv_heads, l.ring, l.chunk, 0, stride }) |v| p.add(int(v));
+         p.add(scale);
+         const blocks = std.math.divCeil(u32, r.rows * (r.heads / r.kv_heads), prompt_pairs) catch unreachable;
+-        try goShared(k.attn_prompt, s, .{ .x = blocks, .y = r.kv_heads, .z = stride }, prompt_threads, prompt_shared, &p);
++        const fp8 = kv.format == .fp8;
++        try goShared(if (fp8) k.attn_prompt_fp8 else k.attn_prompt, s, .{ .x = blocks, .y = r.kv_heads, .z = stride }, prompt_threads, if (fp8) prompt_shared_fp8 else prompt_shared, &p);
+     } else { // a block a chunk, its sub-chunks folded in order
+         for ([_]u32{ r.heads, r.kv_heads, l.ring, l.chunk, 0, stride }) |v| a.add(int(v));
+         a.add(scale);
+-        try go(k.attn_fold, s, .{ .x = r.n_tiles, .y = r.kv_heads, .z = stride }, 128, &a);
++        try go(if (kv.format == .fp8) k.attn_fold_fp8 else k.attn_fold, s, .{ .x = r.n_tiles, .y = r.kv_heads, .z = stride }, 128, &a);
+     }
+     var b: cuda.Args = .{};
+     for ([_]u64{ part_o, part_ml, sink, gate, r.pos, out }) |v| b.add(v);
+diff --git a/zig/src/families/inkling2/kernels_test.zig b/zig/src/families/inkling2/kernels_test.zig
+index 210ac54..8064790 100644
+--- a/zig/src/families/inkling2/kernels_test.zig
++++ b/zig/src/families/inkling2/kernels_test.zig
+@@ -38,9 +38,9 @@ test "inkling2 kernels: the loader type-checks in a build with kernels" {
+ }
+ 
+ const Fake = struct {
+-    var grids: [8][3]u32 = undefined;
+-    var blocks: [8]u32 = undefined;
+-    var shared: [8]u32 = undefined;
++    var grids: [9][3]u32 = undefined;
++    var blocks: [9]u32 = undefined;
++    var shared: [9]u32 = undefined;
+     var count: usize = 0;
+     fn launch(f: cuda.abi.Function, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, _: c_uint, _: c_uint, sh: c_uint, _: cuda.abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) c_int {
+         const i = @intFromPtr(f) - 1;
+@@ -55,12 +55,27 @@ const Fake = struct {
+ test "inkling2 kernels: one decode row at 1M splits 64 chunks into sub-chunks for each of a rank's 4 key heads" {
+     var d: cuda.Driver = undefined;
+     d.api.cuLaunchKernel = Fake.launch;
++    Fake.count = 0;
+     const fun = struct {
+         fn of(drv: *const cuda.Driver, i: usize) cuda.Function {
+             return .{ .d = drv, .handle = @ptrFromInt(i) };
+         }
+     };
+-    const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4), .attn_fold = fun.of(&d, 3), .pmod = .{ .d = &d, .handle = null }, .attn_prompt = fun.of(&d, 3) };
++    const kern: k.Kernels = .{
++        .mod = .{ .d = &d, .handle = null },
++        .pmod = .{ .d = &d, .handle = null },
++        .prep = fun.of(&d, 1),
++        .rel_table = fun.of(&d, 2),
++        .attn = fun.of(&d, 3),
++        .merge = fun.of(&d, 4),
++        .attn_fold = fun.of(&d, 3),
++        .attn_prompt = fun.of(&d, 3),
++        .prep_fp8 = fun.of(&d, 5),
++        .attn_fp8 = fun.of(&d, 6),
++        .attn_fp8_prefetch = fun.of(&d, 9),
++        .attn_fold_fp8 = fun.of(&d, 7),
++        .attn_prompt_fp8 = fun.of(&d, 8),
++    };
+     const s: cuda.Stream = .{ .d = &d, .handle = null };
+     const r: k.Rows = .{ .rows = 1, .heads = 24, .kv_heads = 4, .pos = 0, .seg_of = 0, .segs = 0, .tiles = 0, .n_tiles = 1, .last_pos = 1048575 };
+     const l = k.Layer.global(1048576);
+@@ -91,6 +106,31 @@ test "inkling2 kernels: one decode row at 1M splits 64 chunks into sub-chunks fo
+     prompt.rows = 2048;
+     try k.attend(&kern, s, prompt, l, 64, 2048 * 24 * 64, 0, .{ .k = 0, .v = 0 }, 0, 0, 0, 0, 0, 0);
+     try t.expectEqual([3]u32{ 96, 4, 64 }, Fake.grids[2]);
++    const fp8: k.Cache = .{ .k = 0, .v = 0, .format = .fp8 };
++    try k.prep(&kern, s, r, l, .{ .qk_clip = 22.6, .rel_clip = 8, .floor = 128000, .alpha = 0.1, .eps = 1e-6 }, .{ 0, 0, 0, 0 }, .{ 0, 0 }, 0, 0, fp8);
++    try t.expectEqual([3]u32{ 1, 32, 1 }, Fake.grids[4]);
++    try k.attend(&kern, s, r, l, 64, all, 0, fp8, 0, 0, 0, 0, 0, 0);
++    try t.expectEqual([3]u32{ 1, 4, 64 * k.subs }, Fake.grids[5]);
++    try k.attend(&kern, s, r, k.Layer.sliding(1024, 2048), 5, 0, 0, fp8, 0, 0, 0, 0, 0, 0);
++    try t.expectEqual([3]u32{ 1, 4, 6 }, Fake.grids[5]);
++    try k.attend(&kern, s, two, l, 64, all - 1, 0, fp8, 0, 0, 0, 0, 0, 0);
++    try t.expectEqual([3]u32{ 1, 4, 64 }, Fake.grids[6]);
++    try k.attend(&kern, s, prompt, l, 64, 2048 * 24 * 64, 0, fp8, 0, 0, 0, 0, 0, 0);
++    try t.expectEqual([3]u32{ 96, 4, 64 }, Fake.grids[7]);
++    try t.expectEqual(@as(u32, 32768), Fake.shared[7]);
++    var decode = r;
++    decode.decode = true;
++    try k.attend(&kern, s, decode, l, 64, all, 0, fp8, 0, 0, 0, 0, 0, 0);
++    try t.expectEqual([3]u32{ 1, 4, 64 * k.subs }, Fake.grids[8]);
++    try t.expectEqual(@as(u32, 128), Fake.blocks[8]);
++    try t.expectEqual(@as(u32, 51712), Fake.shared[8]);
++    try k.attend(&kern, s, decode, k.Layer.sliding(1024, 2048), 5, 0, 0, fp8, 0, 0, 0, 0, 0, 0);
++    try t.expectEqual([3]u32{ 1, 4, 6 }, Fake.grids[8]);
++    const launches = Fake.count;
++    Fake.grids[8] = @splat(0);
++    try k.attend(&kern, s, decode, l, 64, all, 0, .{ .k = 0, .v = 0 }, 0, 0, 0, 0, 0, 0);
++    try t.expectEqual(launches + 2, Fake.count);
++    try t.expectEqual([3]u32{ 0, 0, 0 }, Fake.grids[8]);
+     try t.expect(!k.split(.{ .rows = 65, .heads = 24, .kv_heads = 4, .pos = 0, .seg_of = 0, .segs = 0, .tiles = 0, .n_tiles = 7, .last_pos = 100 }, 1, 1 << 30));
+ }
+ 
+diff --git a/zig/src/families/inkling2/loop.zig b/zig/src/families/inkling2/loop.zig
+index a7a12d6..d9bfe89 100644
+--- a/zig/src/families/inkling2/loop.zig
++++ b/zig/src/families/inkling2/loop.zig
+@@ -10,11 +10,32 @@ pub fn validateLoad(c: *const config.Config, rank: usize, images: bool) !void {
+     if (lp.gate_rank != 64) return error.UnsupportedLoopGateRank;
+ }
+ 
++pub const modelopt_prompt_rows: usize = 2048;
++pub const exl3_prompt_rows: usize = 4096;
++
++pub fn promptRows(_: bool) usize {
++    return @import("sys").environment.read(usize, "TF_INKLING2_PREFILL_ROWS", exl3_prompt_rows) catch exl3_prompt_rows;
++}
++
++pub const CacheFormat = enum {
++    bf16,
++    fp8,
++
++    pub fn rowBytes(format: CacheFormat, dim: u32) u64 {
++        return switch (format) {
++            .bf16 => @as(u64, dim) * 2,
++            .fp8 => @as(u64, dim) + @sizeOf(f32),
++        };
++    }
++};
++
+ pub const SnapshotSlot = struct {
+     kv_offset: u64,
+     kv_bytes: u64,
+     conv_offset: u64,
+     conv_bytes: u64,
++    global_offset: u64 = 0,
++    global_row: u64 = 0,
+ };
+ 
+ /// A stream or a saved prompt owns the same complete layout: no visit shares KV or convolution state with another.
+@@ -22,24 +43,48 @@ pub const CacheLayout = struct {
+     slots: [config.max_visits]SnapshotSlot,
+     n: u32,
+     bytes: u64,
++    format: CacheFormat,
++    rows_per_pass: usize,
++
++    pub fn init(c: *const config.Text, p: *const plan_.Plan, context: u32, format: CacheFormat, rows_per_pass: usize) !CacheLayout {
++        return make(c, p, context, format, rows_per_pass, false);
++    }
++
++    pub fn initPaged(c: *const config.Text, p: *const plan_.Plan, context: u32, format: CacheFormat, rows_per_pass: usize) !CacheLayout {
++        return make(c, p, context, format, rows_per_pass, true);
++    }
+ 
+-    pub fn init(c: *const config.Text, p: *const plan_.Plan, context: u32) !CacheLayout {
+-        if (context == 0 or context > c.max_context or p.n_visits != c.visitCount()) return error.BadLoopCache;
++    fn make(c: *const config.Text, p: *const plan_.Plan, context: u32, format: CacheFormat, rows_per_pass: usize, paged: bool) !CacheLayout {
++        if (context == 0 or context > c.max_context or p.n_visits != c.visitCount() or
++            rows_per_pass == 0 or rows_per_pass > exl3_prompt_rows) return error.BadLoopCache;
+         var out: CacheLayout = undefined;
+         out.n = p.n_visits;
++        out.format = format;
++        out.rows_per_pass = rows_per_pass;
+         out.bytes = 0;
++        var global_offset: u64 = 0;
+         const conv_values = 3 * (2 * @as(u64, c.local.kv * c.local.dim) + 2 * @as(u64, c.hidden));
+         for (p.visits[0..p.n_visits], 0..) |visit, i| {
+             const layer = p.layers[visit.layer];
+-            const rows: u32 = @intCast(@min(2048, context));
++            const rows: u32 = @intCast(@min(rows_per_pass, context));
++            const global = paged and layer.kind == .global;
+             const tokens = if (layer.kind == .global)
+-                std.mem.alignForward(u32, context, 64)
++                (if (global) 0 else std.mem.alignForward(u32, context, 64))
+             else
+                 std.mem.alignForward(u32, c.window + rows - 1, 64);
+-            const kv = try std.math.mul(u64, tokens, 2 * @as(u64, layer.heads.kv * layer.heads.dim * 2));
++            const row = 2 * layer.heads.kv * format.rowBytes(layer.heads.dim);
++            const kv = try std.math.mul(u64, tokens, row);
+             // The recurrence rounds each site then widens its complete state to FP32 before the FMAs.
+             const conv = try std.math.mul(u64, conv_values, 4);
+-            out.slots[i] = .{ .kv_offset = out.bytes, .kv_bytes = kv, .conv_offset = 0, .conv_bytes = conv };
++            out.slots[i] = .{
++                .kv_offset = out.bytes,
++                .kv_bytes = kv,
++                .conv_offset = 0,
++                .conv_bytes = conv,
++                .global_offset = global_offset,
++                .global_row = if (global) row else 0,
++            };
++            if (global) global_offset += row;
+             out.bytes = try std.math.add(u64, out.bytes, kv);
+         }
+         var conv_offset = out.bytes;
+@@ -51,6 +96,15 @@ pub const CacheLayout = struct {
+         return out;
+     }
+ 
++    pub fn globalBytesPerToken(p: *const plan_.Plan, format: CacheFormat) u64 {
++        var bytes: u64 = 0;
++        for (p.visits[0..p.n_visits]) |visit| {
++            const layer = p.layers[visit.layer];
++            if (layer.kind == .global) bytes += 2 * layer.heads.kv * format.rowBytes(layer.heads.dim);
++        }
++        return bytes;
++    }
++
+     pub fn at(l: *const CacheLayout, visit: u32) SnapshotSlot {
+         return l.slots[visit];
+     }
+@@ -96,7 +150,7 @@ test "a saved prompt restores every visit byte and owns its copy" {
+     const c = try config.parse(arena.allocator(), @import("config_test.zig").mini, &why);
+     var prec: [24]plan_.Precision = @splat(.nvfp4);
+     const p = try plan_.build(&c.text, &prec);
+-    const layout = try CacheLayout.init(&c.text, &p, 1);
++    const layout = try CacheLayout.init(&c.text, &p, 1, .bf16, modelopt_prompt_rows);
+     const state = try std.testing.allocator.alloc(u8, @intCast(layout.bytes));
+     defer std.testing.allocator.free(state);
+     for (state, 0..) |*v, i| v.* = @truncate(i * 29 + 7);
+@@ -117,7 +171,7 @@ test "Mini has 48 independent KV and convolution slots and a whole-state snapsho
+     const c = try config.parse(a, config_test.mini, &why);
+     var prec: [24]plan_.Precision = @splat(.nvfp4);
+     const p = try plan_.build(&c.text, &prec);
+-    const layout = try CacheLayout.init(&c.text, &p, 1_048_576);
++    const layout = try CacheLayout.init(&c.text, &p, 1_048_576, .bf16, modelopt_prompt_rows);
+     try std.testing.expectEqual(@as(u32, 48), layout.n);
+     try std.testing.expectEqual(@as(u64, 3072 * 2 * 8 * 128 * 2), layout.at(0).kv_bytes);
+     try std.testing.expectEqual(@as(u64, 1_048_576 * 2 * 8 * 128 * 2), layout.at(5).kv_bytes);
+@@ -161,8 +215,27 @@ test "pass snapshots and rollback layout cover every visit" {
+     const c = try config.parse(arena.allocator(), config_test.mini, &why);
+     var precisions: [24]plan_.Precision = @splat(.nvfp4);
+     const p = try plan_.build(&c.text, &precisions);
+-    const layout = try CacheLayout.init(&c.text, &p, 4096);
++    const layout = try CacheLayout.init(&c.text, &p, 4096, .bf16, modelopt_prompt_rows);
+     try std.testing.expectEqual(@as(u32, 48), layout.n);
+     try std.testing.expect(layout.at(17).kv_offset != layout.at(29).kv_offset);
+     try std.testing.expectEqual(@as(u64, layout.at(46).conv_offset + layout.at(46).conv_bytes), layout.at(47).conv_offset);
+ }
++
++test "FP8 holds one E4M3 code per value and one FP32 scale per head row of every visit" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    var why: config.Why = .{};
++    const c = try config.parse(arena.allocator(), @import("config_test.zig").mini, &why);
++    const p = try plan_.build(&c.text, &(@as([24]plan_.Precision, @splat(.nvfp4))));
++    const bf16 = try CacheLayout.init(&c.text, &p, 8705, .bf16, modelopt_prompt_rows);
++    const fp8 = try CacheLayout.init(&c.text, &p, 8705, .fp8, modelopt_prompt_rows);
++    var end: u64 = 0;
++    for (fp8.slots[0..fp8.n], bf16.slots[0..bf16.n]) |small, wide| {
++        try std.testing.expectEqual(end, small.kv_offset);
++        try std.testing.expectEqual(wide.kv_bytes / 256 * 132, small.kv_bytes);
++        try std.testing.expectEqual(wide.conv_bytes, small.conv_bytes);
++        end += small.kv_bytes;
++    }
++    try std.testing.expectEqual(end, fp8.at(0).conv_offset);
++    try std.testing.expectEqual(@as(u64, 64 * 16896), (try CacheLayout.init(&c.text, &p, 8769, .fp8, modelopt_prompt_rows)).bytes - fp8.bytes);
++}
+diff --git a/zig/src/families/inkling2/loop_engine.zig b/zig/src/families/inkling2/loop_engine.zig
+index 18f8667..a8947e5 100644
+--- a/zig/src/families/inkling2/loop_engine.zig
++++ b/zig/src/families/inkling2/loop_engine.zig
+@@ -185,7 +185,7 @@ pub const Model = struct {
+     fn cacheOf(m: *const Model, visit: u32) attention.Cache {
+         const slot = m.layout.at(visit);
+         const base = m.slotBase() + slot.kv_offset;
+-        return .{ .k = base, .v = base + slot.kv_bytes / 2 };
++        return .{ .k = base, .v = base + slot.kv_bytes / 2, .format = m.layout.format };
+     }
+ 
+     fn convOf(m: *const Model, visit: u32, site: usize) u64 {
+@@ -213,7 +213,7 @@ pub const Model = struct {
+     }
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, w: *const weights_.Weights, context: usize) !Model {
+-        const layout = try loop.CacheLayout.init(&w.c.text, &w.p, @intCast(context));
++        const layout = try loop.CacheLayout.init(&w.c.text, &w.p, @intCast(context), .bf16, prompt_rows);
+         var m: Model = .{
+             .gpa = gpa,
+             .d = d,
+diff --git a/zig/src/families/inkling2/loop_pages.zig b/zig/src/families/inkling2/loop_pages.zig
+new file mode 100644
+index 0000000..024b83c
+--- /dev/null
++++ b/zig/src/families/inkling2/loop_pages.zig
+@@ -0,0 +1,152 @@
++//! Inkling 2 Mini's global KV arena and graph-stable page tables.
++const std = @import("std");
++const cuda = @import("cuda");
++const kv = @import("core").kv_pool;
++const loop = @import("loop.zig");
++const engine = @import("loop_engine.zig");
++
++pub const page_tokens: u32 = 256; // cache_rows.cuh; a whole number of 64-key attention tiles
++
++pub fn need(prompt: usize, reply: usize) usize {
++    const geometry: kv.Layout = .{ .page_tokens = page_tokens, .fixed_bytes = 0, .token_bytes = 1, .snap_bytes = 0 };
++    return geometry.need(prompt, reply, engine.window_rows);
++}
++
++pub fn tableBytes(context: usize) usize {
++    return need(context, 0) * @sizeOf(u32);
++}
++
++pub const Pages = struct {
++    pool: kv.Pool,
++    memory: cuda.DeviceBuffer,
++    tokens: usize,
++
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, count: usize, row_bytes: u64) !Pages {
++        const tokens = count * page_tokens;
++        var pool = try kv.Pool.init(gpa, count, row_bytes * page_tokens);
++        errdefer pool.deinit();
++        const memory = try cuda.DeviceBuffer.alloc(d, tokens * row_bytes);
++        return .{ .pool = pool, .memory = memory, .tokens = tokens };
++    }
++
++    pub fn deinit(p: *Pages) void {
++        p.pool.deinit();
++        p.memory.free();
++    }
++
++    pub fn cache(p: *const Pages, visit: loop.SnapshotSlot, format: loop.CacheFormat) @import("kernels.zig").Cache {
++        const k = p.memory.ptr + visit.global_offset * p.tokens;
++        return .{ .k = k, .v = k + visit.global_row * p.tokens / 2, .format = format };
++    }
++};
++
++/// A global K/V plane has a region per head's codes and, in FP8, per head's scales.
++/// A page's storage spans every plane. Pack state across its regions in physical order.
++const StateGeometry = struct {
++    heads: usize,
++    codes: usize,
++    scales: usize,
++    pages: usize,
++    page_bytes: usize,
++
++    fn piece(g: StateGeometry, ids: []const u32, offset: usize) struct { offset: usize, len: usize } {
++        const physical = ids[offset / g.page_bytes];
++        const plane = g.heads * (g.codes + g.scales);
++        const row_offset = offset % g.page_bytes;
++        const plane_base = row_offset / plane * plane;
++        const local = row_offset % plane;
++        const scale_base = g.heads * g.codes;
++        const scale = local >= scale_base;
++        const region = if (scale) g.scales else g.codes;
++        const start = if (scale) scale_base else 0;
++        const within = (local - start) % region;
++        const base = plane_base + local - within;
++        return .{ .offset = base * g.pages + physical * region + within, .len = region - within };
++    }
++};
++
++pub const StateCopy = struct {
++    m: *const engine.Model,
++    s: cuda.Stream,
++    ids: []const u32,
++    geometry: StateGeometry,
++    out: bool,
++    offset: usize = 0,
++
++    pub fn init(m: *const engine.Model, s: cuda.Stream, ids: []const u32, out: bool) StateCopy {
++        const p = &m.pages.?;
++        const heads = m.w.c.text.global;
++        const fp8 = m.layout.format == .fp8;
++        return .{
++            .m = m,
++            .s = s,
++            .ids = ids,
++            .out = out,
++            .geometry = .{
++                .heads = heads.kv,
++                .codes = @as(usize, heads.dim) * page_tokens * (if (fp8) @as(usize, 1) else 2),
++                .scales = if (fp8) page_tokens * @sizeOf(f32) else 0,
++                .pages = p.pool.total(),
++                .page_bytes = @intCast(p.pool.page_bytes),
++            },
++        };
++    }
++
++    pub fn span(w: *StateCopy, ptr: u64, size: usize) !void {
++        const arena = w.m.pages.?.memory.ptr;
++        var copied: usize = 0;
++        while (copied < size) {
++            const piece = w.geometry.piece(w.ids, w.offset);
++            const n = @min(size - copied, piece.len);
++            const dev = ptr + copied;
++            const blob = arena + piece.offset;
++            try w.m.copy(w.s, if (w.out) blob else dev, if (w.out) dev else blob, n);
++            w.offset += n;
++            copied += n;
++        }
++    }
++};
++
++test "Mini snapshot bytes span scattered head planes and respect physical page IDs" {
++    const g: StateGeometry = .{ .heads = 2, .codes = 32, .scales = 4, .pages = 4, .page_bytes = 144 };
++    const ids = &[_]u32{ 3, 1 };
++    try std.testing.expectEqual(@as(usize, 96), g.piece(ids, 0).offset);
++    try std.testing.expectEqual(@as(usize, 1), g.piece(ids, 31).len);
++    try std.testing.expectEqual(@as(usize, 268), g.piece(ids, 64).offset);
++    try std.testing.expectEqual(@as(usize, 284), g.piece(ids, 68).offset);
++    try std.testing.expectEqual(@as(usize, 384), g.piece(ids, 72).offset);
++    try std.testing.expectEqual(@as(usize, 32), g.piece(ids, 144).offset);
++}
++
++pub const Map = struct {
++    m: *engine.Model,
++    s: cuda.Stream,
++    slot: usize,
++
++    pub fn table(m: *Map) kv.Table {
++        return .{ .ctx = m, .write = write };
++    }
++
++    fn write(ctx: *anyopaque, ids: []const u32, from: usize) anyerror!void {
++        const m: *Map = @ptrCast(@alignCast(ctx));
++        const ptr = m.m.pageTable(m.slot);
++        try m.m.upload(m.s, ptr + from * @sizeOf(u32), std.mem.sliceAsBytes(ids[from..]));
++    }
++};
++
++pub fn reserve(m: *engine.Model, s: cuda.Stream, slot: usize, lease: *kv.Lease, n: usize) !void {
++    const p = if (m.pages) |*p| &p.pool else return;
++    try p.promise(lease, n - lease.ids.items.len);
++    var map: Map = .{ .m = m, .s = s, .slot = slot };
++    try p.cover(lease, n, map.table());
++}
++
++pub fn finish(m: *engine.Model, lease: *kv.Lease) void {
++    if (m.pages) |*p| p.pool.finish(lease);
++}
++
++test "Mini reserves whole pages including the last verify window" {
++    try std.testing.expectEqual(@as(usize, 1), need(230, 10));
++    try std.testing.expectEqual(@as(usize, 2), need(231, 10));
++    try std.testing.expectEqual(@as(usize, 33 * 4), tableBytes(8192));
++}
+diff --git a/zig/src/native/cuda_options.zig b/zig/src/native/cuda_options.zig
+index ef19c8f..74d8406 100644
+--- a/zig/src/native/cuda_options.zig
++++ b/zig/src/native/cuda_options.zig
+@@ -23,6 +23,10 @@ pub fn set(comptime F: type, o: api.Open, opts: *F.Options, problem: *[]const u8
+             opts.vision = .{ .image_tokens = if (vo.image_tokens_set) vo.image_tokens else own orelse vo.image_tokens, .max_images = vo.max_images };
+             // a family that reads videos takes the counts its tower holds (Nemotron Omni's only a token budget)
+             const L = @typeInfo(@FieldType(F.Options, "vision")).optional.child;
++            if (comptime @hasField(L, "image_share")) opts.vision.?.image_share = switch (vo.image_share) {
++                .request => .request,
++                .fixed => .fixed,
++            };
+             if (comptime @hasField(L, "video_tokens")) opts.vision.?.video_tokens = vo.video_tokens;
+             if (comptime @hasField(L, "max_videos")) opts.vision.?.max_videos = vo.max_videos;
+             if (comptime @hasField(L, "max_frames")) opts.vision.?.max_frames = vo.max_frames;
+@@ -41,7 +45,7 @@ pub fn set(comptime F: type, o: api.Open, opts: *F.Options, problem: *[]const u8
+     if (comptime @hasField(F.Options, "drafter")) opts.drafter = o.drafter;
+     if (comptime @hasField(F.Options, "drafter_bits")) opts.drafter_bits = o.drafter_bits;
+     if (comptime @hasField(F.Options, "rope_yarn")) opts.rope_yarn = o.rope_yarn;
+-    if (@hasField(F.Options, "kv8")) opts.kv8 = o.kv8;
++    if (@hasField(F.Options, "kv8") and (o.given.kv_cache or o.kv8)) opts.kv8 = o.kv8;
+     if (@hasField(F.Options, "prompt_int8")) opts.prompt_int8 = o.prompt_int8;
+     if (@hasField(F.Options, "loops")) opts.loops = o.loops;
+     if (@hasField(F.Options, "learn_conversations")) opts.learn_conversations = o.learn_conversations;
+@@ -110,3 +114,17 @@ test "full-only precision: checkpoint is unknown before a family can load or all
+     try std.testing.expect(set(Both, .{ .dir = "d", .model_type = "nemotron_h", .precision = .checkpoint }, &existing, &why));
+     try std.testing.expectEqual(@as(?@typeInfo(@TypeOf(existing.precision)).optional.child, .checkpoint), existing.precision);
+ }
++
++test "cache options preserve the family default and forward explicit BF16 and FP8" {
++    const F = struct {
++        pub const Options = struct { kv8: bool = true };
++    };
++    var opts: F.Options = .{};
++    var why: []const u8 = "";
++    var o: api.Open = .{ .dir = "d", .model_type = "inkling2_loop" };
++    try std.testing.expect(set(F, o, &opts, &why) and opts.kv8);
++    o.given.kv_cache = true;
++    try std.testing.expect(set(F, o, &opts, &why) and !opts.kv8);
++    o.kv8 = true;
++    try std.testing.expect(set(F, o, &opts, &why) and opts.kv8);
++}
+diff --git a/zig/src/native/cuda_prompt_pages.zig b/zig/src/native/cuda_prompt_pages.zig
+index 8568057..fec367b 100644
+--- a/zig/src/native/cuda_prompt_pages.zig
++++ b/zig/src/native/cuda_prompt_pages.zig
+@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
+ 
+ /// Whether the family keeps prompts this way: it declares the hooks, its streams are on pages and TF_KV_SHARE is set.
+ pub fn wanted(comptime F: type, loaded: anytype) !bool {
++    if (comptime @hasField(@TypeOf(loaded), "paging")) if (loaded.paging) |p| return p.cache_entries > 0;
+     return could(F, loaded) and try hooks.sharing() > 0;
+ }
+ 
+@@ -19,6 +20,19 @@ pub fn could(comptime F: type, loaded: anytype) bool {
+     return loaded.layout != null;
+ }
+ 
++pub fn pageLimit(loaded: anytype) ?usize {
++    if (comptime @hasField(@TypeOf(loaded), "paging")) if (loaded.paging) |p| {
++        return @intCast(p.pool.kept / p.layout.pageBytes());
++    };
++    return null;
++}
++
++/// The limit on retained mark metadata for a family with no reserved snapshot slots.
++pub fn entryLimit(loaded: anytype) ?usize {
++    if (comptime @hasField(@TypeOf(loaded), "paging")) if (loaded.paging) |p| return p.cache_entries;
++    return null;
++}
++
+ /// What the unpaged store's note on a state past its whole budget adds: the setting, where `could` holds.
+ pub fn hint(comptime F: type, loaded: anytype) []const u8 {
+     return if (could(F, loaded)) "; TF_KV_SHARE=n keeps a prompt's rows as the pool's pages instead of copying them" else "";
+@@ -34,6 +48,10 @@ pub const Adapter = struct {
+ 
+     /// The family's store, its pool's reclaim evicting the tree's idle pages; null: the family has no pool.
+     pub fn open(comptime F: type, gpa: Allocator, target: anytype, page_tokens: u32, snap_limit: usize) !?*Adapter {
++        return openLimited(F, gpa, target, page_tokens, snap_limit, null);
++    }
++
++    pub fn openLimited(comptime F: type, gpa: Allocator, target: anytype, page_tokens: u32, snap_limit: usize, page_limit: ?usize) !?*Adapter {
+         const pool = F.share_pool(target) orelse return null;
+         const x = try gpa.create(Adapter);
+         errdefer gpa.destroy(x);
+@@ -46,14 +64,46 @@ pub const Adapter = struct {
+         rules.min_gap = 256;
+         rules.tail = true;
+         const copies: radix.Snapshots = .{ .ptr = target, .vtable = &snaps.Snaps(F, null).vtable };
+-        x.* = .{ .gpa = gpa, .pool = pool, .store = try radix.Store.init(gpa, copies, radix.pagesOf(kv.Pool, pool, pool.page_bytes), rules), .detach = Detach(F).call, .target = target };
++        const pages = radix.pagesOf(kv.Pool, pool, pool.page_bytes);
++        const store = if (comptime @hasDecl(F, "share_state"))
++            try radix.Store.initGroups(gpa, copies, pages, rules, .{ .parts = &.{.{ .kind = .state, .make = .copied }}, .legacy = false }, .{ .ptr = target, .vtable = &StatePart(F).vtable })
++        else
++            try radix.Store.init(gpa, copies, pages, rules);
++        x.* = .{ .gpa = gpa, .pool = pool, .store = store, .detach = Detach(F).call, .target = target };
+         errdefer x.store.deinit();
+-        x.store.limit(.{ .pages = pool.total(), .snaps = snap_limit });
++        x.store.reclaim_lru = @hasDecl(F, "share_reclaim_lru") and F.share_reclaim_lru;
++        x.store.limit(.{ .pages = page_limit orelse pool.total(), .snaps = snap_limit });
+         try pool.joinReclaim(.{ .ctx = x, .call = reclaim }); // a promise or a hold evicts the tree's idle pages first
+         F.share_attach(target, .{ .ctx = x, .vtable = &vtable });
+         return x;
+     }
+ 
++    fn StatePart(comptime F: type) type {
++        return struct {
++            fn bytes(ptr: *anyopaque, _: u32, at: u32) u64 {
++                return F.share_state.bytes(F.share_backend(ptr), at);
++            }
++
++            fn copy(ptr: *anyopaque, owner: ?*anyopaque, _: u32, at: u32, dst: radix.Parts.Part) anyerror!void {
++                try F.share_state.copy(F.share_backend(ptr), owner, at, dst.ids, dst.bytes, true);
++            }
++
++            fn restore(ptr: *anyopaque, owner: ?*anyopaque, _: u32, at: u32, src: radix.Parts.Part) anyerror!void {
++                try F.share_state.copy(F.share_backend(ptr), owner, at, src.ids, src.bytes, false);
++            }
++
++            fn copyRows(_: *anyopaque, _: ?*anyopaque, _: u32, _: u32, _: u32, _: u32) anyerror!void {
++                return error.PageAlignedMarksOnly;
++            }
++
++            fn fence(ptr: *anyopaque, _: ?*anyopaque) void {
++                F.share_state.fence(F.share_backend(ptr));
++            }
++
++            const vtable: radix.PartHooks.VTable = .{ .bytes = bytes, .copy = copy, .restore = restore, .copy_rows = copyRows, .fence = fence };
++        };
++    }
++
+     fn Detach(comptime F: type) type {
+         return struct {
+             fn call(target: *anyopaque) void {
+@@ -86,16 +136,18 @@ pub const Adapter = struct {
+         return .{ .from = p.from, .marks = p.marks };
+     }
+ 
+-    fn keep(ctx: *anyopaque, q: hooks.Query, at: u32, owner: *anyopaque, mine: []const u32, path: []u32) usize {
++    fn keep(ctx: *anyopaque, q: hooks.Query, at: u32, owner: *anyopaque, mine: []const u32, path: []u32) hooks.Kept {
+         const x = of(ctx);
+-        const ids = identities(x.gpa, q.images) catch return 0; // nothing kept: a later turn prefills it
++        const ids = identities(x.gpa, q.images) catch return .{}; // nothing kept: a later turn prefills it
+         defer x.gpa.free(ids);
+-        return x.store.keep(query(q, ids), at, owner, mine, path).shared;
++        const retained: []const radix.Retained = if (x.store.decl.specs.len > 0) &.{.{ .base = 0, .ids = &.{} }} else &.{};
++        const kept = x.store.keepParts(query(q, ids), at, owner, mine, retained, path);
++        return .{ .held = kept.held, .shared = kept.shared };
+     }
+ 
+     /// The family's query as the store takes it, its images as `ids`.
+     fn query(q: hooks.Query, ids: []const radix.Identity) radix.Query {
+-        return .{ .key = q.key, .prompt_len = q.prompt_len, .images = ids, .frame = q.frame, .namespace = q.namespace, .starts = q.starts, .prefilled = q.prefilled };
++        return .{ .key = q.key, .prompt_len = q.prompt_len, .images = ids, .frame = q.frame, .namespace = q.namespace, .salt = q.salt, .starts = q.starts, .prefilled = q.prefilled };
+     }
+ 
+     /// The images' identities in the store's type (none allocated for text).
+@@ -158,7 +210,7 @@ test "TF_KV_SHARE's adapter: a kept prompt's pages resume a later one, adopted;
+     try f.pool.cover(&lease, 3, null);
+     var path: [2]u32 = undefined;
+     var owner: u8 = 0;
+-    try testing.expectEqual(@as(usize, 2), p.keep(.of(&prompt), 8, &owner, lease.ids.items[0..2], &path));
++    try testing.expectEqual(@as(usize, 2), p.keep(.of(&prompt), 8, &owner, lease.ids.items[0..2], &path).shared);
+     try testing.expectEqualSlices(u32, lease.ids.items[0..2], &path);
+     f.pool.finish(&lease);
+     var adopt: std.ArrayList(u32) = .empty;
+@@ -196,8 +248,8 @@ test "TF_KV_SHARE's adapter: a picture under the same key words reaches the stor
+     try f.pool.cover(&lb, 2, null);
+     var path: [2]u32 = undefined;
+     var owner: u8 = 0;
+-    try testing.expectEqual(@as(usize, 2), p.keep(qa, 8, &owner, la.ids.items, &path));
+-    try testing.expectEqual(@as(usize, 2), p.keep(qb, 8, &owner, lb.ids.items, &path));
++    try testing.expectEqual(@as(usize, 2), p.keep(qa, 8, &owner, la.ids.items, &path).shared);
++    try testing.expectEqual(@as(usize, 2), p.keep(qb, 8, &owner, lb.ids.items, &path).shared);
+     try testing.expectEqual(la.ids.items[0], path[0]); // the text page: a's
+     try testing.expectEqual(lb.ids.items[1], path[1]); // the image's page: b's own
+     var adopt: std.ArrayList(u32) = .empty;
+diff --git a/zig/src/native/cuda_streams.zig b/zig/src/native/cuda_streams.zig
+index ef733ad..a4a5c42 100644
+--- a/zig/src/native/cuda_streams.zig
++++ b/zig/src/native/cuda_streams.zig
+@@ -60,6 +60,9 @@ pub fn shareSlots(share: bool, snap_bytes: u64, host_cache: bool) !?usize {
+ 
+ /// The family's streams in `b.room`; null with `problem` set when none fit or --parallel asks for more than fit.
+ pub fn count(comptime F: type, a: Allocator, loaded: anytype, o: api.Open, b: Budget, problem: *[]const u8) !?Count {
++    if (comptime @hasField(@TypeOf(loaded), "paging")) if (loaded.paging) |p| {
++        return .{ .streams = p.pool.lanes, .paged = p.pool, .layout = p.layout };
++    };
+     const free = loaded.free_streams;
+     const grow = budget.growRoom(b.room, !@hasField(F.Options, "lanes"));
+     const wrapped = kv_pages.wrapped(F, loaded, free, b.stream_bytes, b.room);
+diff --git a/zig/src/native/cuda_window.zig b/zig/src/native/cuda_window.zig
+index 2e94e48..ebff5c1 100644
+--- a/zig/src/native/cuda_window.zig
++++ b/zig/src/native/cuda_window.zig
+@@ -31,6 +31,10 @@ pub fn pastCeiling(a: Allocator, requested: i64, ceiling: i64, switch_name: []co
+     return std.fmt.allocPrint(a, "--context {d} exceeds the {d}-token window {s} sets", .{ requested, ceiling, switch_name });
+ }
+ 
++pub fn pastModel(a: Allocator, requested: i64, ceiling: i64) ![]const u8 {
++    return std.fmt.allocPrint(a, "--context {d} exceeds this model's {d}-token window", .{ requested, ceiling });
++}
++
+ /// The startup line of a window past the checkpoint's trained one, which only the family's switch serves.
+ pub fn pastTrained(a: Allocator, window: i64, trained: i64, switch_name: []const u8) ![]const u8 {
+     const words = "{s}: a {d}-token window, past the checkpoint's trained {d} tokens; past them the quality is the operator's to check";
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index c71e693..2cd98b5 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -440,7 +440,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
+         .drafter_bits = args.drafter_bits,
+         .rope_yarn = args.rope_yarn,
+         .record = args.record,
+-        .kv8 = std.mem.eql(u8, args.kv_cache, "fp8"),
++        .kv8 = std.mem.eql(u8, args.kv_cache orelse "bf16", "fp8"),
+         .prompt_int8 = std.mem.eql(u8, args.prompt_precision, "int8"),
+         .speed_up = args.speed_up,
+         .prompt_cache_gib = args.prompt_cache_gib,
+@@ -467,7 +467,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
+         .tp = args.tp,
+         .execution_witness = args.execution_witness,
+         .rank = args.rank,
+-        .given = .{ .tp = args.tp_given, .rank = args.rank_given },
++        .given = .{ .tp = args.tp_given, .rank = args.rank_given, .kv_cache = args.kv_cache != null },
+         .master = args.master,
+         .master_port = args.master_port,
+         .policy = args.policy,
+diff --git a/zig/src/server/cli_args.zig b/zig/src/server/cli_args.zig
+index b701000..28a366a 100644
+--- a/zig/src/server/cli_args.zig
++++ b/zig/src/server/cli_args.zig
+@@ -78,7 +78,7 @@ pub const Args = struct {
+     drafter_bits: u8 = 4,
+     rope_yarn: ?f64 = null, // YaRN with this factor over the checkpoint's trained window (Qwen3.5/3.6 on CUDA)
+     record: ?[]const u8 = null, // drafter training rows written under this folder
+-    kv_cache: []const u8 = "bf16", // fp8: e4m3 attention caches with a scale a row, about twice the context
++    kv_cache: ?[]const u8 = null, // null uses the backend and family default
+     prompt_precision: []const u8 = "bf16", // int8: prompt matmuls quantize their inputs to int8 a 64-input group
+     slide: bool = false, // Sliding Weights learns what /v1/slide/learn is told into the served weights, live
+     slide_drift_gate: bool = false,
+diff --git a/zig/src/server/cli_test.zig b/zig/src/server/cli_test.zig
+index 18a2d85..ad3cfa4 100644
+--- a/zig/src/server/cli_test.zig
++++ b/zig/src/server/cli_test.zig
+@@ -246,7 +246,7 @@ test "parse and capabilities share the table" {
+     try std.testing.expectEqual(@as(u8, 0), (try parse(a, &.{ "m", "--drafter-bits", "0" }, &u)).drafter_bits);
+     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--drafter-bits", "8" }, &u));
+     try std.testing.expectEqualStrings("/r", (try parse(a, &.{ "m", "--record", "/r" }, &u)).record.?);
+-    try std.testing.expectEqualStrings("fp8", (try parse(a, &.{ "m", "--kv-cache", "fp8" }, &u)).kv_cache);
++    try std.testing.expectEqualStrings("fp8", (try parse(a, &.{ "m", "--kv-cache", "fp8" }, &u)).kv_cache.?);
+     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--kv-cache", "int4" }, &u));
+     try std.testing.expectEqualStrings("int8", (try parse(a, &.{ "m", "--prompt-precision", "int8" }, &u)).prompt_precision);
+     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--prompt-precision", "fp4" }, &u));
+diff --git a/zig/src/server/witness.zig b/zig/src/server/witness.zig
+index f192bb1..ff1c72c 100644
+--- a/zig/src/server/witness.zig
++++ b/zig/src/server/witness.zig
+@@ -51,7 +51,7 @@ pub fn excluded(args: cli.Args) ?[]const u8 {
+         .{ "--vision", args.vision },
+         .{ "--tp", args.tp > 1 },
+         .{ "--speed-up", args.speed_up != null },
+-        .{ "--kv-cache", !std.mem.eql(u8, args.kv_cache, "bf16") },
++        .{ "--kv-cache", !std.mem.eql(u8, args.kv_cache orelse "bf16", "bf16") },
+         .{ "--prompt-precision", !std.mem.eql(u8, args.prompt_precision, "bf16") },
+         .{ "--rope-yarn", args.rope_yarn != null },
+     };
+-- 
+2.43.0
+

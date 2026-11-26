@@ -1,0 +1,321 @@
+From 48f5781fbaf96ed4fc378e313317bc68ddc0d15a Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+Date: Thu, 26 Nov 2026 00:57:22 +0000
+Subject: [PATCH 14/14] inkling2: 8-warp 2x4 prompt_tc_coop with RT=2 and 2-row
+ r+=8 gateDownPrepared
+
+---
+ zig/kernels/cuda/inkling2/loop_math.cu       | 60 ++++++++-----
+ zig/kernels/cuda/inkling2/modelopt.cu        | 88 ++++++++++----------
+ zig/src/families/inkling2/loop_math_cuda.zig |  2 +-
+ zig/src/families/inkling2/modelopt.zig       |  2 +-
+ 4 files changed, 85 insertions(+), 67 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/loop_math.cu b/zig/kernels/cuda/inkling2/loop_math.cu
+index 0f8e9e1..c66e4b4 100644
+--- a/zig/kernels/cuda/inkling2/loop_math.cu
++++ b/zig/kernels/cuda/inkling2/loop_math.cu
+@@ -407,44 +407,60 @@ __device__ void gateDown(const float* __restrict__ h, const float* __restrict__
+     }
+ }
+ 
+-// Reuse the prepared BF16 row across 4 rows in SMEM, retaining the original gateDown dot and reduction order.
++// Reuse the prepared BF16 row across 2 rows in SMEM (83% occupancy), pairing 8 rank rows per pass.
+ __device__ void gateDownPrepared(const uint16_t* __restrict__ prepared, const uint16_t* __restrict__ down,
+                                  uint16_t* __restrict__ zeta, int rows, int c) {
+     if (c <= 2304) {
+         __shared__ float sh[16 * 32];
+-        __shared__ uint16_t s_src[4 * 4608];
+-        const int row0 = static_cast<int>(blockIdx.x) * 4;
++        __shared__ uint16_t s_src[2 * 4608];
++        const int row0 = static_cast<int>(blockIdx.x) * 2;
+         const int width = 2 * c;
+-        const int count = rows - row0 < 4 ? rows - row0 : 4;
+-        for (int r = 0; r < count; ++r) {
+-            const uint16_t* src = prepared + static_cast<size_t>(row0 + r) * width;
+-            for (int i = threadIdx.x; i < width; i += blockDim.x) s_src[r * width + i] = src[i];
++        const bool has1 = row0 + 1 < rows;
++        const uint16_t* src0 = prepared + static_cast<size_t>(row0) * width;
++        const uint16_t* src1 = prepared + static_cast<size_t>(row0 + 1) * width;
++        for (int i = threadIdx.x; i < width; i += blockDim.x) {
++            s_src[i] = src0[i];
++            if (has1) s_src[width + i] = src1[i];
+         }
+         __syncthreads();
+-        for (int r = 0; r < kRank; r += 4) {
++        for (int r = 0; r < kRank; r += 8) {
+             const uint16_t* d0 = down + static_cast<size_t>(r) * width;
+             const uint16_t* d1 = d0 + width;
+             const uint16_t* d2 = d1 + width;
+             const uint16_t* d3 = d2 + width;
+-            float acc[16];
+-#pragma unroll
+-            for (int k = 0; k < 16; ++k) acc[k] = 0.0f;
++            const uint16_t* d4 = d3 + width;
++            const uint16_t* d5 = d4 + width;
++            const uint16_t* d6 = d5 + width;
++            const uint16_t* d7 = d6 + width;
++            float acc[16] = {0.0f};
+             for (int i = threadIdx.x; i < width; i += blockDim.x) {
++                const float n0 = bf(s_src[i]);
++                const float n1 = has1 ? bf(s_src[width + i]) : 0.0f;
+                 const float w0 = bf(d0[i]), w1 = bf(d1[i]), w2 = bf(d2[i]), w3 = bf(d3[i]);
+-#pragma unroll
+-                for (int row = 0; row < 4; ++row) {
+-                    const float n = row < count ? bf(s_src[row * width + i]) : 0.0f;
+-                    acc[4 * row + 0] = __fmaf_rn(w0, n, acc[4 * row + 0]);
+-                    acc[4 * row + 1] = __fmaf_rn(w1, n, acc[4 * row + 1]);
+-                    acc[4 * row + 2] = __fmaf_rn(w2, n, acc[4 * row + 2]);
+-                    acc[4 * row + 3] = __fmaf_rn(w3, n, acc[4 * row + 3]);
+-                }
++                const float w4 = bf(d4[i]), w5 = bf(d5[i]), w6 = bf(d6[i]), w7 = bf(d7[i]);
++                acc[0] = __fmaf_rn(w0, n0, acc[0]);
++                acc[1] = __fmaf_rn(w1, n0, acc[1]);
++                acc[2] = __fmaf_rn(w2, n0, acc[2]);
++                acc[3] = __fmaf_rn(w3, n0, acc[3]);
++                acc[4] = __fmaf_rn(w4, n0, acc[4]);
++                acc[5] = __fmaf_rn(w5, n0, acc[5]);
++                acc[6] = __fmaf_rn(w6, n0, acc[6]);
++                acc[7] = __fmaf_rn(w7, n0, acc[7]);
++                acc[8] = __fmaf_rn(w0, n1, acc[8]);
++                acc[9] = __fmaf_rn(w1, n1, acc[9]);
++                acc[10] = __fmaf_rn(w2, n1, acc[10]);
++                acc[11] = __fmaf_rn(w3, n1, acc[11]);
++                acc[12] = __fmaf_rn(w4, n1, acc[12]);
++                acc[13] = __fmaf_rn(w5, n1, acc[13]);
++                acc[14] = __fmaf_rn(w6, n1, acc[14]);
++                acc[15] = __fmaf_rn(w7, n1, acc[15]);
+             }
+             blockSums<16>(acc, sh);
+             if (threadIdx.x == 0) {
+-                for (int row = 0; row < count; ++row)
+-                    for (int k = 0; k < 4; ++k)
+-                        zeta[static_cast<size_t>(row0 + row) * kRank + r + k] = tobf(acc[4 * row + k]);
++                for (int k = 0; k < 8; ++k) zeta[static_cast<size_t>(row0) * kRank + r + k] = tobf(acc[k]);
++                if (has1) {
++                    for (int k = 0; k < 8; ++k) zeta[static_cast<size_t>(row0 + 1) * kRank + r + k] = tobf(acc[8 + k]);
++                }
+             }
+         }
+         return;
+diff --git a/zig/kernels/cuda/inkling2/modelopt.cu b/zig/kernels/cuda/inkling2/modelopt.cu
+index 738dd5e..20cb289 100644
+--- a/zig/kernels/cuda/inkling2/modelopt.cu
++++ b/zig/kernels/cuda/inkling2/modelopt.cu
+@@ -491,7 +491,7 @@ __device__ __forceinline__ void prompt_tc_body(const uint8_t* __restrict__ xc, c
+   }
+ }
+ 
+-// Cooperative 4-warp BN=128 block-scaled tensor-core GEMM for 64-row prompt tiles: all 4 warps share sx_c/sx_s/s_tok.
++// Cooperative 8-warp (2 row-halves x 4 col-blocks) BN=128 block-scaled TC GEMM for 64-row prompt tiles.
+ template <int FMT>
+ __device__ __forceinline__ void prompt_tc_coop(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc,
+                                                int x_stride, int slots, Weight w, int KG, int NB,
+@@ -499,7 +499,8 @@ __device__ __forceinline__ void prompt_tc_coop(const uint8_t* __restrict__ xc, c
+                                                const int* __restrict__ members, void* __restrict__ out, int N,
+                                                int skip) {
+   const int tid = threadIdx.x;
+-  const int warp = tid >> 5, lane = tid & 31, gq = lane >> 2, t = lane & 3;
++  const int warp = tid >> 5, wm = warp >> 2, wn = warp & 3;
++  const int lane = tid & 31, gq = lane >> 2, t = lane & 3;
+   const int nb_groups = (NB + 3) >> 2;
+   const int units = __ldg(item_count) * nb_groups;
+   __shared__ __align__(16) uint4 sx_c[2][64][2];
+@@ -512,18 +513,18 @@ __device__ __forceinline__ void prompt_tc_coop(const uint8_t* __restrict__ xc, c
+   const int steps = FMT == 0 ? (KG >> 1) : KG;
+   for (int unit = blockIdx.x; unit < units; unit += gridDim.x) {
+     const int it = unit / nb_groups, cb_grp = unit - it * nb_groups;
+-    const int cb = (cb_grp << 2) + warp;
++    const int cb = (cb_grp << 2) + wn;
+     const bool valid_cb = cb < NB;
+     const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+     if (e == skip) continue;
+     const float outer = FMT == 0 ? outer_of(w, e) : 1.0f;
+-    bool v[4][2];
+-    int pr[4][2];
++    bool v[2][2];
++    int pr[2][2];
+ #pragma unroll
+-    for (int r = 0; r < 4; ++r)
++    for (int r = 0; r < 2; ++r)
+ #pragma unroll
+       for (int h = 0; h < 2; ++h) {
+-        const int i = 16 * r + gq + 8 * h;
++        const int i = 32 * wm + 16 * r + gq + 8 * h;
+         v[r][h] = i < cnt;
+         pr[r][h] = v[r][h] ? __ldg(members + first + i) : 0;
+       }
+@@ -537,48 +538,49 @@ __device__ __forceinline__ void prompt_tc_coop(const uint8_t* __restrict__ xc, c
+     }
+     __syncthreads();
+     auto load_stage = [&](int s, int g) {
+-      {
++      if (tid < 128) {
+         const int rr = tid >> 1, cc = tid & 1;
+         const int tok = s_tok[rr];
+         const int safe_tok = tok >= 0 ? tok : 0;
+         tf_common::cp16z(&sx_c[s][rr][cc],
+                          xc + static_cast<size_t>(safe_tok) * c_stride + static_cast<size_t>(g) * 32 + 16 * cc,
+                          tok >= 0);
+-      }
+-      if (tid < 64) {
+-        const int tok = s_tok[tid];
++        const int w_wn = tid >> 5, w_lane = tid & 31, wcb = (cb_grp << 2) + w_wn;
++        if (wcb < NB) {
++          const long long row = w.row0 + w.row_step * (wcb * 32 + w_lane);
++          const long long z = (e * w.N + row) * w.K + (FMT == 0 ? 64LL : 32LL) * g;
++          if constexpr (FMT == 0) {
++            sw_s[s][w_wn][w_lane] = __ldg(reinterpret_cast<const uint32_t*>(w.scales + z / 16));
++          } else {
++            sw_s[s][w_wn][w_lane] = static_cast<uint32_t>(__ldg(w.scales + z / 32));
++          }
++        }
++      } else if (tid < 192) {
++        const int rr = tid - 128;
++        const int tok = s_tok[rr];
+         if (tok >= 0) {
+           if constexpr (FMT == 0) {
+-            sx_s[s][tid] = __ldg(reinterpret_cast<const uint32_t*>(xsc + static_cast<size_t>(tok) * s_stride + g * 4));
++            sx_s[s][rr] = __ldg(reinterpret_cast<const uint32_t*>(xsc + static_cast<size_t>(tok) * s_stride + g * 4));
+           } else {
+-            sx_s[s][tid] = static_cast<uint32_t>(__ldg(xsc + static_cast<size_t>(tok) * s_stride + g));
++            sx_s[s][rr] = static_cast<uint32_t>(__ldg(xsc + static_cast<size_t>(tok) * s_stride + g));
+           }
+         } else {
+-          sx_s[s][tid] = 0u;
++          sx_s[s][rr] = 0u;
+         }
+       }
+-      if (valid_cb) {
+-#pragma unroll
+-        for (int i = 0; i < 2; ++i) {
+-          const int q = lane + 32 * i, lr = q >> 1, cc = q & 1;
+-          const long long row = w.row0 + w.row_step * (cb * 32 + lr);
+-          const long long z = (e * w.N + row) * w.K + (FMT == 0 ? 64LL : 32LL) * g;
+-          tf_common::cp16(&sw_c[s][warp][lr][cc], w.codes + (FMT == 0 ? z / 2 : z) + 16 * cc);
+-        }
+-        {
+-          const long long row = w.row0 + w.row_step * (cb * 32 + lane);
++      {
++        const int w_wn = tid >> 6, q = tid & 63, lr = q >> 1, cc = q & 1;
++        const int wcb = (cb_grp << 2) + w_wn;
++        if (wcb < NB) {
++          const long long row = w.row0 + w.row_step * (wcb * 32 + lr);
+           const long long z = (e * w.N + row) * w.K + (FMT == 0 ? 64LL : 32LL) * g;
+-          if constexpr (FMT == 0) {
+-            sw_s[s][warp][lane] = __ldg(reinterpret_cast<const uint32_t*>(w.scales + z / 16));
+-          } else {
+-            sw_s[s][warp][lane] = static_cast<uint32_t>(__ldg(w.scales + z / 32));
+-          }
++          tf_common::cp16(&sw_c[s][w_wn][lr][cc], w.codes + (FMT == 0 ? z / 2 : z) + 16 * cc);
+         }
+       }
+     };
+-    float acc[1][4][4][4];
++    float acc[1][2][4][4];
+ #pragma unroll
+-    for (int r = 0; r < 4; ++r)
++    for (int r = 0; r < 2; ++r)
+ #pragma unroll
+       for (int j = 0; j < 4; ++j) acc[0][r][j][0] = acc[0][r][j][1] = acc[0][r][j][2] = acc[0][r][j][3] = 0.f;
+     if (steps > 0) {
+@@ -596,10 +598,10 @@ __device__ __forceinline__ void prompt_tc_coop(const uint8_t* __restrict__ xc, c
+       }
+       __syncthreads();
+       if (valid_cb) {
+-        uint32_t a[4][4], sa[4];
++        uint32_t a[2][4], sa[2];
+ #pragma unroll
+-        for (int r = 0; r < 4; ++r) {
+-          const int r0 = 16 * r;
++        for (int r = 0; r < 2; ++r) {
++          const int r0 = 32 * wm + 16 * r;
+           const uint32_t* p0 = reinterpret_cast<const uint32_t*>(&sx_c[cur][r0 + gq][0]);
+           const uint32_t* p1 = reinterpret_cast<const uint32_t*>(&sx_c[cur][r0 + gq + 8][0]);
+           a[r][0] = p0[t];
+@@ -610,15 +612,15 @@ __device__ __forceinline__ void prompt_tc_coop(const uint8_t* __restrict__ xc, c
+         }
+ #pragma unroll
+         for (int j = 0; j < 4; ++j) {
+-          const uint32_t* wp = reinterpret_cast<const uint32_t*>(&sw_c[cur][warp][8 * j + gq][0]);
++          const uint32_t* wp = reinterpret_cast<const uint32_t*>(&sw_c[cur][wn][8 * j + gq][0]);
+           const uint32_t b0 = wp[t], b1 = wp[4 + t];
+-          const uint32_t sb = sw_s[cur][warp][8 * j + gq];
++          const uint32_t sb = sw_s[cur][wn][8 * j + gq];
+           if constexpr (FMT == 0) {
+ #pragma unroll
+-            for (int r = 0; r < 4; ++r) mma4::mma_fp4(acc[0][r][j], a[r], b0, b1, sa[r], sb);
++            for (int r = 0; r < 2; ++r) mma4::mma_fp4(acc[0][r][j], a[r], b0, b1, sa[r], sb);
+           } else {
+ #pragma unroll
+-            for (int r = 0; r < 4; ++r) mma_mxfp8(acc[0][r][j], a[r], b0, b1, sa[r], sb);
++            for (int r = 0; r < 2; ++r) mma_mxfp8(acc[0][r][j], a[r], b0, b1, sa[r], sb);
+           }
+         }
+       }
+@@ -627,15 +629,15 @@ __device__ __forceinline__ void prompt_tc_coop(const uint8_t* __restrict__ xc, c
+     if (valid_cb) {
+       if constexpr (FMT == 0) {
+ #pragma unroll
+-        for (int r = 0; r < 4; ++r)
++        for (int r = 0; r < 2; ++r)
+ #pragma unroll
+           for (int j = 0; j < 4; ++j)
+ #pragma unroll
+             for (int q = 0; q < 4; ++q) acc[0][r][j][q] *= outer;
+       }
+ #pragma unroll
+-      for (int r = 0; r < 4; ++r)
+-        store<4, 4>(acc, r, out, nullptr, N, cb * 32 + 2 * t, pr[r][0], pr[r][1], v[r][0], v[r][1]);
++      for (int r = 0; r < 2; ++r)
++        store<2, 4>(acc, r, out, nullptr, N, cb * 32 + 2 * t, pr[r][0], pr[r][1], v[r][0], v[r][1]);
+     }
+     __syncthreads();
+   }
+@@ -832,7 +834,7 @@ extern "C" __global__ void __launch_bounds__(256)
+   }
+ }
+ 
+-extern "C" __global__ void __launch_bounds__(128)
++extern "C" __global__ void __launch_bounds__(256)
+     tf_ink2moe_prompt_tc_nvfp4(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc, int x_stride,
+                                int slots, ink2o::Weight w, int KG, int NB, const int* __restrict__ items,
+                                const int* __restrict__ item_count, const int* __restrict__ members,
+@@ -840,7 +842,7 @@ extern "C" __global__ void __launch_bounds__(128)
+   ink2o::prompt_tc_coop<0>(xc, xsc, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip);
+ }
+ 
+-extern "C" __global__ void __launch_bounds__(128)
++extern "C" __global__ void __launch_bounds__(256)
+     tf_ink2moe_prompt_tc_mxfp8(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc, int x_stride,
+                                int slots, ink2o::Weight w, int KG, int NB, const int* __restrict__ items,
+                                const int* __restrict__ item_count, const int* __restrict__ members,
+diff --git a/zig/src/families/inkling2/loop_math_cuda.zig b/zig/src/families/inkling2/loop_math_cuda.zig
+index 5704339..3a80eab 100644
+--- a/zig/src/families/inkling2/loop_math_cuda.zig
++++ b/zig/src/families/inkling2/loop_math_cuda.zig
+@@ -165,7 +165,7 @@ pub fn gateDownPrepared(
+     for ([_]u64{ prepared, down, zeta }) |v| b.add(v);
+     b.add(int(rows));
+     b.add(int(c));
+-    const prepared_grid: cuda.Dim3 = if (c <= 2304) .{ .x = @intCast((rows + 3) / 4), .y = 1 } else .{ .x = grid, .y = rank / 2 };
++    const prepared_grid: cuda.Dim3 = if (c <= 2304) .{ .x = @intCast((rows + 1) / 2), .y = 1 } else .{ .x = grid, .y = rank / 2 };
+     try go(k.gate_prepared_fn, s, prepared_grid, 256, &b);
+ }
+ 
+diff --git a/zig/src/families/inkling2/modelopt.zig b/zig/src/families/inkling2/modelopt.zig
+index 2c5296c..605650b 100644
+--- a/zig/src/families/inkling2/modelopt.zig
++++ b/zig/src/families/inkling2/modelopt.zig
+@@ -245,7 +245,7 @@ fn projectionTc(s: cuda.Stream, fn_: cuda.Function, coop: bool, xc: u64, xsc: u6
+     a.add(@as(i32, -1));
+     const grid = if (coop) item_bound * ((nb + 3) / 4) else (item_bound * nb + 3) / 4;
+     if (grid == 0) return;
+-    try cuda.launch.launch(fn_, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &a);
++    try cuda.launch.launch(fn_, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = if (coop) 256 else 128 } }, s, &a);
+ }
+ 
+ /// Run one MoE layer. `pick` is row-major int32 expert IDs; routing `weights` are fp32.
+-- 
+2.43.0
+

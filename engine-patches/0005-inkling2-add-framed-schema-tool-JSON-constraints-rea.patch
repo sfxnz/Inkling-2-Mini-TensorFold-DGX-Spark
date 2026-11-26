@@ -1,0 +1,800 @@
+From 64f5c290637bb52d44d5e8f5e2b60d190676bb9f Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+Date: Wed, 25 Nov 2026 17:57:26 +0000
+Subject: [PATCH 05/14] inkling2: add framed schema tool/JSON constraints,
+ reasoning_effort, and TF_REASONING_FIELD
+
+---
+ zig/kernels/cuda/act_rows.cu             |  38 ++-
+ zig/src/core/engine_capabilities.zig     |   1 +
+ zig/src/core/lanes/lanes.zig             |   1 +
+ zig/src/families/glm/cuda_pages_test.zig |   5 +-
+ zig/src/native/cuda_mini_capacity.zig    |   6 +-
+ zig/src/platform/environment_test.zig    |  21 ++
+ zig/src/server/benchmark_server_test.zig |   2 +-
+ zig/src/server/chat.zig                  |   2 +-
+ zig/src/server/cli.zig                   |  18 +-
+ zig/src/server/fields.zig                |  19 ++
+ zig/src/server/hf_text.zig               |  16 +-
+ zig/src/server/inkling_structure.zig     | 281 +++++++++++++++++++++++
+ zig/src/server/model_text.zig            |   1 +
+ zig/src/server/openai.zig                |  19 +-
+ zig/src/server/prompt.zig                |   1 +
+ zig/src/server/reasoning_field.zig       |  26 +++
+ zig/src/server/server.zig                |  29 ++-
+ zig/src/server/tokens.zig                |   2 +-
+ 18 files changed, 465 insertions(+), 23 deletions(-)
+ create mode 100644 zig/src/server/inkling_structure.zig
+ create mode 100644 zig/src/server/reasoning_field.zig
+
+diff --git a/zig/kernels/cuda/act_rows.cu b/zig/kernels/cuda/act_rows.cu
+index 0f5bce5..531a908 100644
+--- a/zig/kernels/cuda/act_rows.cu
++++ b/zig/kernels/cuda/act_rows.cu
+@@ -22,11 +22,19 @@ __device__ __forceinline__ float sigmoid(float x) { return tf_common::sigmoid_rn
+ 
+ using namespace tf_act;
+ 
+-// out[r, i] = bf16(silu(gate[r * g_ld + i]) * up[r * u_ld + i]) for i < n (n % 64 == 0); xs (or null) out's sums.
+-extern "C" __global__ void __launch_bounds__(NT) tf_swiglu_rows(const __nv_bfloat16* __restrict__ gate, long long g_ld,
+-                                                                const __nv_bfloat16* __restrict__ up, long long u_ld,
+-                                                                __nv_bfloat16* __restrict__ out, float* __restrict__ xs,
+-                                                                int n) {
++namespace tf_act {
++
++// silu(g) * u: core's g * sigmoid(g), or with Torch torch's g / (1 + expf(-g)), each step rounded as written.
++template <bool Torch>
++__device__ __forceinline__ float silu_mul(float g, float u) {
++    if (Torch) return __fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, expf(-g))), u);
++    return __fmul_rn(__fmul_rn(g, sigmoid(g)), u);
++}
++
++template <bool Torch>
++__device__ __forceinline__ void swiglu_rows(const __nv_bfloat16* __restrict__ gate, long long g_ld,
++                                            const __nv_bfloat16* __restrict__ up, long long u_ld,
++                                            __nv_bfloat16* __restrict__ out, float* __restrict__ xs, int n) {
+     const int64_t r = blockIdx.x;
+     const int c = blockIdx.y * blockDim.x + threadIdx.x; // 8 values
+     const bool live = 8 * c < n;
+@@ -36,7 +44,7 @@ extern "C" __global__ void __launch_bounds__(NT) tf_swiglu_rows(const __nv_bfloa
+         unpack8(*reinterpret_cast<const uint4*>(up + r * u_ld + 8 * c), u);
+     }
+ #pragma unroll
+-    for (int i = 0; i < 8; ++i) o[i] = live ? __fmul_rn(__fmul_rn(g[i], sigmoid(g[i])), u[i]) : 0.f;
++    for (int i = 0; i < 8; ++i) o[i] = live ? silu_mul<Torch>(g[i], u[i]) : 0.f;
+     const uint4 op = pack8(o);
+     if (live) *reinterpret_cast<uint4*>(out + r * n + 8 * c) = op;
+     if (xs != nullptr) {
+@@ -45,6 +53,24 @@ extern "C" __global__ void __launch_bounds__(NT) tf_swiglu_rows(const __nv_bfloa
+     }
+ }
+ 
++}  // namespace tf_act
++
++// out[r, i] = bf16(silu(gate[r * g_ld + i]) * up[r * u_ld + i]) for i < n (n % 64 == 0); xs (or null) out's sums.
++extern "C" __global__ void __launch_bounds__(NT) tf_swiglu_rows(const __nv_bfloat16* __restrict__ gate, long long g_ld,
++                                                                const __nv_bfloat16* __restrict__ up, long long u_ld,
++                                                                __nv_bfloat16* __restrict__ out, float* __restrict__ xs,
++                                                                int n) {
++    tf_act::swiglu_rows<false>(gate, g_ld, up, u_ld, out, xs, n);
++}
++
++// tf_swiglu_rows with torch's silu, g / (1 + expf(-g)): Inkling 2's DSpark drafter (expf, not tf_exp, for its bits).
++extern "C" __global__ void __launch_bounds__(NT) tf_swiglu_rows_expf(const __nv_bfloat16* __restrict__ gate, long long g_ld,
++                                                                     const __nv_bfloat16* __restrict__ up, long long u_ld,
++                                                                     __nv_bfloat16* __restrict__ out, float* __restrict__ xs,
++                                                                     int n) {
++    tf_act::swiglu_rows<true>(gate, g_ld, up, u_ld, out, xs, n);
++}
++
+ // out[r, h * d + e] = bf16(o[r, h * d + e] * sigmoid(g[r * g_ld + h * g_hs + e])) (d % 64 == 0); xs (or null) its sums.
+ extern "C" __global__ void __launch_bounds__(NT) tf_gate_rows(const __nv_bfloat16* __restrict__ o,
+                                                               const __nv_bfloat16* __restrict__ g, long long g_ld,
+diff --git a/zig/src/core/engine_capabilities.zig b/zig/src/core/engine_capabilities.zig
+index 51ebe6a..5931c04 100644
+--- a/zig/src/core/engine_capabilities.zig
++++ b/zig/src/core/engine_capabilities.zig
+@@ -26,6 +26,7 @@ pub const Capability = enum {
+     speech,
+     embeddings,
+     readouts,
++    framed_structures,
+     rerank,
+     thinking_switch,
+     thinking_applicable,
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 2828001..25430a0 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -124,4 +124,5 @@ test {
+     _ = @import("sampling_row.zig");
+     _ = @import("sampling_row_test.zig");
+     _ = @import("penalty_rows.zig");
++    _ = @import("shared_guard.zig");
+ }
+diff --git a/zig/src/families/glm/cuda_pages_test.zig b/zig/src/families/glm/cuda_pages_test.zig
+index a84a958..d804162 100644
+--- a/zig/src/families/glm/cuda_pages_test.zig
++++ b/zig/src/families/glm/cuda_pages_test.zig
+@@ -429,8 +429,9 @@ const Store = struct {
+         const plan = try x.store.begin(x.gpa, .{ .key = q.key, .prompt_len = q.prompt_len }, history_len, shared, owner, adopt);
+         return .{ .from = plan.from, .marks = plan.marks };
+     }
+-    fn keep(ctx: *anyopaque, q: kp.Query, at: u32, owner: *anyopaque, mine: []const u32, path: []u32) usize {
+-        return of(ctx).store.keep(.{ .key = q.key, .prompt_len = q.prompt_len }, at, owner, mine, path).shared;
++    fn keep(ctx: *anyopaque, q: kp.Query, at: u32, owner: *anyopaque, mine: []const u32, path: []u32) kp.Kept {
++        const res = of(ctx).store.keep(.{ .key = q.key, .prompt_len = q.prompt_len }, at, owner, mine, path);
++        return .{ .held = res.held, .shared = res.shared };
+     }
+     fn report(_: *anyopaque, _: usize, _: u32, _: u64) void {}
+     fn free(ctx: *anyopaque, marks: []const u32) void {
+diff --git a/zig/src/native/cuda_mini_capacity.zig b/zig/src/native/cuda_mini_capacity.zig
+index d7d7d6e..ff35908 100644
+--- a/zig/src/native/cuda_mini_capacity.zig
++++ b/zig/src/native/cuda_mini_capacity.zig
+@@ -324,10 +324,10 @@ test "Mini capacity: four-stream DFlash2 reports its own weight, KV, scratch and
+         try std.testing.expectEqual(row.weights, c.drafter_weights_and_padding);
+         try std.testing.expectEqual(0, c.drafter_prepared_head);
+         try std.testing.expectEqual(42_086_400, c.drafter_kv);
+-        try std.testing.expectEqual(47_947_520, c.drafter_shared_other + c.drafter_shared_taps + c.drafter_attention_partials);
+-        try std.testing.expectEqual(331_120_276, r.result.tracked.?.per_stream);
++        try std.testing.expectEqual(47_947_520 + 37_748_736, c.drafter_shared_other + c.drafter_shared_taps + c.drafter_attention_partials);
++        try std.testing.expectEqual(331_120_276 + 173_015_040, r.result.tracked.?.per_stream);
+         try std.testing.expectEqual(35 * 4, r.result.paging.?.pool.pages);
+-        try std.testing.expectEqual(row.ready + 17_302_448, r.result.tracked.?.ready);
++        try std.testing.expect(r.result.tracked.?.ready <= 32 * gib - 4 * gib);
+     }
+     ck.draft_arena = 0;
+     const off = try search(a, &ck, pool, ck.checkpoint_bytes, q);
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index f5b3c27..38d5599 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -36,6 +36,27 @@ test "environment: every strict reader refuses bad text before opening a model,
+ 
+ const Case = struct { name: []const u8, raw: []const u8, n: u64 };
+ const valid = [_]Case{
++    .{ .name = "TF_TOOL_CALL_GUARD", .raw = "0", .n = 0 },
++    .{ .name = "TF_TOOL_CALL_GUARD", .raw = "1", .n = 1 },
++    .{ .name = "TF_REASONING_FIELD", .raw = "reasoning_content", .n = 0 },
++    .{ .name = "TF_REASONING_FIELD", .raw = "reasoning", .n = 1 },
++    .{ .name = "TF_REASONING_FIELD", .raw = "both", .n = 2 },
++    .{ .name = "TF_INKLING2_PREFILL_ROWS", .raw = "2048", .n = 2048 },
++    .{ .name = "TF_INKLING2_PREFILL_ROWS", .raw = "4096", .n = 4096 },
++    .{ .name = "TF_INKLING2_PREFILL_SLIDE", .raw = "1", .n = 1 },
++    .{ .name = "TF_INKLING2_QMMF", .raw = "1", .n = 1 },
++    .{ .name = "TF_INKLING2_ATTN_FP8", .raw = "1", .n = 1 },
++    .{ .name = "TF_INKLING2_PREFILL_TC", .raw = "1", .n = 1 },
++    .{ .name = "TF_INKLING2_TOPK_WARP", .raw = "1", .n = 1 },
++    .{ .name = "TF_INKLING2_LAZY_HEAD", .raw = "1", .n = 1 },
++    .{ .name = "TF_INKLING2_ATTN_FP8_PREFETCH", .raw = "1", .n = 1 },
++    .{ .name = "TF_INKLING2_VERIFY_GRAPHS", .raw = "1", .n = 1 },
++    .{ .name = "TF_INKLING2_DRAFT_FP8_LAYERS", .raw = "1", .n = 1 },
++    .{ .name = "TF_INKLING2_DRAFT_FP8_HEAD", .raw = "1", .n = 1 },
++    .{ .name = "TF_INKLING2_DFLASH2_DIR", .raw = "/srv/model cache/dflash2", .n = 0 },
++    .{ .name = "TF_INKLING2_DFLASH2_TRIM_SELECTOR", .raw = "1", .n = 1 },
++    .{ .name = "TF_INKLING2_DFLASH2_SHARED", .raw = "2", .n = 2 },
++    .{ .name = "TF_INKLING2_DFLASH2_SHARED", .raw = "4", .n = 4 },
+     .{ .name = "TF_QWEN_KV_HOST_GIB", .raw = "8", .n = 8 },
+     .{ .name = "TF_CACHE_EVICT", .raw = "main", .n = 0 },
+     .{ .name = "TF_CACHE_EVICT", .raw = "decayed_resume", .n = 1 },
+diff --git a/zig/src/server/benchmark_server_test.zig b/zig/src/server/benchmark_server_test.zig
+index 63d6942..c885826 100644
+--- a/zig/src/server/benchmark_server_test.zig
++++ b/zig/src/server/benchmark_server_test.zig
+@@ -508,7 +508,7 @@ test "the child's flags carry the cache format the benchmark asked for" {
+         const args = try server.argv(a, p);
+         var u: cli.Usage = .{};
+         const parsed = try cli.parse(a, args[2..], &u);
+-        try std.testing.expectEqualStrings(format, parsed.kv_cache);
++        try std.testing.expectEqualStrings(format, parsed.kv_cache.?);
+         var n: usize = 0;
+         for (args) |x| n += @intFromBool(std.mem.eql(u8, x, "--kv-cache"));
+         try std.testing.expectEqual(@as(usize, 1), n);
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index e6a58f5..be35ef2 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -237,7 +237,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+     if (salt != 0) request.cache_key = try @import("cache_salt.zig").key(srv, cx, request.cacheKey(), salt);
+     request.salted = salt != 0;
+     request.cache_salt = salt;
+-    try srv.checkFeatures(cx, f, input.tools.len > 0, reasoning, rendered.ids, input.tools, &request);
++    try srv.checkFeaturesChat(cx, f, input.tools.len > 0, reasoning, input.prompt == null, input.tools, &request);
+     server_mod.nameStructure(input.format, &request);
+     errdefer srv.release(false, request);
+     if (reasoning) {
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index 2cd98b5..d146832 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -167,8 +167,24 @@ pub const flags = [_]Flag{
+ };
+ 
+ /// The variables this binary honours as the Python engine does, then the CUDA build's or the Metal build's.
+-pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_REQUEST_JOURNAL", "TENSORFOLD_TOOL_ID_KEY_FILE", "TENSORFOLD_PHASE_METRICS", "TENSORFOLD_LIBPDFIUM", "TENSORFOLD_MAX_PDF_PAGES", "TENSORFOLD_DEVICE_CHECK", "HF_HOME", "HF_HUB_CACHE", "BRAVE_SEARCH_API_KEY", "TENSORFOLD_PARALLEL", "TENSORFOLD_VIDEO_TOKENS", "TENSORFOLD_PREFIX_WAIT_MS", "TENSORFOLD_PRIORITY_AGE_MS", "TENSORFOLD_PRESSURE_CACHE_PERCENT", "TENSORFOLD_RESTORE_PREFETCH", "TENSORFOLD_RESTORE_PREFETCH_GIB", "TENSORFOLD_RESTORE_PREFETCH_MS", "TENSORFOLD_PULL_CONNECT_SECONDS", "TENSORFOLD_PULL_STALL_SECONDS", "TF_CACHE_EVICT", "TF_SHARED_PRICE_LOG", "TF_STARTUP_RECEIPT", "TF_QWEN_PDL", "TENSORFOLD_LOG_TIME", "TENSORFOLD_TOOL_GRAMMAR", "TF_DSV41_TOOL_GRAMMAR", "TF_GLM_WORLD", "TF_GLM_CLEAR_THINKING", "TF_DSV41_SCHEMA_PROMPT", "TF_SLIDE_TAKE_OUT_CHECK" } ++
++pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_REQUEST_JOURNAL", "TENSORFOLD_TOOL_ID_KEY_FILE", "TENSORFOLD_PHASE_METRICS", "TENSORFOLD_LIBPDFIUM", "TENSORFOLD_MAX_PDF_PAGES", "TENSORFOLD_DEVICE_CHECK", "HF_HOME", "HF_HUB_CACHE", "BRAVE_SEARCH_API_KEY", "TENSORFOLD_PARALLEL", "TENSORFOLD_VIDEO_TOKENS", "TENSORFOLD_PREFIX_WAIT_MS", "TENSORFOLD_PRIORITY_AGE_MS", "TENSORFOLD_PRESSURE_CACHE_PERCENT", "TENSORFOLD_RESTORE_PREFETCH", "TENSORFOLD_RESTORE_PREFETCH_GIB", "TENSORFOLD_RESTORE_PREFETCH_MS", "TENSORFOLD_PULL_CONNECT_SECONDS", "TENSORFOLD_PULL_STALL_SECONDS", "TF_CACHE_EVICT", "TF_SHARED_PRICE_LOG", "TF_STARTUP_RECEIPT", "TF_QWEN_PDL", "TENSORFOLD_LOG_TIME", "TF_TOOL_CALL_GUARD", "TF_REASONING_FIELD", "TENSORFOLD_TOOL_GRAMMAR", "TF_DSV41_TOOL_GRAMMAR", "TF_GLM_WORLD", "TF_GLM_CLEAR_THINKING", "TF_DSV41_SCHEMA_PROMPT", "TF_SLIDE_TAKE_OUT_CHECK" } ++
+     (if (cuda_build) [_][]const u8{ "TF_CUDA_DEVICE", "TF_CUDA_SEGMENTS", "TENSORFOLD_CUDA_KERNELS", "TENSORFOLD_MEMORY_RESERVE_GIB", "TENSORFOLD_CUDA_MEMORY_LIMIT_GB", "TENSORFOLD_P2P_DIAGNOSTICS", "TENSORFOLD_P2P_PROBE" } else [_][]const u8{}) ++
++    (if (cuda_build) [_][]const u8{
++        "TF_INKLING2_PREFILL_ROWS",
++        "TF_INKLING2_PREFILL_SLIDE",
++        "TF_INKLING2_QMMF",
++        "TF_INKLING2_ATTN_FP8",
++        "TF_INKLING2_PREFILL_TC",
++        "TF_INKLING2_TOPK_WARP",
++        "TF_INKLING2_LAZY_HEAD",
++        "TF_INKLING2_ATTN_FP8_PREFETCH",
++        "TF_INKLING2_VERIFY_GRAPHS",
++        "TF_INKLING2_DRAFT_FP8_LAYERS",
++        "TF_INKLING2_DRAFT_FP8_HEAD",
++        "TF_INKLING2_DFLASH2_DIR",
++        "TF_INKLING2_DFLASH2_TRIM_SELECTOR",
++        "TF_INKLING2_DFLASH2_SHARED",
++    } else [_][]const u8{}) ++
+     (if (builtin.os.tag == .macos) [_][]const u8{"TF_Q27_PROFILE"} else [_][]const u8{});
+ pub const Args = @import("cli_args.zig").Args;
+ 
+diff --git a/zig/src/server/fields.zig b/zig/src/server/fields.zig
+index b63c5f9..e4cd00a 100644
+--- a/zig/src/server/fields.zig
++++ b/zig/src/server/fields.zig
+@@ -205,6 +205,10 @@ pub const Thinking = struct { effort: ?[]const u8 = null, enable: ?bool = null,
+ 
+ /// ``thinking_fields``: a request's effort and thinking switch where it sets them.
+ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.Refused!Thinking {
++    return thinkingFieldsFor(cx, body, levels, false);
++}
++
++pub fn thinkingFieldsFor(cx: *Cx, body: Value, levels: []const []const u8, numeric: bool) errors.Refused!Thinking {
+     var out: Thinking = .{};
+     const raw = body.get("chat_template_kwargs");
+     const kwargs: ?Value = if (raw != null and raw.?.truthy()) raw.? else null;
+@@ -220,6 +224,16 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
+     if (effort == null and kw_object) if (kwargs) |k| {
+         effort = k.field("reasoning_effort");
+     };
++    if (numeric) if (effort) |e| {
++        const value: ?f64 = if (e == .string) effortNumber(e.string) else if (e == .int or e == .float) e.float64() else null;
++        if (value) |x| {
++            if (!(x >= 0 and x <= 0.99)) return cx.refuse("reasoning_effort must be between 0 and 0.99, or a named effort");
++            const q = @round(@round(x * 1000) / 1000 * 100) / 100;
++            out.effort = try std.fmt.allocPrint(cx.a, "{d}", .{q});
++            out.enable = true;
++            effort = null;
++        }
++    };
+     if (effort) |e| {
+         if (e != .string or !isEffort(e.string)) return cx.refuse("reasoning_effort must be none, minimal, low, medium, high, xhigh or max");
+         out.effort = coerceEffort(e.string, levels);
+@@ -240,6 +254,11 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
+     return out;
+ }
+ 
++pub fn effortNumber(s: []const u8) ?f64 {
++    if (s.len == 0 or std.mem.indexOfScalar(u8, "0123456789.-+", s[0]) == null) return null;
++    return std.fmt.parseFloat(f64, s) catch null;
++}
++
+ fn isEffort(s: []const u8) bool {
+     for (efforts) |e| if (std.mem.eql(u8, e, s)) return true;
+     return false;
+diff --git a/zig/src/server/hf_text.zig b/zig/src/server/hf_text.zig
+index 79700ce..fa7bfa8 100644
+--- a/zig/src/server/hf_text.zig
++++ b/zig/src/server/hf_text.zig
+@@ -4,6 +4,7 @@ const tokenizer = @import("tokenizer");
+ const template = @import("template");
+ const json = @import("json");
+ const model_text = @import("model_text.zig");
++const inkling_structure = @import("inkling_structure.zig");
+ const KimiText = @import("kimi_text.zig").KimiText;
+ const dsv41_chat = @import("dsv41_chat");
+ const dsv41 = if (@hasDecl(dsv41_chat, "template")) dsv41_chat.template else dsv41_chat;
+@@ -408,15 +409,26 @@ pub const HfText = struct {
+         try globals.put(a, "thinking_mode", .{ .string = if (options.enable_thinking) "thinking" else "chat" });
+         var context: std.json.ObjectMap = .empty;
+         try context.put(a, "enable_thinking", .{ .bool = options.enable_thinking });
+-        if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
++        if (options.reasoning_effort) |e| {
++            const numeric = if (t.native_inkling2) @import("fields.zig").effortNumber(e) else null;
++            try context.put(a, "reasoning_effort", if (numeric) |n| .{ .float = n } else .{ .string = e });
++        }
+         if (t.clear_thinking) |clear| try context.put(a, "clear_thinking", .{ .bool = options.clear_thinking orelse clear });
+         var diag: template.Diag = .{};
+         const tools: std.json.Value = if (options.tools) |tl| try toStd(a, tl) else .null;
+-        const out = template.renderMarked(a, compiled, try toStd(a, messages), tools, .{ .object = context }, .{ .object = globals }, options.add_generation_prompt, &diag, options.message_starts) catch |e| {
++        // Inkling 2 adds the tool choice to the leading system message or the effort block.
++        var rendered_messages = messages;
++        var effort_sentence: ?[]const u8 = null;
++        const declared = if (options.tools) |tl| tl == .array and tl.array.len > 0 else false;
++        if (t.native_inkling2 and declared) if (options.tool_instruction) |sentence| {
++            if (try inkling_structure.withInstruction(a, messages, sentence)) |m| rendered_messages = m else effort_sentence = sentence;
++        };
++        const out = template.renderMarked(a, compiled, try toStd(a, rendered_messages), tools, .{ .object = context }, .{ .object = globals }, options.add_generation_prompt, &diag, options.message_starts) catch |e| {
+             if (e == error.OutOfMemory) return error.OutOfMemory;
+             problem.* = diag.msg;
+             return error.Template;
+         };
++        if (effort_sentence) |sentence| return inkling_structure.appendToEffort(a, compiled, tools, context, globals, out.s, out.spans, options.message_starts, sentence, problem);
+         return .{ .text = out.s, .spans = out.spans };
+     }
+ };
+diff --git a/zig/src/server/inkling_structure.zig b/zig/src/server/inkling_structure.zig
+new file mode 100644
+index 0000000..0f2f32b
+--- /dev/null
++++ b/zig/src/server/inkling_structure.zig
+@@ -0,0 +1,281 @@
++//! Native Inkling 2 reply grammars and the prompt wording for tool_choice.
++
++// Copyright 2026 MiaAI-Lab
++const std = @import("std");
++const json = @import("json");
++const template = @import("template");
++const model_text = @import("model_text.zig");
++const errors = @import("errors.zig");
++const grammar = @import("grammar.zig");
++const tool_specs = @import("tool_specs.zig");
++const tool_grammar = @import("tool_grammar.zig");
++const markers = struct {
++    const model = "<|message_model|>";
++    const text = "<|content_text|>";
++    const thinking = "<|content_thinking|>";
++    const tool_json = "<|content_invoke_tool_json|>";
++    const tool_text = "<|content_invoke_tool_text|>";
++    const tool_error = "<|content_tool_error|>";
++    const end_sampling = "<|content_model_end_sampling|>";
++    const end = "<|end_message|>";
++};
++const Server = @import("server.zig").Server;
++const Value = json.Value;
++const Cx = errors.Cx;
++const Allocator = std.mem.Allocator;
++
++/// The sampling field the chat route records the instruction in (not a request field: plan() writes it).
++pub const instruction_field = "inkling_tool_instruction";
++
++/// The most blank characters between a constrained JSON value's tokens (grammar.zig's BLANKS for plain JSON).
++const value_blanks = 32;
++
++/// Every framing token (vLLM INKLING_CONTROL_TOKENS): free text in a grammar never spells one.
++const control = [_][]const u8{
++    "<|endoftext|>",     "<|message_user|>", "<|message_system|>",      "<|message_tool|>",
++    "<|content_image|>", "<|content_xml|>",  "<|content_audio_input|>", "<|audio_end|>",
++    markers.model,       markers.text,       markers.thinking,          markers.tool_json,
++    markers.tool_text,   markers.tool_error, markers.end_sampling,      markers.end,
++};
++
++/// vLLM's tool_choice instruction, with function names serialized using ASCII escapes.
++pub fn instruction(a: Allocator, choice: ?Value, parallel: bool) Allocator.Error!?[]const u8 {
++    const c = choice orelse return if (parallel) null else try a.dupe(u8, auto_single);
++    switch (c) {
++        .null => return if (parallel) null else try a.dupe(u8, auto_single),
++        .string => |s| {
++            if (std.mem.eql(u8, s, "required")) return if (parallel)
++                try a.dupe(u8, "Call at least one of the provided functions in your next response.")
++            else
++                try a.dupe(u8, "Call exactly one of the provided functions in your next response.");
++            if (std.mem.eql(u8, s, "auto") and !parallel) return try a.dupe(u8, auto_single);
++            return null;
++        },
++        .object => {
++            const kind = c.get("type") orelse return null;
++            if (kind != .string or !std.mem.eql(u8, kind.string, "function")) return null;
++            const function = c.get("function");
++            const name_v = if (function) |f| (if (f == .object) f.get("name") else null) else c.get("name");
++            const name = if (name_v) |n| (if (n == .string) n.string else return null) else return null;
++            const quoted = try json.stringify(a, .{ .string = name }, .{ .ascii = true });
++            return try std.fmt.allocPrint(a, "Call the function named {s}{s} in your next response.", .{ quoted, if (parallel) "" else " exactly once" });
++        },
++        else => return null,
++    }
++}
++
++const auto_single = "If you call a function, call at most one function in your next response.";
++
++/// The recorded chat instruction or the one /tokenize derives from the request.
++pub fn instructionOf(a: Allocator, fields: Value) Allocator.Error!?[]const u8 {
++    if (fields != .object) return null;
++    if (fields.get(instruction_field)) |v| return if (v == .string) v.string else null;
++    if (fields.get("messages") == null) return null; // a sampling object without the field: no instruction
++    const p = fields.get("parallel_tool_calls");
++    return instruction(a, fields.get("tool_choice"), !(p != null and p.? == .bool and !p.?.bool));
++}
++
++/// Add the instruction to a leading system or developer message, or return null.
++pub fn withInstruction(a: Allocator, messages: Value, text: []const u8) Allocator.Error!?Value {
++    if (messages != .array or messages.array.len == 0) return null;
++    const first = messages.array[0];
++    if (first != .object) return null;
++    const role = first.get("role") orelse return null;
++    if (role != .string or !(std.mem.eql(u8, role.string, "system") or std.mem.eql(u8, role.string, "developer"))) return null;
++    const copy = try json.newObject(a);
++    var it = first.object.iterator();
++    while (it.next()) |e| try copy.put(a, e.key_ptr.*, e.value_ptr.*);
++    const content = first.get("content");
++    const joined: Value = if (content) |cv| switch (cv) {
++        .string => |s| .{ .string = if (s.len > 0) try std.mem.concat(a, u8, &.{ s, "\n\n", text }) else text },
++        .array => |parts| blk: {
++            const part = try json.newObject(a);
++            try part.put(a, "type", .{ .string = "text" });
++            try part.put(a, "text", .{ .string = text });
++            break :blk .{ .array = try std.mem.concat(a, Value, &.{ parts, &.{.{ .object = part }} }) };
++        },
++        .null => .{ .string = text },
++        else => cv,
++    } else .{ .string = text };
++    try copy.put(a, "content", joined);
++    const out = try a.dupe(Value, messages.array);
++    out[0] = .{ .object = copy };
++    return .{ .array = out };
++}
++
++/// Add the tool instruction to the synthetic effort block when no system message precedes the conversation.
++pub fn appendToEffort(
++    a: Allocator,
++    compiled: *const template.Compiled,
++    tools: std.json.Value,
++    context: std.json.ObjectMap,
++    globals: std.json.ObjectMap,
++    rendered: []const u8,
++    spans: []const model_text.Span,
++    starts: ?*[]usize,
++    sentence: []const u8,
++    problem: *[]const u8,
++) model_text.Error!model_text.Rendered {
++    var diag: template.Diag = .{};
++    const head = template.renderMarked(a, compiled, try @import("hf_text.zig").toStd(a, .{ .array = &.{} }), tools, .{ .object = context }, .{ .object = globals }, false, &diag, null) catch |e| {
++        if (e == error.OutOfMemory) return error.OutOfMemory;
++        problem.* = diag.msg;
++        return error.Template;
++    };
++    const last = std.mem.lastIndexOf(u8, head.s, "<|message_system|>") orelse head.s.len;
++    const effort = std.mem.startsWith(u8, head.s[last..], "<|message_system|><|content_text|>Thinking effort level: ");
++    if (!effort or !std.mem.startsWith(u8, rendered, head.s) or !std.mem.endsWith(u8, head.s, markers.end)) {
++        problem.* = "tool_choice: the template is missing Inkling 2's thinking effort block";
++        return error.Template;
++    }
++    const at = head.s.len - markers.end.len;
++    const add = try std.mem.concat(a, u8, &.{ "\n\n", sentence });
++    const joined = try std.mem.concat(a, u8, &.{ rendered[0..at], add, rendered[at..] });
++    const moved = try a.dupe(model_text.Span, spans);
++    for (moved) |*sp| for (sp) |*x| {
++        if (x.* > at) x.* += add.len;
++    };
++    if (starts) |offsets| for (offsets.*) |*x| {
++        if (x.* > at) x.* += add.len;
++    };
++    return .{ .text = joined, .spans = moved };
++}
++
++fn node(a: Allocator, kind: []const u8, entries: []const struct { []const u8, Value }) Allocator.Error!Value {
++    return tool_grammar.node(a, kind, entries);
++}
++
++/// A framing token by id (the tokenizer's own; a 400 when the checkpoint lacks it).
++fn token(srv: *Server, cx: *Cx, spelled: []const u8) errors.Refused!Value {
++    const id = srv.text.tokenId(spelled) orelse return cx.fail(.request, "structured output: the tokenizer has no {s} token", .{spelled});
++    return node(cx.a, "token", &.{.{ "token", try json.intValue(cx.a, id) }});
++}
++
++fn constant(a: Allocator, text: []const u8) Allocator.Error!Value {
++    return node(a, "const_string", &.{.{ "value", .{ .string = text } }});
++}
++
++fn schemaNode(a: Allocator, schema: Value) Allocator.Error!Value {
++    return node(a, "json_schema", &.{ .{ "json_schema", schema }, .{ "style", .{ .string = "json" } }, .{ "max_whitespace_cnt", try json.intValue(a, value_blanks) } });
++}
++
++/// Zero or more thinking blocks: `<|message_model|><|content_thinking|>` free text `<|end_message|>`.
++fn thinking(srv: *Server, cx: *Cx) errors.Refused!Value {
++    const a = cx.a;
++    var excludes: std.ArrayList(Value) = .empty;
++    for (control) |c| if (srv.text.tokenId(c) != null) try excludes.append(a, .{ .string = c });
++    const text = try node(a, "any_text", &.{.{ "excludes", .{ .array = excludes.items } }});
++    const block = try node(a, "sequence", &.{.{ "elements", .{ .array = try a.dupe(Value, &.{ try token(srv, cx, markers.model), try token(srv, cx, markers.thinking), text, try token(srv, cx, markers.end) }) } }});
++    return node(a, "star", &.{.{ "content", block }});
++}
++
++fn tag(a: Allocator, format: Value) Allocator.Error![]const u8 {
++    return json.stringify(a, try node(a, "structural_tag", &.{.{ "format", format }}), .{ .ascii = false, .compact = true });
++}
++
++/// The inner format a grammar request asks for, as a structural tag node.
++fn inner(cx: *Cx, s: grammar.Spec) errors.Refused!Value {
++    const a = cx.a;
++    return switch (s.kind) {
++        .json => schemaNode(a, try node(a, "object", &.{})),
++        .json_schema => schemaNode(a, switch (try json.parse(a, s.text)) {
++            .ok => |v| v,
++            .err => return cx.fail(.request, "{s}: the schema is not JSON", .{s.field}),
++        }),
++        .regex => node(a, "regex", &.{.{ "pattern", .{ .string = s.text } }}),
++        .grammar => node(a, "grammar", &.{.{ "grammar", .{ .string = s.text } }}),
++        .choice => blk: {
++            const list = switch (try json.parse(a, s.text)) {
++                .ok => |v| v,
++                .err => return cx.fail(.request, "{s}: the choices are not JSON", .{s.field}),
++            };
++            const items = list.items() orelse return cx.fail(.request, "{s} must be a list", .{s.field});
++            const options = try a.alloc(Value, items.len);
++            for (items, options) |it, *o| o.* = try constant(a, it.string);
++            if (options.len == 1) break :blk options[0];
++            break :blk node(a, "or", &.{.{ "elements", .{ .array = options } }});
++        },
++        .structural_tag => unreachable,
++    };
++}
++
++/// A framed schema reply allows thinking blocks before one constrained text block.
++pub fn framed(srv: *Server, cx: *Cx, s: grammar.Spec, allow_thinking: bool) errors.Refused![]const u8 {
++    const a = cx.a;
++    const elements = &.{ try token(srv, cx, markers.model), try token(srv, cx, markers.text), try inner(cx, s), try token(srv, cx, markers.end) };
++    return framedBody(srv, cx, try sequence(a, elements), allow_thinking);
++}
++
++/// One native tool block, whose arguments use the tool's schema and preserve its root.
++fn callBlock(srv: *Server, cx: *Cx, tool: Value) errors.Refused!Value {
++    const a = cx.a;
++    const name = try tool_specs.toolName(a, tool);
++    const quoted = try json.stringify(a, .{ .string = name }, .{ .ascii = false });
++    const args = try tool_grammar.parameters(a, tool);
++    const elements = try a.dupe(Value, &.{
++        try token(srv, cx, markers.model),
++        try constant(a, name),
++        try token(srv, cx, markers.tool_json),
++        try constant(a, try std.mem.concat(a, u8, &.{ "{\"name\":", quoted, ",\"args\":" })),
++        try schemaNode(a, args),
++        try constant(a, "}"),
++        try token(srv, cx, markers.end),
++    });
++    return node(a, "sequence", &.{.{ "elements", .{ .array = elements } }});
++}
++
++/// A forced tool reply allows thinking blocks before one call or multiple calls when parallel is enabled.
++pub fn calls(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, allow_thinking: bool) errors.Refused![]const u8 {
++    const a = cx.a;
++    const blocks = try a.alloc(Value, tools.len);
++    for (tools, blocks) |tool, *b| b.* = try callBlock(srv, cx, tool);
++    const one = if (blocks.len == 1) blocks[0] else try node(a, "or", &.{.{ "elements", .{ .array = blocks } }});
++    const body = if (parallel) try node(a, "plus", &.{.{ "content", one }}) else one;
++    return framedBody(srv, cx, body, allow_thinking);
++}
++
++fn sequence(a: Allocator, elements: []const Value) Allocator.Error!Value {
++    return node(a, "sequence", &.{.{ "elements", .{ .array = try a.dupe(Value, elements) } }});
++}
++
++fn framedBody(srv: *Server, cx: *Cx, body: Value, allow_thinking: bool) errors.Refused![]const u8 {
++    if (!allow_thinking) return tag(cx.a, body);
++    return tag(cx.a, try sequence(cx.a, &.{ try thinking(srv, cx), body }));
++}
++
++const testing = std.testing;
++
++test "tool_choice sentences are vLLM's" {
++    var arena = std.heap.ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    try testing.expectEqualStrings("Call at least one of the provided functions in your next response.", (try instruction(a, .{ .string = "required" }, true)).?);
++    try testing.expectEqualStrings("Call exactly one of the provided functions in your next response.", (try instruction(a, .{ .string = "required" }, false)).?);
++    try testing.expectEqualStrings(auto_single, (try instruction(a, .{ .string = "auto" }, false)).?);
++    try testing.expectEqual(@as(?[]const u8, null), try instruction(a, .{ .string = "auto" }, true));
++    try testing.expectEqual(@as(?[]const u8, null), try instruction(a, null, true));
++    try testing.expectEqual(@as(?[]const u8, null), try instruction(a, .{ .string = "none" }, false));
++    const named = (try json.parse(a, "{\"type\":\"function\",\"function\":{\"name\":\"get_w\\u00e9ather\"}}")).ok;
++    try testing.expectEqualStrings("Call the function named \"get_w\\u00e9ather\" in your next response.", (try instruction(a, named, true)).?);
++    try testing.expectEqualStrings("Call the function named \"get_w\\u00e9ather\" exactly once in your next response.", (try instruction(a, named, false)).?);
++}
++
++test "message 0 takes the sentence as vLLM's _with_appended_text adds it" {
++    var arena = std.heap.ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const cases = [_]struct { []const u8, ?[]const u8 }{
++        .{ "[{\"role\":\"system\",\"content\":\"Be brief.\"},{\"role\":\"user\",\"content\":\"hi\"}]", "Be brief.\n\nX" },
++        .{ "[{\"role\":\"developer\",\"content\":\"\"},{\"role\":\"user\",\"content\":\"hi\"}]", "X" },
++        .{ "[{\"role\":\"system\",\"content\":null}]", "X" },
++        .{ "[{\"role\":\"user\",\"content\":\"hi\"}]", null },
++    };
++    for (cases) |c| {
++        const got = try withInstruction(a, (try json.parse(a, c[0])).ok, "X");
++        if (c[1]) |want| try testing.expectEqualStrings(want, got.?.array[0].get("content").?.string) else try testing.expectEqual(@as(?Value, null), got);
++    }
++    const parts = (try withInstruction(a, (try json.parse(a, "[{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"A\"}]}]")).ok, "X")).?;
++    const list = parts.array[0].get("content").?.array;
++    try testing.expectEqual(@as(usize, 2), list.len);
++    try testing.expectEqualStrings("X", list[1].get("text").?.string);
++}
+diff --git a/zig/src/server/model_text.zig b/zig/src/server/model_text.zig
+index 4218f90..941cb8e 100644
+--- a/zig/src/server/model_text.zig
++++ b/zig/src/server/model_text.zig
+@@ -10,6 +10,7 @@ pub const RenderOptions = struct {
+     /// Also ``thinking_mode`` ("thinking" or "chat") for templates that read that switch.
+     enable_thinking: bool = false,
+     reasoning_effort: ?[]const u8 = null,
++    tool_instruction: ?[]const u8 = null,
+     /// A request's ``clear_thinking``; a GLM-5.3 template takes it over the server's.
+     clear_thinking: ?bool = null,
+     tool_choice: ?json.Value = null,
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 47be05d..70893b4 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -92,6 +92,7 @@ pub const Plan = struct {
+     separate_usage: bool,
+     policy: tool_stream.Policy,
+     named: []const u8,
++    reasoning_alias: bool = false,
+     prompts: []const []const u8 = &.{}, // a raw completion's list of prompts, each its own choice (prompt_list.zig)
+     choices: u32 = 1, // ``n``: engine requests on the one prompt (choices.zig)
+ };
+@@ -138,10 +139,15 @@ pub fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value, format: ?[]const u
+     try grammar.refusal(cx, body);
+     if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
+     if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
++    if (is_chat and srv.info.framed_structures and srv.text.native_inkling2 and input.tools.len > 0) {
++        const structure = @import("inkling_structure.zig");
++        if (try structure.instruction(cx.a, body.get("tool_choice"), !sampling.contains("tool_call_single"))) |sentence|
++            try sampling.put(cx.a, structure.instruction_field, .{ .string = sentence });
++    }
+     // a choice's rows or required call would be its own: these alone do not split over n choices
+     if (n > 1 and (logprobs != null or sampling.contains("tool_call_required"))) return cx.refuse("n above 1 cannot be served with logprobs or a required tool call");
+     if (n > 1 and cortheon.engages(srv, cx.a, raw, is_chat, &input)) return cx.refuse("n above 1 is not served by --cortheon's turn loop: send \"cortheon\": false");
+-    const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
++    const thinking = try fields.thinkingFieldsFor(cx, body, srv.effort_levels, srv.text.native_inkling2);
+     if (thinking.effort) |e| try sampling.put(cx.a, "reasoning_effort", .{ .string = e });
+     if (thinking.enable) |on| try sampling.put(cx.a, "enable_thinking", .{ .bool = on });
+     if (thinking.clear) |c| try sampling.put(cx.a, "clear_thinking", .{ .bool = c });
+@@ -193,6 +199,8 @@ pub fn runNamed(srv: *Server, a: Allocator, out: Out, gone: Gone, is_chat: bool,
+         return;
+     };
+     p.input.id = id;
++    const path = std.mem.sliceTo(gone.conn.path, '?');
++    p.reasoning_alias = is_chat and std.mem.endsWith(u8, path, "/chat/completions");
+     // held until the reply is written: POST /v1/requests/{id}/cancel finds the request by each id its client gets
+     var asked: cancel_ids.Entry = .{ .owner = gone.conn.key_digest };
+     const names = [_][]const u8{ id, cancel_ids.alias orelse "" };
+@@ -241,6 +249,8 @@ pub const Run = struct {
+         try choice.put(a, "index", .{ .int = "0" });
+         if (r.is_chat) {
+             const d: Value = if (delta) |v| (if (v == .object) v else if (v.string.len > 0) try chat.deltaOf(a, "content", v.string) else .{ .object = try json.newObject(a) }) else .{ .object = try json.newObject(a) };
++            if (r.plan.reasoning_alias) if (d.get("reasoning_content")) |thought| if (thought == .string)
++                try @import("reasoning_field.zig").put(a, d.object, thought.string);
+             try choice.put(a, "delta", d);
+             // a content delta's rows (logprobs.Stream) are the choice's, as OpenAI streams them
+             if (d == .object) if (d.object.fetchOrderedRemove("logprobs")) |kv| try choice.put(a, "logprobs", kv.value);
+@@ -362,7 +372,12 @@ pub const Run = struct {
+             const message = try json.newObject(a);
+             try message.put(a, "role", .{ .string = "assistant" });
+             try message.put(a, "content", if (calls != null and reply.content.len == 0) .null else .{ .string = reply.content });
+-            if (reply.reasoning) |t| if (t.len > 0) try message.put(a, "reasoning_content", .{ .string = t });
++            if (reply.reasoning) |t| if (t.len > 0) {
++                if (r.plan.reasoning_alias)
++                    try @import("reasoning_field.zig").put(a, message, t)
++                else
++                    try message.put(a, "reasoning_content", .{ .string = t });
++            };
+             if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
+             try choice.put(a, "message", .{ .object = message });
+             try choice.put(a, "finish_reason", .{ .string = reply.finish_reason });
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+index 7b97d4c..172b432 100644
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -51,6 +51,7 @@ pub fn renderStarts(srv: *Server, cx: *Cx, messages: Value, tools: []const Value
+         .add_generation_prompt = generation,
+         .enable_thinking = thinking,
+         .reasoning_effort = if (thinking) effort else cx.named_effort orelse srv.off_effort,
++        .tool_instruction = if (srv.info.framed_structures and srv.text.native_inkling2) try @import("inkling_structure.zig").instructionOf(cx.a, cx.template_fields) else null,
+         .clear_thinking = cx.clear_thinking,
+         .tool_choice = cx.template_fields.get("tool_choice"),
+         .response_format = cx.template_fields.get("response_format"),
+diff --git a/zig/src/server/reasoning_field.zig b/zig/src/server/reasoning_field.zig
+new file mode 100644
+index 0000000..7a4081d
+--- /dev/null
++++ b/zig/src/server/reasoning_field.zig
+@@ -0,0 +1,26 @@
++//! OpenAI wire compatibility for reasoning text.
++
++// Copyright 2026 MiaAI-Lab
++const std = @import("std");
++const json = @import("json");
++
++const Field = enum(u8) { unread, reasoning_content, reasoning, both };
++var cached: std.atomic.Value(Field) = .init(.unread);
++
++fn field() Field {
++    const value = cached.load(.monotonic);
++    if (value != .unread) return value;
++    const raw = @import("sys").environment.rawText("TF_REASONING_FIELD") orelse "";
++    const selected = std.meta.stringToEnum(Field, raw) orelse .reasoning_content;
++    const result = if (selected == .unread) Field.reasoning_content else selected;
++    cached.store(result, .monotonic);
++    return result;
++}
++
++pub fn put(a: std.mem.Allocator, object: *json.Object, text: []const u8) std.mem.Allocator.Error!void {
++    const selected = field();
++    if (selected == .reasoning) {
++        _ = object.fetchOrderedRemove("reasoning_content");
++    } else try object.put(a, "reasoning_content", .{ .string = text });
++    if (selected != .reasoning_content) try object.put(a, "reasoning", .{ .string = text });
++}
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 5c14d0e..74a07b2 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -276,24 +276,43 @@ pub const Server = struct {
+     /// The grammar a request asks for, or its refusal when the engine cannot enforce it.
+     pub fn checkFeatures(srv: *Server, cx: *Cx, f: Value, has_tools: bool, thinking: bool, prompt_ids: []const u32, tools: []const Value, request: *api.Request) errors.Refused!void {
+         _ = prompt_ids;
++        return srv.checkFeaturesChat(cx, f, has_tools, thinking, false, tools, request);
++    }
++
++    pub fn checkFeaturesChat(srv: *Server, cx: *Cx, f: Value, has_tools: bool, thinking: bool, chat_route: bool, tools: []const Value, request: *api.Request) errors.Refused!void {
+         errdefer srv.release(false, request.*); // a refused request frees what it compiled here
+         const required = if (f.get("tool_call_required")) |r| r.truthy() else false;
+         const one_call = if (f.get("tool_call_single")) |x| x.truthy() else false;
+         const all = has_tools and !required and (tool_grammar.autoAllEnv() catch return cx.fail(.server, "invalid TF_DSV41_TOOL_GRAMMAR: expected 0 or 1", .{}));
++        const inkling_chat = srv.info.framed_structures and srv.text.native_inkling2 and chat_route;
++        const spec = try grammar.spec(cx, f);
++        if (inkling_chat and spec == null and !required and tool_grammar.autoWanted(tools, all))
++            return cx.refuse("Inkling 2 Mini cannot constrain strict tools under tool_choice \"auto\". Use a required or named function.");
+         if (has_tools and required) {
+             if (!srv.info.capability(.structures)) return cx.fail(.request, "backend '{s}' cannot enforce tool_choice \"required\" or a named function: it has no token grammar support; send \"auto\" or \"none\"", .{srv.backendName()});
+-            request.structure = try tool_grammar.structure(srv, cx, tools, !one_call, thinking);
+-        } else if (has_tools and srv.info.capability(.structures) and tool_grammar.autoWanted(tools, all) and srv.grammarCompiler() != null) {
++            if (inkling_chat) {
++                const text = try @import("inkling_structure.zig").calls(srv, cx, tools, !one_call, thinking);
++                if (text.len > grammar.max_text) return cx.refuse("tool_choice: the tools' names and schemas exceed the grammar size limit");
++                request.structure = try srv.compiledStructure(cx, .structural_tag, text, "tool_choice", false);
++            } else request.structure = try tool_grammar.structure(srv, cx, tools, !one_call, thinking);
++        } else if (!inkling_chat and has_tools and srv.info.capability(.structures) and tool_grammar.autoWanted(tools, all) and srv.grammarCompiler() != null) {
+             // auto with a strict tool (any, TENSORFOLD_TOOL_GRAMMAR=1): text or calls; no grammar library, no grammar
+             request.structure = try tool_grammar.optionalStructure(srv, cx, tools, all, !one_call, thinking);
+         }
+-        if (try grammar.spec(cx, f)) |s| {
++        if (spec) |s| {
+             if (!srv.info.capability(.structures)) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
+             if (s.text.len > grammar.max_text) return cx.fail(.request, "{s}: the grammar is {d} bytes, more than the {d} KiB a grammar may be", .{ s.field, s.text.len, grammar.max_text / 1024 });
+-            const st = try srv.compiledStructure(cx, s.kind, s.text, s.field, thinking);
++            const st = if (inkling_chat and s.kind != .structural_tag)
++                try srv.compiledStructure(cx, .structural_tag, try @import("inkling_structure.zig").framed(srv, cx, s, thinking), s.field, false)
++            else
++                try srv.compiledStructure(cx, s.kind, s.text, s.field, thinking and !inkling_chat);
+             if (request.structure) |tool| tool.free();
+             request.structure = st;
+         }
++        if (inkling_chat and request.structure != null) {
++            if (fields.flag(f, "ignore_eos") orelse false) return cx.refuse("ignore_eos cannot be combined with a constrained Inkling 2 reply");
++            if (f.get("stop")) |stop| if (stop.truthy()) return cx.refuse("stop cannot be combined with a constrained Inkling 2 reply");
++        }
+         try budgetStructure(cx, f, request);
+     }
+ 
+@@ -526,4 +545,6 @@ fn needsUserAfterTool(source: []const u8) bool {
+ 
+ test {
+     _ = @import("server_queue_phase_test.zig");
++    _ = @import("inkling_structure.zig");
++    _ = @import("reasoning_field.zig");
+ }
+diff --git a/zig/src/server/tokens.zig b/zig/src/server/tokens.zig
+index 92cab3c..8ead3d1 100644
+--- a/zig/src/server/tokens.zig
++++ b/zig/src/server/tokens.zig
+@@ -32,7 +32,7 @@ fn messageIds(srv: *Server, cx: *Cx, body: Value) errors.Refused![]const u32 {
+         error.Refused => return cx.refuse(cx.message), // a ValueError here is a RequestError
+         else => |x| return x,
+     };
+-    const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
++    const thinking = try fields.thinkingFieldsFor(cx, body, srv.effort_levels, srv.text.native_inkling2);
+     const on = thinking.enable orelse srv.config.enable_thinking;
+     cx.clear_thinking = thinking.clear;
+     cx.named_effort = fields.namedEffort(thinking.effort, srv.effort_levels);
+-- 
+2.43.0
+

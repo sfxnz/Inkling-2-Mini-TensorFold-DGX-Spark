@@ -1,0 +1,14 @@
+0001-inkling2-add-paged-FP8-KV-pool-LRU-radix-reclaim-and.patch
+0002-inkling2-add-gatePrepare-warp-router-lazy-head-and-C.patch
+0003-inkling2-add-qmmf-attention-projections-ATTN_FP8-opt.patch
+0004-inkling2-enable-DFlash2-DSpark-drafters-CUDA-vision-.patch
+0005-inkling2-add-framed-schema-tool-JSON-constraints-rea.patch
+0006-inkling2-parallelize-MoE-plan-and-gateDownPrepared-c.patch
+0007-inkling2-batch-DFlash2-absorb-propose-with-graphed-a.patch
+0008-inkling2-tile-gateUp-8x-pipeline-prompt_tc-with-cp.a.patch
+0009-inkling2-add-RT-1-Blackwell-verify-TC-MoE-rows-12-bo.patch
+0010-inkling2-enable-zero-copy-pool-prefix_cache-add-SMEM.patch
+0011-inkling2-cooperative-TC-prefill-wide-decode-MoE-FP8-.patch
+0012-inkling2-batch-prefix-StateCopy-spans-8-row-32-row-l.patch
+0013-inkling2-restore-loop_ar-gateUpTiled-occupancy-and-u.patch
+0014-inkling2-8-warp-2x4-prompt_tc_coop-with-RT-2-and-2-r.patch

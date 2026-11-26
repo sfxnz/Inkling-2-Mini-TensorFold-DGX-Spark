@@ -1,0 +1,385 @@
+From a5705079c129d8ccc7aa489e963dbdcd61629776 Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+Date: Wed, 25 Nov 2026 21:19:32 +0000
+Subject: [PATCH 09/14] inkling2: add RT=1 Blackwell verify TC MoE (rows>=12),
+ bound verify_cache=64, include flags in warmCacheKey
+
+---
+ zig/kernels/cuda/inkling2/modelopt.cu      | 90 ++++++++++++++--------
+ zig/src/families/inkling2/dflash2_cuda.zig |  4 +-
+ zig/src/families/inkling2/loop_backend.zig | 17 +++-
+ zig/src/families/inkling2/loop_graphs.zig  |  4 +-
+ zig/src/families/inkling2/modelopt.zig     | 21 +++--
+ zig/src/platform/environment.zig           |  1 +
+ zig/src/platform/environment_test.zig      |  1 +
+ zig/src/server/cli.zig                     |  1 +
+ 8 files changed, 92 insertions(+), 47 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/modelopt.cu b/zig/kernels/cuda/inkling2/modelopt.cu
+index 9b4353a..5d2c186 100644
+--- a/zig/kernels/cuda/inkling2/modelopt.cu
++++ b/zig/kernels/cuda/inkling2/modelopt.cu
+@@ -339,20 +339,22 @@ __device__ __forceinline__ void mma_mxfp8(float (&)[4], const uint32_t (&)[4], u
+ }
+ #endif
+ 
+-// Blackwell native block-scaled tensor-core prompt GEMM over ModelOpt row-major checkpoint weights.
+-template <int FMT>
++// Blackwell native block-scaled tensor-core GEMM over ModelOpt row-major checkpoint weights (RT=4 for 64-row prompt, RT=1 for 16-row verify).
++template <int FMT, int RT = 4>
+ __device__ __forceinline__ void prompt_tc_body(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc,
+                                                int x_stride, int slots, Weight w, int KG, int NB,
+                                                const int* __restrict__ items, const int* __restrict__ item_count,
+                                                const int* __restrict__ members, void* __restrict__ out, int N,
+                                                int skip) {
++  constexpr int kRows = 16 * RT;
++  constexpr int kTokLoads = (kRows + 31) / 32;
+   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
+   const int units = __ldg(item_count) * NB;
+-  __shared__ __align__(16) uint4 sx_c[2][4][64][2];
+-  __shared__ __align__(16) uint32_t sx_s[2][4][64];
++  __shared__ __align__(16) uint4 sx_c[2][4][kRows][2];
++  __shared__ __align__(16) uint32_t sx_s[2][4][kRows];
+   __shared__ __align__(16) uint4 sw_c[2][4][32][2];
+   __shared__ __align__(16) uint32_t sw_s[2][4][32];
+-  __shared__ int s_tok[4][64];
++  __shared__ int s_tok[4][kRows];
+   const int c_stride = FMT == 0 ? (x_stride >> 1) : x_stride;
+   const int s_stride = FMT == 0 ? (x_stride >> 4) : (x_stride >> 5);
+   const int steps = FMT == 0 ? (KG >> 1) : KG;
+@@ -361,10 +363,10 @@ __device__ __forceinline__ void prompt_tc_body(const uint8_t* __restrict__ xc, c
+     const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+     if (e == skip) continue;
+     const float outer = FMT == 0 ? outer_of(w, e) : 1.0f;
+-    bool v[4][2];
+-    int pr[4][2];
++    bool v[RT][2];
++    int pr[RT][2];
+ #pragma unroll
+-    for (int r = 0; r < 4; ++r)
++    for (int r = 0; r < RT; ++r)
+ #pragma unroll
+       for (int h = 0; h < 2; ++h) {
+         const int i = 16 * r + gq + 8 * h;
+@@ -372,19 +374,21 @@ __device__ __forceinline__ void prompt_tc_body(const uint8_t* __restrict__ xc, c
+         pr[r][h] = v[r][h] ? __ldg(members + first + i) : 0;
+       }
+ #pragma unroll
+-    for (int i = 0; i < 2; ++i) {
++    for (int i = 0; i < kTokLoads; ++i) {
+       const int rr = lane + 32 * i;
+-      if (rr < cnt) {
+-        const int p = __ldg(members + first + rr);
+-        s_tok[warp][rr] = slots ? (p / slots) : p;
+-      } else {
+-        s_tok[warp][rr] = -1;
++      if (rr < kRows) {
++        if (rr < cnt) {
++          const int p = __ldg(members + first + rr);
++          s_tok[warp][rr] = slots ? (p / slots) : p;
++        } else {
++          s_tok[warp][rr] = -1;
++        }
+       }
+     }
+     __syncwarp();
+     auto load_stage = [&](int s, int g) {
+ #pragma unroll
+-      for (int i = 0; i < 4; ++i) {
++      for (int i = 0; i < RT; ++i) {
+         const int q = lane + 32 * i, rr = q >> 1, cc = q & 1;
+         const int tok = s_tok[warp][rr];
+         const int safe_tok = tok >= 0 ? tok : 0;
+@@ -393,17 +397,19 @@ __device__ __forceinline__ void prompt_tc_body(const uint8_t* __restrict__ xc, c
+                          tok >= 0);
+       }
+ #pragma unroll
+-      for (int i = 0; i < 2; ++i) {
++      for (int i = 0; i < kTokLoads; ++i) {
+         const int rr = lane + 32 * i;
+-        const int tok = s_tok[warp][rr];
+-        if (tok >= 0) {
+-          if constexpr (FMT == 0) {
+-            sx_s[s][warp][rr] = __ldg(reinterpret_cast<const uint32_t*>(xsc + static_cast<size_t>(tok) * s_stride + g * 4));
++        if (rr < kRows) {
++          const int tok = s_tok[warp][rr];
++          if (tok >= 0) {
++            if constexpr (FMT == 0) {
++              sx_s[s][warp][rr] = __ldg(reinterpret_cast<const uint32_t*>(xsc + static_cast<size_t>(tok) * s_stride + g * 4));
++            } else {
++              sx_s[s][warp][rr] = static_cast<uint32_t>(__ldg(xsc + static_cast<size_t>(tok) * s_stride + g));
++            }
+           } else {
+-            sx_s[s][warp][rr] = static_cast<uint32_t>(__ldg(xsc + static_cast<size_t>(tok) * s_stride + g));
++            sx_s[s][warp][rr] = 0u;
+           }
+-        } else {
+-          sx_s[s][warp][rr] = 0u;
+         }
+       }
+ #pragma unroll
+@@ -423,9 +429,9 @@ __device__ __forceinline__ void prompt_tc_body(const uint8_t* __restrict__ xc, c
+         }
+       }
+     };
+-    float acc[1][4][4][4];
++    float acc[1][RT][4][4];
+ #pragma unroll
+-    for (int r = 0; r < 4; ++r)
++    for (int r = 0; r < RT; ++r)
+ #pragma unroll
+       for (int j = 0; j < 4; ++j) acc[0][r][j][0] = acc[0][r][j][1] = acc[0][r][j][2] = acc[0][r][j][3] = 0.f;
+     if (steps > 0) {
+@@ -442,9 +448,9 @@ __device__ __forceinline__ void prompt_tc_body(const uint8_t* __restrict__ xc, c
+         tf_common::cp_wait<0>();
+       }
+       __syncwarp();
+-      uint32_t a[4][4], sa[4];
++      uint32_t a[RT][4], sa[RT];
+ #pragma unroll
+-      for (int r = 0; r < 4; ++r) {
++      for (int r = 0; r < RT; ++r) {
+         const int r0 = 16 * r;
+         const uint32_t* p0 = reinterpret_cast<const uint32_t*>(&sx_c[cur][warp][r0 + gq][0]);
+         const uint32_t* p1 = reinterpret_cast<const uint32_t*>(&sx_c[cur][warp][r0 + gq + 8][0]);
+@@ -461,25 +467,25 @@ __device__ __forceinline__ void prompt_tc_body(const uint8_t* __restrict__ xc, c
+         const uint32_t sb = sw_s[cur][warp][8 * j + gq];
+         if constexpr (FMT == 0) {
+ #pragma unroll
+-          for (int r = 0; r < 4; ++r) mma4::mma_fp4(acc[0][r][j], a[r], b0, b1, sa[r], sb);
++          for (int r = 0; r < RT; ++r) mma4::mma_fp4(acc[0][r][j], a[r], b0, b1, sa[r], sb);
+         } else {
+ #pragma unroll
+-          for (int r = 0; r < 4; ++r) mma_mxfp8(acc[0][r][j], a[r], b0, b1, sa[r], sb);
++          for (int r = 0; r < RT; ++r) mma_mxfp8(acc[0][r][j], a[r], b0, b1, sa[r], sb);
+         }
+       }
+       __syncwarp();
+     }
+     if constexpr (FMT == 0) {
+ #pragma unroll
+-      for (int r = 0; r < 4; ++r)
++      for (int r = 0; r < RT; ++r)
+ #pragma unroll
+         for (int j = 0; j < 4; ++j)
+ #pragma unroll
+           for (int q = 0; q < 4; ++q) acc[0][r][j][q] *= outer;
+     }
+ #pragma unroll
+-    for (int r = 0; r < 4; ++r)
+-      store<4, 4>(acc, r, out, nullptr, N, cb * 32 + 2 * t, pr[r][0], pr[r][1], v[r][0], v[r][1]);
++    for (int r = 0; r < RT; ++r)
++      store<RT, 4>(acc, r, out, nullptr, N, cb * 32 + 2 * t, pr[r][0], pr[r][1], v[r][0], v[r][1]);
+   }
+ }
+ 
+@@ -674,7 +680,7 @@ extern "C" __global__ void __launch_bounds__(128)
+                                int slots, ink2o::Weight w, int KG, int NB, const int* __restrict__ items,
+                                const int* __restrict__ item_count, const int* __restrict__ members,
+                                void* __restrict__ out, int N, int skip) {
+-  ink2o::prompt_tc_body<0>(xc, xsc, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip);
++  ink2o::prompt_tc_body<0, 4>(xc, xsc, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip);
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(128)
+@@ -682,5 +688,21 @@ extern "C" __global__ void __launch_bounds__(128)
+                                int slots, ink2o::Weight w, int KG, int NB, const int* __restrict__ items,
+                                const int* __restrict__ item_count, const int* __restrict__ members,
+                                void* __restrict__ out, int N, int skip) {
+-  ink2o::prompt_tc_body<1>(xc, xsc, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip);
++  ink2o::prompt_tc_body<1, 4>(xc, xsc, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip);
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ink2moe_verify_tc_nvfp4(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc, int x_stride,
++                               int slots, ink2o::Weight w, int KG, int NB, const int* __restrict__ items,
++                               const int* __restrict__ item_count, const int* __restrict__ members,
++                               void* __restrict__ out, int N, int skip) {
++  ink2o::prompt_tc_body<0, 1>(xc, xsc, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip);
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ink2moe_verify_tc_mxfp8(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc, int x_stride,
++                               int slots, ink2o::Weight w, int KG, int NB, const int* __restrict__ items,
++                               const int* __restrict__ item_count, const int* __restrict__ members,
++                               void* __restrict__ out, int N, int skip) {
++  ink2o::prompt_tc_body<1, 1>(xc, xsc, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip);
+ }
+diff --git a/zig/src/families/inkling2/dflash2_cuda.zig b/zig/src/families/inkling2/dflash2_cuda.zig
+index 35e0569..b6dc16e 100644
+--- a/zig/src/families/inkling2/dflash2_cuda.zig
++++ b/zig/src/families/inkling2/dflash2_cuda.zig
+@@ -207,9 +207,9 @@ pub const Drafter = struct {
+     }
+ 
+     pub fn enableGraphs(d: *Drafter, a: std.mem.Allocator) void {
+-        d.graphs = .init(a, d.graph_engine.engine(), .{ .max = 64 });
++        d.graphs = .init(a, d.graph_engine.engine(), .{ .max = 32 });
+         d.graphs.?.name = "inkling2 mini dflash2 proposal";
+-        d.absorb_graphs = .init(a, d.graph_engine.engine(), .{ .max = 32 });
++        d.absorb_graphs = .init(a, d.graph_engine.engine(), .{ .max = 16 });
+         d.absorb_graphs.?.name = "inkling2 mini dflash2 absorb";
+     }
+ 
+diff --git a/zig/src/families/inkling2/loop_backend.zig b/zig/src/families/inkling2/loop_backend.zig
+index 4dc50b5..6286b79 100644
+--- a/zig/src/families/inkling2/loop_backend.zig
++++ b/zig/src/families/inkling2/loop_backend.zig
+@@ -3,6 +3,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const lanes = @import("lanes");
+ const engine = @import("loop_engine.zig");
++const modelopt = @import("modelopt.zig");
+ const ops = @import("ops.zig");
+ const dspark = @import("dspark_cuda.zig");
+ const dflash = @import("dflash2_cuda.zig");
+@@ -111,22 +112,30 @@ pub const Backend = struct {
+         var ctx_buf: [24]u8 = undefined;
+         const ctx_str = std.fmt.bufPrint(&ctx_buf, "ctx{d}", .{b.m.context}) catch return null;
+         const attn_str: []const u8 = if (b.m.w.layers.len > 0)
+-            if (b.m.w.layers[0].attn.qmmf) |qa| if (qa.wq.mode == .fp8) "attn_fp8" else "attn_bf16" else "attn_raw"
++            if (b.m.w.layers[0].attn.qmmf) |qa|
++                if (qa.wq.mode == .fp8)
++                    if (qa.gate.mode == .fp8) "attn_fp8_gate_fp8" else "attn_fp8"
++                else if (qa.gate.mode == .fp8) "attn_bf16_gate_fp8" else "attn_bf16"
++            else
++                "attn_raw"
+         else
+             "attn_none";
+         const draft_mode: []const u8 = switch (d.*) {
+             .dflash2 => |df| if (df.w.fp8_layers)
+-                if (df.w.base != null) "df_fp8_fp8" else "df_fp8_bf16"
+-            else if (df.w.base != null) "df_bf16_fp8" else "df_bf16_bf16",
++                if (df.w.base) |bw| (if (bw.mode == .fp4) "df_fp8_fp4" else "df_fp8_fp8") else "df_fp8_bf16"
++            else if (df.w.base) |bw| (if (bw.mode == .fp4) "df_bf16_fp4" else "df_bf16_fp8") else "df_bf16_bf16",
+             .dspark => "ds",
+         };
++        var tc_buf: [24]u8 = undefined;
++        const tc_str = std.fmt.bufPrint(&tc_buf, "tc{d}_v{d}", .{ modelopt.prefillTcMode(), modelopt.verifyTcRows() }) catch return null;
+         const parts = [_][]const u8{
+-            "inkling2-warm-v1",
++            "inkling2-warm-v2",
+             cap_str,
+             @tagName(d.*),
+             draft_mode,
+             if (lazy) "lazy" else "dense",
+             attn_str,
++            tc_str,
+             @tagName(b.m.layout.format),
+             ctx_str,
+         };
+diff --git a/zig/src/families/inkling2/loop_graphs.zig b/zig/src/families/inkling2/loop_graphs.zig
+index b3a1c5e..72e4226 100644
+--- a/zig/src/families/inkling2/loop_graphs.zig
++++ b/zig/src/families/inkling2/loop_graphs.zig
+@@ -15,9 +15,9 @@ pub const Graphs = struct {
+ 
+     pub fn init(g: *Graphs, gpa: std.mem.Allocator, d: *const cuda.Driver, separate: bool) void {
+         g.cuda_engine = .{ .d = d };
+-        g.cache = .init(gpa, g.cuda_engine.engine(), if (separate) .{ .max = 64 } else .{});
++        g.cache = .init(gpa, g.cuda_engine.engine(), if (separate) .{ .max = 32 } else .{});
+         g.cache.name = "inkling2 mini decode";
+-        g.verify_cache = if (separate) Cache.init(gpa, g.cuda_engine.engine(), .{ .max = 256 }) else null;
++        g.verify_cache = if (separate) Cache.init(gpa, g.cuda_engine.engine(), .{ .max = 64 }) else null;
+         if (g.verify_cache) |*verify| verify.name = "inkling2 mini shared verify";
+     }
+ 
+diff --git a/zig/src/families/inkling2/modelopt.zig b/zig/src/families/inkling2/modelopt.zig
+index ba5864d..f44a176 100644
+--- a/zig/src/families/inkling2/modelopt.zig
++++ b/zig/src/families/inkling2/modelopt.zig
+@@ -20,6 +20,10 @@ pub fn prefillTcMode() u8 {
+     return S.v.?;
+ }
+ 
++pub fn verifyTcRows() usize {
++    return @import("sys").environment.read(u32, "TF_INKLING2_VERIFY_TC_ROWS", 12) catch 12;
++}
++
+ pub const Projection = struct {
+     codes: u64,
+     scales: u64,
+@@ -60,6 +64,8 @@ pub const Kernels = struct {
+     quant_x_mxfp8: cuda.Function,
+     prompt_tc_nvfp4: cuda.Function,
+     prompt_tc_mxfp8: cuda.Function,
++    verify_tc_nvfp4: cuda.Function,
++    verify_tc_mxfp8: cuda.Function,
+     act: cuda.Function,
+     combine: cuda.Function,
+     resident: usize,
+@@ -79,6 +85,8 @@ pub const Kernels = struct {
+             .quant_x_mxfp8 = try mod.function("tf_ink2moe_quant_x_mxfp8"),
+             .prompt_tc_nvfp4 = try mod.function("tf_ink2moe_prompt_tc_nvfp4"),
+             .prompt_tc_mxfp8 = try mod.function("tf_ink2moe_prompt_tc_mxfp8"),
++            .verify_tc_nvfp4 = try mod.function("tf_ink2moe_verify_tc_nvfp4"),
++            .verify_tc_mxfp8 = try mod.function("tf_ink2moe_verify_tc_mxfp8"),
+             .act = try mod.function("tf_ink2moe_act"),
+             .combine = try mod.function("tf_ink2moe_combine"),
+             .resident = @max(1, try decode.occupancy(128, 0)) * sms,
+@@ -240,7 +248,10 @@ pub fn run(k: *const Kernels, s: cuda.Stream, l: Layer, caps: experts.Caps, x: u
+     const pairs = rows * slots;
+     const b = layout(scratch, rows, slots, hidden, intermediate);
+     const listed = rows >= 32;
+-    const tile: usize = if (listed) 64 else 16;
++    const use_tc = rows >= verifyTcRows() and k.tc_ok and prefillTcMode() != 0 and
++        ((l.format == .nvfp4 and hidden % 64 == 0 and intermediate % 64 == 0) or
++        (l.format == .mxfp8 and hidden % 32 == 0 and intermediate % 32 == 0));
++    const tile: usize = if (rows >= 64 or (!use_tc and listed)) 64 else 16;
+     const item_bound = (pairs + tile - 1) / tile + @min(pairs, @as(usize, l.experts));
+ 
+     var g: cuda.Args = .{};
+@@ -248,10 +259,10 @@ pub fn run(k: *const Kernels, s: cuda.Stream, l: Layer, caps: experts.Caps, x: u
+     for ([_]usize{ rows, slots, l.experts, tile }) |v| g.add(i32d(v));
+     try cuda.launch.launch(k.plan, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 512 } }, s, &g);
+ 
+-    const use_tc = listed and k.tc_ok and prefillTcMode() != 0 and
+-        ((l.format == .nvfp4 and hidden % 64 == 0 and intermediate % 64 == 0) or
+-        (l.format == .mxfp8 and hidden % 32 == 0 and intermediate % 32 == 0));
+-    const tc_fn = if (l.format == .nvfp4) k.prompt_tc_nvfp4 else k.prompt_tc_mxfp8;
++    const tc_fn = if (tile == 64)
++        (if (l.format == .nvfp4) k.prompt_tc_nvfp4 else k.prompt_tc_mxfp8)
++    else
++        (if (l.format == .nvfp4) k.verify_tc_nvfp4 else k.verify_tc_mxfp8);
+     const fn_ = if (listed) k.prompt else k.decode;
+     if (use_tc) {
+         try quantX(k, s, l.format, x, x_stride, rows, hidden, b.x_tc_codes, b.x_tc_scales);
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 931f63c..95c6cc9 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -55,6 +55,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_INKLING2_ATTN_FP8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 packs Mini wq/wk/wv/wo as FP8 qmmf weights)" },
+     .{ .name = "TF_INKLING2_GATE_FP8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 packs Mini gate_attn as FP8 qmmf weights)" },
+     .{ .name = "TF_INKLING2_PREFILL_TC", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 enables Blackwell sm_121a native block-scaled MoE TC prefill)" },
++    .{ .name = "TF_INKLING2_VERIFY_TC_ROWS", .scope = .cuda, .kind = .u32, .min = 1, .max = 64, .forms = "1 to 64 (minimum MoE rows for Blackwell verify TC dispatch; default 12)" },
+     .{ .name = "TF_INKLING2_TOPK_WARP", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 uses the Mini warp router)" },
+     .{ .name = "TF_INKLING2_LAZY_HEAD", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 prunes certified losers in Mini greedy decode)" },
+     .{ .name = "TF_INKLING2_ATTN_FP8_PREFETCH", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 prefetches Mini FP8 KV in decode)" },
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index 0990ad6..0d027ff 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -48,6 +48,7 @@ const valid = [_]Case{
+     .{ .name = "TF_INKLING2_ATTN_FP8", .raw = "1", .n = 1 },
+     .{ .name = "TF_INKLING2_GATE_FP8", .raw = "1", .n = 1 },
+     .{ .name = "TF_INKLING2_PREFILL_TC", .raw = "1", .n = 1 },
++    .{ .name = "TF_INKLING2_VERIFY_TC_ROWS", .raw = "12", .n = 12 },
+     .{ .name = "TF_INKLING2_TOPK_WARP", .raw = "1", .n = 1 },
+     .{ .name = "TF_INKLING2_LAZY_HEAD", .raw = "1", .n = 1 },
+     .{ .name = "TF_INKLING2_ATTN_FP8_PREFETCH", .raw = "1", .n = 1 },
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index 7295f3b..cf826bb 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -176,6 +176,7 @@ pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENS
+         "TF_INKLING2_ATTN_FP8",
+         "TF_INKLING2_GATE_FP8",
+         "TF_INKLING2_PREFILL_TC",
++        "TF_INKLING2_VERIFY_TC_ROWS",
+         "TF_INKLING2_TOPK_WARP",
+         "TF_INKLING2_LAZY_HEAD",
+         "TF_INKLING2_ATTN_FP8_PREFETCH",
+-- 
+2.43.0
+

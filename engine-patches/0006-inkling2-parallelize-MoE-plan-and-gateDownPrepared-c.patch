@@ -1,0 +1,365 @@
+From 5185b43ef4296083f7c4aff7261a0f7a7467e51e Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+Date: Wed, 25 Nov 2026 19:27:33 +0000
+Subject: [PATCH 06/14] inkling2: parallelize MoE plan and gateDownPrepared,
+ cache warm costs, expand verify graph cache, prefetch weights
+
+---
+ zig/kernels/cuda/inkling2/loop_math.cu       | 48 ++++++++++-
+ zig/kernels/cuda/inkling2/modelopt.cu        | 90 +++++++++++++++++---
+ zig/src/families/inkling2/loop_backend.zig   | 90 ++++++++++++++++++++
+ zig/src/families/inkling2/loop_graphs.zig    |  4 +-
+ zig/src/families/inkling2/loop_math_cuda.zig |  4 +-
+ zig/src/families/inkling2/loop_weights.zig   |  2 +
+ zig/src/families/inkling2/modelopt.zig       |  2 +-
+ 7 files changed, 219 insertions(+), 21 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/loop_math.cu b/zig/kernels/cuda/inkling2/loop_math.cu
+index 84266c6..0a5de68 100644
+--- a/zig/kernels/cuda/inkling2/loop_math.cu
++++ b/zig/kernels/cuda/inkling2/loop_math.cu
+@@ -295,7 +295,49 @@ __device__ void gateDown(const float* __restrict__ h, const float* __restrict__
+ 
+ // Reuse the prepared BF16 row, retaining the original gateDown dot and reduction order.
+ __device__ void gateDownPrepared(const uint16_t* __restrict__ prepared, const uint16_t* __restrict__ down,
+-                                 uint16_t* __restrict__ zeta, int c) {
++                                 uint16_t* __restrict__ zeta, int rows, int c) {
++    if (c <= 2304) {
++        __shared__ float sh[8 * 32];
++        __shared__ uint16_t s_src[2 * 4608];
++        const int row0 = static_cast<int>(blockIdx.x) * 2;
++        const int width = 2 * c;
++        const bool has1 = row0 + 1 < rows;
++        const uint16_t* src0 = prepared + static_cast<size_t>(row0) * width;
++        const uint16_t* src1 = prepared + static_cast<size_t>(row0 + 1) * width;
++        for (int i = threadIdx.x; i < width; i += blockDim.x) {
++            s_src[i] = src0[i];
++            if (has1) s_src[width + i] = src1[i];
++        }
++        __syncthreads();
++        for (int r = 0; r < kRank; r += 4) {
++            const uint16_t* d0 = down + static_cast<size_t>(r) * width;
++            const uint16_t* d1 = d0 + width;
++            const uint16_t* d2 = d1 + width;
++            const uint16_t* d3 = d2 + width;
++            float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
++            for (int i = threadIdx.x; i < width; i += blockDim.x) {
++                const float n0 = bf(s_src[i]);
++                const float n1 = has1 ? bf(s_src[width + i]) : 0.0f;
++                const float w0 = bf(d0[i]), w1 = bf(d1[i]), w2 = bf(d2[i]), w3 = bf(d3[i]);
++                acc[0] = __fmaf_rn(w0, n0, acc[0]);
++                acc[1] = __fmaf_rn(w1, n0, acc[1]);
++                acc[2] = __fmaf_rn(w2, n0, acc[2]);
++                acc[3] = __fmaf_rn(w3, n0, acc[3]);
++                acc[4] = __fmaf_rn(w0, n1, acc[4]);
++                acc[5] = __fmaf_rn(w1, n1, acc[5]);
++                acc[6] = __fmaf_rn(w2, n1, acc[6]);
++                acc[7] = __fmaf_rn(w3, n1, acc[7]);
++            }
++            blockSums<8>(acc, sh);
++            if (threadIdx.x == 0) {
++                for (int k = 0; k < 4; ++k) zeta[static_cast<size_t>(row0) * kRank + r + k] = tobf(acc[k]);
++                if (has1) {
++                    for (int k = 0; k < 4; ++k) zeta[static_cast<size_t>(row0 + 1) * kRank + r + k] = tobf(acc[4 + k]);
++                }
++            }
++        }
++        return;
++    }
+     __shared__ float sh[2 * 32];
+     const size_t row = blockIdx.x;
+     const int r = 2 * static_cast<int>(blockIdx.y);
+@@ -380,8 +422,8 @@ extern "C" __global__ void __launch_bounds__(256)
+ 
+ extern "C" __global__ void __launch_bounds__(256)
+     tf_ink2_loop_gate_down_prepared(const uint16_t* __restrict__ prepared, const uint16_t* __restrict__ down,
+-                                  uint16_t* __restrict__ zeta, int c) {
+-    ink2l::gateDownPrepared(prepared, down, zeta, c);
++                                  uint16_t* __restrict__ zeta, int rows, int c) {
++    ink2l::gateDownPrepared(prepared, down, zeta, rows, c);
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(64)
+diff --git a/zig/kernels/cuda/inkling2/modelopt.cu b/zig/kernels/cuda/inkling2/modelopt.cu
+index e3b54f9..ebe644c 100644
+--- a/zig/kernels/cuda/inkling2/modelopt.cu
++++ b/zig/kernels/cuda/inkling2/modelopt.cu
+@@ -463,26 +463,88 @@ __device__ __forceinline__ void prompt_tc_body(const uint8_t* __restrict__ xc, c
+ } // namespace ink2o
+ 
+ // Pair indices are row * slots + slot. Items hold a physical expert ID, a global member offset and a count.
+-extern "C" __global__ void __launch_bounds__(32) tf_ink2moe_plan(const int32_t* __restrict__ pick,
++extern "C" __global__ void __launch_bounds__(512) tf_ink2moe_plan(const int32_t* __restrict__ pick,
+     int* __restrict__ items, int* __restrict__ members, int* __restrict__ item_count,
+     int rows, int slots, int experts, int tile) {
+-  if (blockIdx.x || threadIdx.x) return;
++  if (blockIdx.x) return;
++  __shared__ int counts[512];
++  __shared__ int offsets[512];
++  __shared__ int warp_sums[16];
++  __shared__ int warp_tiles[16];
++  const int tid = threadIdx.x;
++  const int warp = tid >> 5, lane = tid & 31;
++  counts[tid] = 0;
++  __syncthreads();
++
+   const int pairs = rows * slots;
+-  int used = 0, at = 0;
+-  for (int e = 0; e < experts; ++e) {
+-    const int first = used;
+-    for (int pair = 0; pair < pairs; ++pair) {
+-      if (pick[pair] == e) members[used++] = pair;
++  for (int p = tid; p < pairs; p += 512) {
++    const int e = pick[p];
++    if (static_cast<unsigned>(e) < static_cast<unsigned>(experts)) atomicAdd(&counts[e], 1);
++  }
++  __syncthreads();
++
++  const int cnt = tid < experts ? counts[tid] : 0;
++  const int tc = cnt ? ((cnt + tile - 1) / tile) : 0;
++  int c_scan = cnt;
++  int t_scan = tc;
++#pragma unroll
++  for (int off = 1; off < 32; off <<= 1) {
++    const int c_up = __shfl_up_sync(0xffffffffu, c_scan, off);
++    const int t_up = __shfl_up_sync(0xffffffffu, t_scan, off);
++    if (lane >= off) {
++      c_scan += c_up;
++      t_scan += t_up;
++    }
++  }
++  if (lane == 31) {
++    warp_sums[warp] = c_scan;
++    warp_tiles[warp] = t_scan;
++  }
++  __syncthreads();
++
++  if (warp == 0) {
++    const int orig_wc = lane < 16 ? warp_sums[lane] : 0;
++    const int orig_wt = lane < 16 ? warp_tiles[lane] : 0;
++    int wc = orig_wc;
++    int wt = orig_wt;
++#pragma unroll
++    for (int off = 1; off < 16; off <<= 1) {
++      const int wc_up = __shfl_up_sync(0xffffffffu, wc, off);
++      const int wt_up = __shfl_up_sync(0xffffffffu, wt, off);
++      if (lane >= off) {
++        wc += wc_up;
++        wt += wt_up;
++      }
++    }
++    if (lane < 16) {
++      warp_sums[lane] = wc - orig_wc;
++      warp_tiles[lane] = wt - orig_wt;
+     }
+-    const int count = used - first;
+-    for (int off = 0; off < count; off += tile) {
+-      items[3 * at] = e;
+-      items[3 * at + 1] = first + off;
+-      items[3 * at + 2] = (count - off < tile) ? count - off : tile;
+-      ++at;
++  }
++  __syncthreads();
++
++  const int first = (c_scan - cnt) + warp_sums[warp];
++  const int t0 = (t_scan - tc) + warp_tiles[warp];
++  if (tid < experts) {
++    offsets[tid] = first;
++    for (int k = 0; k < tc; ++k) {
++      const int off = k * tile;
++      const int rem = cnt - off;
++      items[3 * (t0 + k)] = tid;
++      items[3 * (t0 + k) + 1] = first + off;
++      items[3 * (t0 + k) + 2] = rem < tile ? rem : tile;
++    }
++  }
++  if (tid == experts - 1) *item_count = t0 + tc;
++  __syncthreads();
++
++  for (int p = tid; p < pairs; p += 512) {
++    const int e = pick[p];
++    if (static_cast<unsigned>(e) < static_cast<unsigned>(experts)) {
++      const int pos = atomicAdd(&offsets[e], 1);
++      members[pos] = p;
+     }
+   }
+-  *item_count = at;
+ }
+ 
+ #define TF_INK2_MOE(NAME, RT, NT)                                                                                     \
+diff --git a/zig/src/families/inkling2/loop_backend.zig b/zig/src/families/inkling2/loop_backend.zig
+index 56d9f89..b939461 100644
+--- a/zig/src/families/inkling2/loop_backend.zig
++++ b/zig/src/families/inkling2/loop_backend.zig
+@@ -77,6 +77,61 @@ pub const Backend = struct {
+ 
+     const be = lanes.backend;
+ 
++    const WarmRecord = extern struct {
++        schema: u32 = 1,
++        priced_width: u32,
++        propose_ms: f64,
++        total_ms: [dspark.depth + 1]f64,
++        verify_ms: [dspark.depth + 1]f64,
++        key: [32]u8,
++        digest: [32]u8,
++
++        fn seal(rec: *WarmRecord) void {
++            std.crypto.hash.sha2.Sha256.hash(std.mem.asBytes(rec)[0..@offsetOf(WarmRecord, "digest")], &rec.digest, .{});
++        }
++
++        fn valid(rec: *const WarmRecord, expected_key: [32]u8, max_w: usize) bool {
++            if (rec.schema != 1 or rec.priced_width != max_w or !std.mem.eql(u8, &rec.key, &expected_key)) return false;
++            if (!std.math.isFinite(rec.propose_ms) or rec.propose_ms < 0) return false;
++            for (0..max_w) |i| {
++                if (!std.math.isFinite(rec.total_ms[i]) or rec.total_ms[i] <= 0) return false;
++                if (!std.math.isFinite(rec.verify_ms[i]) or rec.verify_ms[i] <= 0) return false;
++            }
++            var copy = rec.*;
++            copy.seal();
++            return std.mem.eql(u8, &rec.digest, &copy.digest);
++        }
++    };
++
++    fn warmCacheKey(b: *const Backend, io: std.Io, d: *const draft_runtime.Drafter, lazy: bool) ?[32]u8 {
++        const cap = b.d.currentCapability() catch return null;
++        var cap_buf: [16]u8 = undefined;
++        const cap_str = std.fmt.bufPrint(&cap_buf, "sm{d}", .{cap}) catch return null;
++        var ctx_buf: [24]u8 = undefined;
++        const ctx_str = std.fmt.bufPrint(&ctx_buf, "ctx{d}", .{b.m.context}) catch return null;
++        const attn_str: []const u8 = if (b.m.w.layers.len > 0)
++            if (b.m.w.layers[0].attn.qmmf) |qa| if (qa.wq.mode == .fp8) "attn_fp8" else "attn_bf16" else "attn_raw"
++        else
++            "attn_none";
++        const draft_mode: []const u8 = switch (d.*) {
++            .dflash2 => |df| if (df.w.fp8_layers)
++                if (df.w.base != null) "df_fp8_fp8" else "df_fp8_bf16"
++            else if (df.w.base != null) "df_bf16_fp8" else "df_bf16_bf16",
++            .dspark => "ds",
++        };
++        const parts = [_][]const u8{
++            "inkling2-warm-v1",
++            cap_str,
++            @tagName(d.*),
++            draft_mode,
++            if (lazy) "lazy" else "dense",
++            attn_str,
++            @tagName(b.m.layout.format),
++            ctx_str,
++        };
++        return lanes.cost_cache.key(b.gpa, io, &parts) catch null;
++    }
++
+     pub fn warm(b: *Backend, io: std.Io) !void {
+         var lease: kv.Lease = .{};
+         defer pages.finish(b.m, &lease);
+@@ -103,6 +158,25 @@ pub const Backend = struct {
+         defer b.m.capture_taps = false;
+         const max = @min(b.costs.len, b.m.context);
+         const lazy = d.* == .dflash2 and b.m.lazy_head != null;
++        const cache_key = b.warmCacheKey(io, d, lazy);
++        if (cache_key) |ckey| {
++            if (lanes.cost_cache.load(WarmRecord, b.gpa, io, ckey)) |rec| {
++                if (rec.valid(ckey, max)) {
++                    for (0..max) |idx| {
++                        b.costs[idx] = .{ .width = @intCast(idx + 1), .ms = rec.total_ms[idx] };
++                        b.shared_costs[idx] = .{ .width = @intCast(idx + 1), .ms = rec.verify_ms[idx] };
++                    }
++                    b.propose_ms = rec.propose_ms;
++                    b.priced_width = max;
++                    if (lazy) try g.warm(b.m, b.k, b.s, 1, false, true);
++                    if (max >= 2) try g.warm(b.m, b.k, b.s, max, true, lazy);
++                    try b.m.reset(b.s);
++                    try b.s.synchronize();
++                    std.log.info("Mini CUDA loaded cached window costs ({d} widths, propose {d:.2} ms)", .{ max, b.propose_ms });
++                    return;
++                }
++            }
++        }
+         const samples: usize = if (d.* == .dflash2) 3 else 1;
+         for (1..max + 1) |width| {
+             const verify_ms = try g.price(b.m, b.k, b.s, io, width, lazy, samples);
+@@ -126,6 +200,22 @@ pub const Backend = struct {
+             if (width == 2 or (d.* == .dflash2 and width == max)) b.propose_ms = propose_ms;
+         }
+         b.priced_width = max;
++        if (cache_key) |ckey| {
++            var rec: WarmRecord = .{
++                .priced_width = @intCast(max),
++                .propose_ms = b.propose_ms,
++                .total_ms = @splat(0),
++                .verify_ms = @splat(0),
++                .key = ckey,
++                .digest = undefined,
++            };
++            for (0..max) |idx| {
++                rec.total_ms[idx] = b.costs[idx].ms;
++                rec.verify_ms[idx] = b.shared_costs[idx].ms;
++            }
++            rec.seal();
++            lanes.cost_cache.save(WarmRecord, b.gpa, io, ckey, rec);
++        }
+         d.session(0).reset();
+         try b.m.reset(b.s);
+         try b.s.synchronize();
+diff --git a/zig/src/families/inkling2/loop_graphs.zig b/zig/src/families/inkling2/loop_graphs.zig
+index 48a4924..b3a1c5e 100644
+--- a/zig/src/families/inkling2/loop_graphs.zig
++++ b/zig/src/families/inkling2/loop_graphs.zig
+@@ -15,9 +15,9 @@ pub const Graphs = struct {
+ 
+     pub fn init(g: *Graphs, gpa: std.mem.Allocator, d: *const cuda.Driver, separate: bool) void {
+         g.cuda_engine = .{ .d = d };
+-        g.cache = .init(gpa, g.cuda_engine.engine(), if (separate) .{ .max = 16 } else .{});
++        g.cache = .init(gpa, g.cuda_engine.engine(), if (separate) .{ .max = 64 } else .{});
+         g.cache.name = "inkling2 mini decode";
+-        g.verify_cache = if (separate) Cache.init(gpa, g.cuda_engine.engine(), .{ .max = 32 }) else null;
++        g.verify_cache = if (separate) Cache.init(gpa, g.cuda_engine.engine(), .{ .max = 256 }) else null;
+         if (g.verify_cache) |*verify| verify.name = "inkling2 mini shared verify";
+     }
+ 
+diff --git a/zig/src/families/inkling2/loop_math_cuda.zig b/zig/src/families/inkling2/loop_math_cuda.zig
+index dd7294e..af80c63 100644
+--- a/zig/src/families/inkling2/loop_math_cuda.zig
++++ b/zig/src/families/inkling2/loop_math_cuda.zig
+@@ -151,8 +151,10 @@ pub fn gateDownPrepared(
+ 
+     var b: cuda.Args = .{};
+     for ([_]u64{ prepared, down, zeta }) |v| b.add(v);
++    b.add(int(rows));
+     b.add(int(c));
+-    try go(k.gate_prepared_fn, s, .{ .x = grid, .y = rank / 2 }, 256, &b);
++    const prepared_grid: cuda.Dim3 = if (c <= 2304) .{ .x = @intCast((rows + 1) / 2), .y = 1 } else .{ .x = grid, .y = rank / 2 };
++    try go(k.gate_prepared_fn, s, prepared_grid, 256, &b);
+ }
+ 
+ /// The up half: forget/gain from zeta and the four-step output, 64 columns a block.
+diff --git a/zig/src/families/inkling2/loop_weights.zig b/zig/src/families/inkling2/loop_weights.zig
+index 9975589..601007d 100644
+--- a/zig/src/families/inkling2/loop_weights.zig
++++ b/zig/src/families/inkling2/loop_weights.zig
+@@ -182,6 +182,8 @@ fn controllers(l: *Loader, ck: *core.Checkpoint, c: *const config.Text, i: u32,
+ /// Load every text tensor, including all four controller triplets and both cross-pass query matrices.
+ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, ck: *core.Checkpoint, c: *const config.Config, p: plan_.Plan) !Weights {
+     if (c.text.loop == null) return error.Inkling2LoopRequired;
++    var reading = ck.prefetch("model.llm.", try core.checkpoint.loadReaders());
++    defer _ = reading.join();
+     var formats: [config.max_layers]modelopt.Format = undefined;
+     for (p.layers[0..c.text.layers], 0..) |layer, k| {
+         formats[k] = switch (layer.precision) {
+diff --git a/zig/src/families/inkling2/modelopt.zig b/zig/src/families/inkling2/modelopt.zig
+index fb63add..ba5864d 100644
+--- a/zig/src/families/inkling2/modelopt.zig
++++ b/zig/src/families/inkling2/modelopt.zig
+@@ -246,7 +246,7 @@ pub fn run(k: *const Kernels, s: cuda.Stream, l: Layer, caps: experts.Caps, x: u
+     var g: cuda.Args = .{};
+     for ([_]u64{ pick, b.items, b.members, b.item_count }) |v| g.add(v);
+     for ([_]usize{ rows, slots, l.experts, tile }) |v| g.add(i32d(v));
+-    try cuda.launch.launch(k.plan, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 32 } }, s, &g);
++    try cuda.launch.launch(k.plan, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 512 } }, s, &g);
+ 
+     const use_tc = listed and k.tc_ok and prefillTcMode() != 0 and
+         ((l.format == .nvfp4 and hidden % 64 == 0 and intermediate % 64 == 0) or
+-- 
+2.43.0
+

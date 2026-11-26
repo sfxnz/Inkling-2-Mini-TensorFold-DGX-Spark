@@ -1,0 +1,549 @@
+From 2e64f8b63e920f40b2cc3769d3bda3f0ad2452e4 Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+Date: Wed, 25 Nov 2026 22:28:34 +0000
+Subject: [PATCH 11/14] inkling2: cooperative TC prefill, wide decode MoE, FP8
+ bulk prompt qmmf, and uncached loop_ar
+
+---
+ zig/kernels/cuda/inkling2/modelopt.cu        | 163 ++++++++++++++++++-
+ zig/kernels/cuda/qmmf.cu                     |  11 +-
+ zig/kernels/cuda/qmmf_body.cuh               |   2 +-
+ zig/src/cuda/qmmf.zig                        |  29 +++-
+ zig/src/families/inkling2/loop_math_cuda.zig |  10 +-
+ zig/src/families/inkling2/modelopt.zig       |  42 +++--
+ zig/src/platform/environment.zig             |   1 +
+ zig/src/platform/environment_test.zig        |   1 +
+ 8 files changed, 223 insertions(+), 36 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/modelopt.cu b/zig/kernels/cuda/inkling2/modelopt.cu
+index 5d2c186..738dd5e 100644
+--- a/zig/kernels/cuda/inkling2/modelopt.cu
++++ b/zig/kernels/cuda/inkling2/modelopt.cu
+@@ -270,7 +270,9 @@ __device__ __forceinline__ void body(const __nv_bfloat16* __restrict__ X, int x_
+       }
+ #pragma unroll
+       for (int r = 0; r < RT; ++r) {
+-        if constexpr (NT == NTW)
++        if (up)
++          store<RT, NT>(acc, r, out, up, N, cb * 8 * NT + 2 * t, pr[r][0], pr[r][1], v[r][0], v[r][1]);
++        else if constexpr (NT == NTW)
+           epilogue<3, 1, RT>(acc, r, out, N, cb * COLS + 2 * t, pr[r][0], pr[r][1], v[r][0], v[r][1], 0.f);
+         else
+           store<RT, NT>(acc, r, out, up, N, cb * 8 * NT + 2 * t, pr[r][0], pr[r][1], v[r][0], v[r][1]);
+@@ -489,6 +491,156 @@ __device__ __forceinline__ void prompt_tc_body(const uint8_t* __restrict__ xc, c
+   }
+ }
+ 
++// Cooperative 4-warp BN=128 block-scaled tensor-core GEMM for 64-row prompt tiles: all 4 warps share sx_c/sx_s/s_tok.
++template <int FMT>
++__device__ __forceinline__ void prompt_tc_coop(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc,
++                                               int x_stride, int slots, Weight w, int KG, int NB,
++                                               const int* __restrict__ items, const int* __restrict__ item_count,
++                                               const int* __restrict__ members, void* __restrict__ out, int N,
++                                               int skip) {
++  const int tid = threadIdx.x;
++  const int warp = tid >> 5, lane = tid & 31, gq = lane >> 2, t = lane & 3;
++  const int nb_groups = (NB + 3) >> 2;
++  const int units = __ldg(item_count) * nb_groups;
++  __shared__ __align__(16) uint4 sx_c[2][64][2];
++  __shared__ __align__(16) uint32_t sx_s[2][64];
++  __shared__ __align__(16) uint4 sw_c[2][4][32][2];
++  __shared__ __align__(16) uint32_t sw_s[2][4][32];
++  __shared__ int s_tok[64];
++  const int c_stride = FMT == 0 ? (x_stride >> 1) : x_stride;
++  const int s_stride = FMT == 0 ? (x_stride >> 4) : (x_stride >> 5);
++  const int steps = FMT == 0 ? (KG >> 1) : KG;
++  for (int unit = blockIdx.x; unit < units; unit += gridDim.x) {
++    const int it = unit / nb_groups, cb_grp = unit - it * nb_groups;
++    const int cb = (cb_grp << 2) + warp;
++    const bool valid_cb = cb < NB;
++    const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
++    if (e == skip) continue;
++    const float outer = FMT == 0 ? outer_of(w, e) : 1.0f;
++    bool v[4][2];
++    int pr[4][2];
++#pragma unroll
++    for (int r = 0; r < 4; ++r)
++#pragma unroll
++      for (int h = 0; h < 2; ++h) {
++        const int i = 16 * r + gq + 8 * h;
++        v[r][h] = i < cnt;
++        pr[r][h] = v[r][h] ? __ldg(members + first + i) : 0;
++      }
++    if (tid < 64) {
++      if (tid < cnt) {
++        const int p = __ldg(members + first + tid);
++        s_tok[tid] = slots ? (p / slots) : p;
++      } else {
++        s_tok[tid] = -1;
++      }
++    }
++    __syncthreads();
++    auto load_stage = [&](int s, int g) {
++      {
++        const int rr = tid >> 1, cc = tid & 1;
++        const int tok = s_tok[rr];
++        const int safe_tok = tok >= 0 ? tok : 0;
++        tf_common::cp16z(&sx_c[s][rr][cc],
++                         xc + static_cast<size_t>(safe_tok) * c_stride + static_cast<size_t>(g) * 32 + 16 * cc,
++                         tok >= 0);
++      }
++      if (tid < 64) {
++        const int tok = s_tok[tid];
++        if (tok >= 0) {
++          if constexpr (FMT == 0) {
++            sx_s[s][tid] = __ldg(reinterpret_cast<const uint32_t*>(xsc + static_cast<size_t>(tok) * s_stride + g * 4));
++          } else {
++            sx_s[s][tid] = static_cast<uint32_t>(__ldg(xsc + static_cast<size_t>(tok) * s_stride + g));
++          }
++        } else {
++          sx_s[s][tid] = 0u;
++        }
++      }
++      if (valid_cb) {
++#pragma unroll
++        for (int i = 0; i < 2; ++i) {
++          const int q = lane + 32 * i, lr = q >> 1, cc = q & 1;
++          const long long row = w.row0 + w.row_step * (cb * 32 + lr);
++          const long long z = (e * w.N + row) * w.K + (FMT == 0 ? 64LL : 32LL) * g;
++          tf_common::cp16(&sw_c[s][warp][lr][cc], w.codes + (FMT == 0 ? z / 2 : z) + 16 * cc);
++        }
++        {
++          const long long row = w.row0 + w.row_step * (cb * 32 + lane);
++          const long long z = (e * w.N + row) * w.K + (FMT == 0 ? 64LL : 32LL) * g;
++          if constexpr (FMT == 0) {
++            sw_s[s][warp][lane] = __ldg(reinterpret_cast<const uint32_t*>(w.scales + z / 16));
++          } else {
++            sw_s[s][warp][lane] = static_cast<uint32_t>(__ldg(w.scales + z / 32));
++          }
++        }
++      }
++    };
++    float acc[1][4][4][4];
++#pragma unroll
++    for (int r = 0; r < 4; ++r)
++#pragma unroll
++      for (int j = 0; j < 4; ++j) acc[0][r][j][0] = acc[0][r][j][1] = acc[0][r][j][2] = acc[0][r][j][3] = 0.f;
++    if (steps > 0) {
++      load_stage(0, 0);
++      tf_common::cp_commit();
++    }
++    for (int g = 0; g < steps; ++g) {
++      const int cur = g & 1;
++      if (g + 1 < steps) {
++        load_stage(cur ^ 1, g + 1);
++        tf_common::cp_commit();
++        tf_common::cp_wait<1>();
++      } else {
++        tf_common::cp_wait<0>();
++      }
++      __syncthreads();
++      if (valid_cb) {
++        uint32_t a[4][4], sa[4];
++#pragma unroll
++        for (int r = 0; r < 4; ++r) {
++          const int r0 = 16 * r;
++          const uint32_t* p0 = reinterpret_cast<const uint32_t*>(&sx_c[cur][r0 + gq][0]);
++          const uint32_t* p1 = reinterpret_cast<const uint32_t*>(&sx_c[cur][r0 + gq + 8][0]);
++          a[r][0] = p0[t];
++          a[r][1] = p1[t];
++          a[r][2] = p0[4 + t];
++          a[r][3] = p1[4 + t];
++          sa[r] = (t & 1) ? sx_s[cur][r0 + gq + 8] : sx_s[cur][r0 + gq];
++        }
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++          const uint32_t* wp = reinterpret_cast<const uint32_t*>(&sw_c[cur][warp][8 * j + gq][0]);
++          const uint32_t b0 = wp[t], b1 = wp[4 + t];
++          const uint32_t sb = sw_s[cur][warp][8 * j + gq];
++          if constexpr (FMT == 0) {
++#pragma unroll
++            for (int r = 0; r < 4; ++r) mma4::mma_fp4(acc[0][r][j], a[r], b0, b1, sa[r], sb);
++          } else {
++#pragma unroll
++            for (int r = 0; r < 4; ++r) mma_mxfp8(acc[0][r][j], a[r], b0, b1, sa[r], sb);
++          }
++        }
++      }
++      __syncthreads();
++    }
++    if (valid_cb) {
++      if constexpr (FMT == 0) {
++#pragma unroll
++        for (int r = 0; r < 4; ++r)
++#pragma unroll
++          for (int j = 0; j < 4; ++j)
++#pragma unroll
++            for (int q = 0; q < 4; ++q) acc[0][r][j][q] *= outer;
++      }
++#pragma unroll
++      for (int r = 0; r < 4; ++r)
++        store<4, 4>(acc, r, out, nullptr, N, cb * 32 + 2 * t, pr[r][0], pr[r][1], v[r][0], v[r][1]);
++    }
++    __syncthreads();
++  }
++}
++
+ } // namespace ink2o
+ 
+ // Pair indices are row * slots + slot. Items hold a physical expert ID, a global member offset and a count.
+@@ -588,6 +740,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_ink2moe_up(const __nv_bfloa
+     const int* __restrict__ members, void* __restrict__ out, int N, int skip, void* __restrict__ up) {
+   ink2o::body<1, 4, ink2o::kDecodeTiles>(X, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip, up);
+ }
++extern "C" __global__ void __launch_bounds__(128) tf_ink2moe_up_wide(const __nv_bfloat16* __restrict__ X, int x_stride,
++    int slots, ink2o::Weight w, int KG, int NB, const int* __restrict__ items, const int* __restrict__ item_count,
++    const int* __restrict__ members, void* __restrict__ out, int N, int skip, void* __restrict__ up) {
++  ink2o::body<1, 4, 4>(X, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip, up);
++}
+ TF_INK2_MOE(tf_ink2moe_prompt_up, 4, NTW)
+ extern "C" __global__ void __launch_bounds__(256) tf_ink2moe_act(const __nv_bfloat16* g, const __nv_bfloat16* u, __nv_bfloat16* o, int n, float gc, float uc) {
+   ink2o::act(g, u, o, n, gc, uc);
+@@ -680,7 +837,7 @@ extern "C" __global__ void __launch_bounds__(128)
+                                int slots, ink2o::Weight w, int KG, int NB, const int* __restrict__ items,
+                                const int* __restrict__ item_count, const int* __restrict__ members,
+                                void* __restrict__ out, int N, int skip) {
+-  ink2o::prompt_tc_body<0, 4>(xc, xsc, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip);
++  ink2o::prompt_tc_coop<0>(xc, xsc, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip);
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(128)
+@@ -688,7 +845,7 @@ extern "C" __global__ void __launch_bounds__(128)
+                                int slots, ink2o::Weight w, int KG, int NB, const int* __restrict__ items,
+                                const int* __restrict__ item_count, const int* __restrict__ members,
+                                void* __restrict__ out, int N, int skip) {
+-  ink2o::prompt_tc_body<1, 4>(xc, xsc, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip);
++  ink2o::prompt_tc_coop<1>(xc, xsc, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip);
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(128)
+diff --git a/zig/kernels/cuda/qmmf.cu b/zig/kernels/cuda/qmmf.cu
+index c58b7b1..6c6a4a4 100644
+--- a/zig/kernels/cuda/qmmf.cu
++++ b/zig/kernels/cuda/qmmf.cu
+@@ -45,7 +45,7 @@ struct Tile {
+     static constexpr int S = MODE == FP4 || MODE == FP8G ? BN * 4 : MODE == MXFP8 ? BN * 2 : 0;
+     static constexpr int STAGE = (X + W + S + 127) / 128 * 128;
+     static constexpr int PARTIALS = MT * NT * 4 * THREADS * 4;
+-    static constexpr int BARRIERS = MODE == BF16 && BN > 64 ? 128 : 0;
++    static constexpr int BARRIERS = (MODE == BF16 || MODE == FP8) && BN > 64 ? 128 : 0;
+     static constexpr int SMEM = (STAGES * STAGE > PARTIALS ? STAGES * STAGE : PARTIALS) + BARRIERS;
+ };
+ 
+@@ -239,6 +239,15 @@ BF16_PROMPT(false, true)
+ BF16_PROMPT(true, false)
+ BF16_PROMPT(true, true)
+ #undef BF16_PROMPT
++#define FP8_PROMPT(F32, FUSE) \
++    template __global__ void qmmf_kernel<FP8, 128, 128, 2, 4, 3, F32, false, FUSE>( \
++        const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, \
++        void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
++FP8_PROMPT(false, false)
++FP8_PROMPT(false, true)
++FP8_PROMPT(true, false)
++FP8_PROMPT(true, true)
++#undef FP8_PROMPT
+ 
+ // Unsplit K32 needs no inter-slice partial buffer or bulk-copy barrier storage.
+ struct PromptK32Tile {
+diff --git a/zig/kernels/cuda/qmmf_body.cuh b/zig/kernels/cuda/qmmf_body.cuh
+index 0ff9ecd..f190412 100644
+--- a/zig/kernels/cuda/qmmf_body.cuh
++++ b/zig/kernels/cuda/qmmf_body.cuh
+@@ -8,7 +8,7 @@
+ #ifdef TF_QMMF_STRIDED
+     static_assert(BN == 64 || BN == 32, "a block reads one 64-column tile of words and scales, or its half");
+ #else
+-    static_assert(BN == 64 || BN == 32 || (MODE == BF16 && BN == 128), "packed column tiles");
++    static_assert(BN == 64 || BN == 32 || ((MODE == BF16 || MODE == FP8) && BN == 128), "packed column tiles");
+ #endif
+     extern __shared__ __align__(128) unsigned char buf[];
+     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+diff --git a/zig/src/cuda/qmmf.zig b/zig/src/cuda/qmmf.zig
+index bf22ac8..40c70ac 100644
+--- a/zig/src/cuda/qmmf.zig
++++ b/zig/src/cuda/qmmf.zig
+@@ -153,8 +153,9 @@ fn loadTiles(mod: Module, comptime mode: Mode, comptime wide: bool) ![7]Function
+     return set;
+ }
+ 
+-/// BF16 prompt tile: 128x128, eight warps, three 32 KiB stages and one barrier per stage.
++/// BF16 and FP8 prompt tiles: 128x128, eight warps, three stages and one barrier per stage.
+ pub const prompt_shared: u32 = 3 * (128 + 128) * group * 2 + 128;
++pub const prompt_fp8_shared: u32 = 3 * (128 * group * 2 + 128 * group) + 128;
+ pub const prompt_rows: usize = 512;
+ pub const prompt_k32_shared: u32 = 3 * (128 + 128) * 32 * 2;
+ 
+@@ -168,12 +169,16 @@ pub fn promptBlocks(m: usize, n: usize) usize {
+ }
+ 
+ pub fn promptSymbol(comptime out: Out, comptime fused: bool) [:0]const u8 {
+-    return std.fmt.comptimePrint("_ZN7tf_qmmf11qmmf_kernelILi4ELi128ELi128ELi2ELi4ELi3ELb{d}ELb0ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{ @intFromBool(out == .f32), @intFromBool(fused) });
++    return promptModeSymbol(.bf16, out, fused);
+ }
+ 
+-/// Only large BF16 grids use the prompt tile; the packed allocation contains complete 128-column tiles.
++pub fn promptModeSymbol(comptime mode: Mode, comptime out: Out, comptime fused: bool) [:0]const u8 {
++    return std.fmt.comptimePrint("_ZN7tf_qmmf11qmmf_kernelILi{d}ELi128ELi128ELi2ELi4ELi3ELb{d}ELb0ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{ @backingInt(mode), @intFromBool(out == .f32), @intFromBool(fused) });
++}
++
++/// Large BF16 and FP8 grids use the 128x128 prompt tile; the packed allocation contains complete 128-column tiles.
+ pub fn promptEligible(m: usize, w: Weight) bool {
+-    return m >= prompt_rows and w.mode == .bf16 and w.n >= 128 and
++    return m >= prompt_rows and (w.mode == .bf16 or w.mode == .fp8) and w.n >= 128 and
+         (w.k >= 512 or (w.n == 10240 and w.k == 320)) and w.npad % 128 == 0;
+ }
+ 
+@@ -190,6 +195,7 @@ pub const Lane = struct {
+     fuse_split_n: usize = 0,
+     fuse_s: [2][2][2]Function = undefined, // by halfModeIndex, Out, row tile 16 then 32: the fused form at decode rows
+     prompt: ?[2][2]Function = null, // Out, then plain / fused; loadPrompt() fills it on sm_12x
++    prompt_fp8: ?[2][2]Function = null, // Out, then plain / fused for FP8 weights; loadPrompt() fills it on sm_12x
+     prompt_k32: ?[2]Function = null, // Out; unsplit BF16 prompt calls, loadPrompt() fills it on sm_12x
+     prompt_sms: usize = 0, // the device's SMs: the tile runs when its blocks fill more than half of them
+     clusters: bool, // sm_90 on: slices meet in a cluster's shared memory
+@@ -231,7 +237,7 @@ pub const Lane = struct {
+         return l;
+     }
+ 
+-    /// The BF16 prompt tile on the current device if it is sm_12x; only families that timed their shapes call this.
++    /// The BF16 and FP8 128x128 prompt tiles on the current device if it is sm_12x; only families that timed their shapes call this.
+     pub fn loadPrompt(l: *Lane, d: *const Driver) !void {
+         if ((try d.currentCapability()) / 10 != 12) return;
+         var prompt: [2][2]Function = undefined;
+@@ -240,6 +246,12 @@ pub const Lane = struct {
+             try f.allowDynamicShared(prompt_shared);
+             prompt[oi][fi] = f;
+         };
++        var prompt_fp8: [2][2]Function = undefined;
++        inline for (.{ Out.bf16, Out.f32 }, 0..) |out, oi| inline for (.{ false, true }, 0..) |fused, fi| {
++            const f = try l.mod.function(promptModeSymbol(.fp8, out, fused));
++            try f.allowDynamicShared(prompt_fp8_shared);
++            prompt_fp8[oi][fi] = f;
++        };
+         var k32: [2]Function = undefined;
+         inline for (.{ Out.bf16, Out.f32 }, 0..) |out, oi| {
+             const f = try l.mod.function(promptK32Symbol(out));
+@@ -251,6 +263,7 @@ pub const Lane = struct {
+         var sms: c_int = 0;
+         try d.check(d.api.cuDeviceGetAttribute(&sms, .multiprocessor_count, dev), "cuDeviceGetAttribute");
+         l.prompt = prompt;
++        l.prompt_fp8 = prompt_fp8;
+         l.prompt_k32 = k32;
+         l.prompt_sms = @intCast(@max(sms, 1));
+     }
+@@ -291,7 +304,7 @@ pub const Lane = struct {
+         const set = (if (out == .f32) l.f32_fns else l.fns)[modeIndex(w.mode)];
+         const ti: usize = if (p.bm == 16) 0 else if (p.bm == 32) 1 else 2;
+         const prompt = l.usesPrompt(m, w);
+-        const k32 = prompt and p.sk == 1 and l.prompt_k32 != null;
++        const k32 = prompt and w.mode == .bf16 and p.sk == 1 and l.prompt_k32 != null;
+         const bm: usize = if (prompt) 128 else p.bm;
+         const rows_t = (m + bm - 1) / bm;
+         const hm = halfModeIndex(w.mode);
+@@ -299,7 +312,7 @@ pub const Lane = struct {
+         const fs = l.fuse_split_n != 0 and p.cluster and w.n >= l.fuse_split_n and hm != null;
+         const hn = if (l.half_n != null) @import("qmmf_half.zig").index(w.mode) else null;
+         const half = (hm != null or hn != null) and p.bm == 16 and !p.fused and !fs and rows_t * ((w.n + bn - 1) / bn) * p.sk < l.half_below;
+-        const f = if (k32) l.prompt_k32.?[@backingInt(out)] else if (prompt) l.prompt.?[@backingInt(out)][@intFromBool(p.fused)] else if (half) (if (hm) |i| l.half[i] else l.half_n.?[hn.?])[@backingInt(out)][@intFromBool(p.cluster)] else if (fs) (if (p.bm == 64) set[6] else l.fuse_s[hm.?][@backingInt(out)][@intFromBool(p.bm == 32)]) else if (p.fused) set[6] else set[ti * 2 + @intFromBool(p.cluster)];
++        const f = if (k32) l.prompt_k32.?[@backingInt(out)] else if (prompt) (if (w.mode == .fp8) l.prompt_fp8.? else l.prompt.?)[@backingInt(out)][@intFromBool(p.fused)] else if (half) (if (hm) |i| l.half[i] else l.half_n.?[hn.?])[@backingInt(out)][@intFromBool(p.cluster)] else if (fs) (if (p.bm == 64) set[6] else l.fuse_s[hm.?][@backingInt(out)][@intFromBool(p.bm == 32)]) else if (p.fused) set[6] else set[ti * 2 + @intFromBool(p.cluster)];
+         const cols: usize = if (prompt) 128 else if (half) 32 else bn;
+         const band = @max(1, @min(rows_t, (12 << 20) / (bm * w.k * 2)));
+         var args: launch_.Args = .{};
+@@ -319,7 +332,7 @@ pub const Lane = struct {
+         try launch_.launch(f, .{
+             .grid = .{ .x = @intCast(rows_t * ((w.n + cols - 1) / cols)), .y = 1, .z = if (p.fused or fs) 1 else p.sk },
+             .block = .{ .x = if (prompt) 256 else threads, .y = 1, .z = 1 },
+-            .shared = if (k32) prompt_k32_shared else if (prompt) prompt_shared else if (half) halfShared(w.mode) else sharedBytes(w.mode, p.bm),
++            .shared = if (k32) prompt_k32_shared else if (prompt) (if (w.mode == .fp8) prompt_fp8_shared else prompt_shared) else if (half) halfShared(w.mode) else sharedBytes(w.mode, p.bm),
+             .cluster = if (p.cluster and !fs) .{ .x = 1, .y = 1, .z = p.sk } else null,
+             .pdl = l.pdl and !prompt, // the prompt entries do not wait
+         }, s, &args);
+diff --git a/zig/src/families/inkling2/loop_math_cuda.zig b/zig/src/families/inkling2/loop_math_cuda.zig
+index 764efb7..40abbe7 100644
+--- a/zig/src/families/inkling2/loop_math_cuda.zig
++++ b/zig/src/families/inkling2/loop_math_cuda.zig
+@@ -72,15 +72,7 @@ pub fn ar(k: *const Kernels, s: cuda.Stream, a: ArArgs) !void {
+         return error.Inkling2LoopArShape;
+     var args: cuda.Args = .{};
+     args.add(a);
+-    const c_usize: usize = @intCast(a.c);
+-    const n_blocks: usize = @intCast(a.n_blocks);
+-    const partial_bytes: usize = if (a.partial_bf16 != 0) c_usize * 2 else c_usize * 4;
+-    const smem_bytes: usize = std.mem.alignForward(usize, n_blocks * c_usize * 2, 16) + partial_bytes;
+-    if (smem_bytes <= 46_080) {
+-        try cuda.launch.launch(k.ar_cached_fn, .{ .grid = .{ .x = @intCast(a.rows) }, .block = .{ .x = 512 }, .shared = @intCast(smem_bytes) }, s, &args);
+-    } else {
+-        try go(k.ar_fn, s, .{ .x = @intCast(a.rows) }, 512, &args);
+-    }
++    try go(k.ar_fn, s, .{ .x = @intCast(a.rows) }, 512, &args);
+ }
+ 
+ /// Messages: BF16 banks, even/odd qm/kv FP32 queries/output; row-local q/k/v/mlp, no scratch/position/mask/cache.
+diff --git a/zig/src/families/inkling2/modelopt.zig b/zig/src/families/inkling2/modelopt.zig
+index 7733502..2c5296c 100644
+--- a/zig/src/families/inkling2/modelopt.zig
++++ b/zig/src/families/inkling2/modelopt.zig
+@@ -24,6 +24,10 @@ pub fn verifyTcRows() usize {
+     return @import("sys").environment.read(u32, "TF_INKLING2_VERIFY_TC_ROWS", 32) catch 32;
+ }
+ 
++pub fn wideRows() usize {
++    return @import("sys").environment.read(u32, "TF_INKLING2_WIDE_ROWS", 4) catch 4;
++}
++
+ pub const Projection = struct {
+     codes: u64,
+     scales: u64,
+@@ -59,6 +63,7 @@ pub const Kernels = struct {
+     mod: cuda.Module,
+     plan: cuda.Function,
+     decode: cuda.Function,
++    decode_wide: cuda.Function,
+     prompt: cuda.Function,
+     quant_x_nvfp4: cuda.Function,
+     quant_x_mxfp8: cuda.Function,
+@@ -69,17 +74,20 @@ pub const Kernels = struct {
+     act: cuda.Function,
+     combine: cuda.Function,
+     resident: usize,
++    resident_wide: usize,
+     tc_ok: bool,
+ 
+     pub fn load(d: *const cuda.Driver, sms: usize) !Kernels {
+         var mod = try cuda.Module.load(d, cuda.kernels.inkling2_modelopt);
+         errdefer mod.unload();
+         const decode = try mod.function("tf_ink2moe_up");
++        const decode_wide = try mod.function("tf_ink2moe_up_wide");
+         const cap = try d.currentCapability();
+         return .{
+             .mod = mod,
+             .plan = try mod.function("tf_ink2moe_plan"),
+             .decode = decode,
++            .decode_wide = decode_wide,
+             .prompt = try mod.function("tf_ink2moe_prompt_up"),
+             .quant_x_nvfp4 = try mod.function("tf_ink2moe_quant_x_nvfp4"),
+             .quant_x_mxfp8 = try mod.function("tf_ink2moe_quant_x_mxfp8"),
+@@ -90,6 +98,7 @@ pub const Kernels = struct {
+             .act = try mod.function("tf_ink2moe_act"),
+             .combine = try mod.function("tf_ink2moe_combine"),
+             .resident = @max(1, try decode.occupancy(128, 0)) * sms,
++            .resident_wide = @max(1, try decode_wide.occupancy(128, 0)) * sms,
+             .tc_ok = cap == 120 or cap == 121,
+         };
+     }
+@@ -177,14 +186,15 @@ pub fn weight(p: Projection, l: Layer, row0: i32, row_step: i32) Weight {
+     };
+ }
+ 
+-/// Output columns a decode warp of tf_ink2moe_up owns (modelopt.cu kDecodeTiles n8 tiles); the prompt kernel owns 32.
++/// Output columns a decode warp of tf_ink2moe_up owns (modelopt.cu kDecodeTiles n8 tiles); wide decode and prompt kernels own 32.
+ const decode_columns: usize = 8;
+ 
+ /// `up` (decode only): w is w13 in row order, gate rows to `out` and up rows to `up`.
+-fn projection(s: cuda.Stream, fn_: cuda.Function, prompt: bool, resident: usize, x: u64, x_stride: usize, slots: usize, w: Weight, items: u64, item_count: u64, members: u64, out: u64, up: u64, item_bound: usize) !void {
++fn projection(s: cuda.Stream, fn_: cuda.Function, prompt: bool, wide: bool, resident: usize, x: u64, x_stride: usize, slots: usize, w: Weight, items: u64, item_count: u64, members: u64, out: u64, up: u64, item_bound: usize) !void {
+     const kg: usize = @intCast(@divExact(w.k, 32));
+     const outputs: usize = @intCast(if (w.row_step == 2) @divExact(w.n, 2) else w.n);
+-    const nb = outputs / if (prompt) @as(usize, 32) else decode_columns;
++    const cols: usize = if (prompt or wide) 32 else decode_columns;
++    const nb = outputs / cols;
+     var a: cuda.Args = .{};
+     a.add(x);
+     a.add(i32d(x_stride));
+@@ -218,7 +228,7 @@ fn quantX(k: *const Kernels, s: cuda.Stream, format: Format, x: u64, x_stride: u
+     try cuda.launch.launch(fn_, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &a);
+ }
+ 
+-fn projectionTc(s: cuda.Stream, fn_: cuda.Function, xc: u64, xsc: u64, x_stride: usize, slots: usize, w: Weight, items: u64, item_count: u64, members: u64, out: u64, item_bound: usize) !void {
++fn projectionTc(s: cuda.Stream, fn_: cuda.Function, coop: bool, xc: u64, xsc: u64, x_stride: usize, slots: usize, w: Weight, items: u64, item_count: u64, members: u64, out: u64, item_bound: usize) !void {
+     const kg: usize = @intCast(@divExact(w.k, 32));
+     const outputs: usize = @intCast(if (w.row_step == 2) @divExact(w.n, 2) else w.n);
+     const nb = outputs / 32;
+@@ -233,7 +243,7 @@ fn projectionTc(s: cuda.Stream, fn_: cuda.Function, xc: u64, xsc: u64, x_stride:
+     for ([_]u64{ items, item_count, members, out }) |v| a.add(v);
+     a.add(i32d(outputs));
+     a.add(@as(i32, -1));
+-    const grid = (item_bound * nb + 3) / 4;
++    const grid = if (coop) item_bound * ((nb + 3) / 4) else (item_bound * nb + 3) / 4;
+     if (grid == 0) return;
+     try cuda.launch.launch(fn_, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &a);
+ }
+@@ -251,6 +261,8 @@ pub fn run(k: *const Kernels, s: cuda.Stream, l: Layer, caps: experts.Caps, x: u
+     const use_tc = rows >= verifyTcRows() and k.tc_ok and prefillTcMode() != 0 and
+         ((l.format == .nvfp4 and hidden % 64 == 0 and intermediate % 64 == 0) or
+         (l.format == .mxfp8 and hidden % 32 == 0 and intermediate % 32 == 0));
++    const wr = wideRows();
++    const wide = !use_tc and !listed and wr > 0 and rows >= wr and hidden % 32 == 0 and intermediate % 32 == 0;
+     const tile: usize = if (rows >= 32) 64 else 16;
+     const item_bound = (pairs + tile - 1) / tile + @min(pairs, @as(usize, l.experts));
+ 
+@@ -259,20 +271,22 @@ pub fn run(k: *const Kernels, s: cuda.Stream, l: Layer, caps: experts.Caps, x: u
+     for ([_]usize{ rows, slots, l.experts, tile }) |v| g.add(i32d(v));
+     try cuda.launch.launch(k.plan, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 512 } }, s, &g);
+ 
+-    const tc_fn = if (tile == 64)
++    const tc_coop = tile == 64;
++    const tc_fn = if (tc_coop)
+         (if (l.format == .nvfp4) k.prompt_tc_nvfp4 else k.prompt_tc_mxfp8)
+     else
+         (if (l.format == .nvfp4) k.verify_tc_nvfp4 else k.verify_tc_mxfp8);
+-    const fn_ = if (listed) k.prompt else k.decode;
++    const fn_ = if (listed) k.prompt else if (wide) k.decode_wide else k.decode;
++    const resident = if (wide) k.resident_wide else k.resident;
+     if (use_tc) {
+         try quantX(k, s, l.format, x, x_stride, rows, hidden, b.x_tc_codes, b.x_tc_scales);
+-        try projectionTc(s, tc_fn, b.x_tc_codes, b.x_tc_scales, hidden, slots, weight(l.w13, l, 0, 2), b.items, b.item_count, b.members, b.gate, item_bound);
+-        try projectionTc(s, tc_fn, b.x_tc_codes, b.x_tc_scales, hidden, slots, weight(l.w13, l, 1, 2), b.items, b.item_count, b.members, b.up, item_bound);
++        try projectionTc(s, tc_fn, tc_coop, b.x_tc_codes, b.x_tc_scales, hidden, slots, weight(l.w13, l, 0, 2), b.items, b.item_count, b.members, b.gate, item_bound);
++        try projectionTc(s, tc_fn, tc_coop, b.x_tc_codes, b.x_tc_scales, hidden, slots, weight(l.w13, l, 1, 2), b.items, b.item_count, b.members, b.up, item_bound);
+     } else if (listed) {
+-        try projection(s, fn_, true, k.resident, x, x_stride, slots, weight(l.w13, l, 0, 2), b.items, b.item_count, b.members, b.gate, 0, item_bound);
+-        try projection(s, fn_, true, k.resident, x, x_stride, slots, weight(l.w13, l, 1, 2), b.items, b.item_count, b.members, b.up, 0, item_bound);
++        try projection(s, fn_, true, false, resident, x, x_stride, slots, weight(l.w13, l, 0, 2), b.items, b.item_count, b.members, b.gate, 0, item_bound);
++        try projection(s, fn_, true, false, resident, x, x_stride, slots, weight(l.w13, l, 1, 2), b.items, b.item_count, b.members, b.up, 0, item_bound);
+     } else {
+-        try projection(s, fn_, false, k.resident, x, x_stride, slots, weight(l.w13, l, 0, 1), b.items, b.item_count, b.members, b.gate, b.up, item_bound);
++        try projection(s, fn_, false, wide, resident, x, x_stride, slots, weight(l.w13, l, 0, 1), b.items, b.item_count, b.members, b.gate, b.up, item_bound);
+     }
+ 
+     var aa: cuda.Args = .{};
+@@ -283,9 +297,9 @@ pub fn run(k: *const Kernels, s: cuda.Stream, l: Layer, caps: experts.Caps, x: u
+     try cuda.launch.launch(k.act, .{ .grid = .{ .x = @intCast((pairs * intermediate + 255) / 256), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &aa);
+     if (use_tc) {
+         try quantX(k, s, l.format, b.act, intermediate, pairs, intermediate, b.x_tc_codes, b.x_tc_scales);
+-        try projectionTc(s, tc_fn, b.x_tc_codes, b.x_tc_scales, intermediate, 0, weight(l.w2, l, 0, 1), b.items, b.item_count, b.members, b.down, item_bound);
++        try projectionTc(s, tc_fn, tc_coop, b.x_tc_codes, b.x_tc_scales, intermediate, 0, weight(l.w2, l, 0, 1), b.items, b.item_count, b.members, b.down, item_bound);
+     } else {
+-        try projection(s, fn_, listed, k.resident, b.act, intermediate, 0, weight(l.w2, l, 0, 1), b.items, b.item_count, b.members, b.down, 0, item_bound);
++        try projection(s, fn_, listed, wide, resident, b.act, intermediate, 0, weight(l.w2, l, 0, 1), b.items, b.item_count, b.members, b.down, 0, item_bound);
+     }
+ 
+     var ca: cuda.Args = .{};
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 333db11..5a83602 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -56,6 +56,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_INKLING2_GATE_FP8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 packs Mini gate_attn as FP8 qmmf weights)" },
+     .{ .name = "TF_INKLING2_PREFILL_TC", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 enables Blackwell sm_121a native block-scaled MoE TC prefill)" },
+     .{ .name = "TF_INKLING2_VERIFY_TC_ROWS", .scope = .cuda, .kind = .u32, .min = 1, .max = 64, .forms = "1 to 64 (minimum MoE rows for Blackwell verify TC dispatch; default 32)" },
++    .{ .name = "TF_INKLING2_WIDE_ROWS", .scope = .cuda, .kind = .u32, .min = 0, .max = 64, .forms = "0 to 64 (minimum MoE rows for 32-col wide decode dispatch, 0 disables; default 4)" },
+     .{ .name = "TF_INKLING2_TOPK_WARP", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 uses the Mini warp router)" },
+     .{ .name = "TF_INKLING2_LAZY_HEAD", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 prunes certified losers in Mini greedy decode)" },
+     .{ .name = "TF_INKLING2_ATTN_FP8_PREFETCH", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 prefetches Mini FP8 KV in decode)" },
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index 821094b..38c496c 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -49,6 +49,7 @@ const valid = [_]Case{
+     .{ .name = "TF_INKLING2_GATE_FP8", .raw = "1", .n = 1 },
+     .{ .name = "TF_INKLING2_PREFILL_TC", .raw = "1", .n = 1 },
+     .{ .name = "TF_INKLING2_VERIFY_TC_ROWS", .raw = "32", .n = 32 },
++    .{ .name = "TF_INKLING2_WIDE_ROWS", .raw = "4", .n = 4 },
+     .{ .name = "TF_INKLING2_TOPK_WARP", .raw = "1", .n = 1 },
+     .{ .name = "TF_INKLING2_LAZY_HEAD", .raw = "1", .n = 1 },
+     .{ .name = "TF_INKLING2_ATTN_FP8_PREFETCH", .raw = "1", .n = 1 },
+-- 
+2.43.0
+

@@ -1,0 +1,110 @@
+Inkling-2-Mini-TensorFold-DGX-Spark
+Copyright 2026 sfxnz
+https://github.com/sfxnz/Inkling-2-Mini-TensorFold-DGX-Spark
+
+This repository's scripts, evaluation harness, Dockerfiles, and engine patch
+series are licensed under the Apache License, Version 2.0 (see LICENSE).
+
+================================================================================
+1. engine-patches/ (Apache License, Version 2.0)
+================================================================================
+
+Patch series (0001..0014, listed in engine-patches/series) against
+ashhart/TensorFold at tag v1.3.5 (tag OID d6b3be891b5fb539a705d9d3b5279008045900e8,
+commit 02b324ae9767253d9911d753d5c835a5070eed1b; engine-patches/BASE).
+
+-- TensorFold (https://github.com/ashhart/TensorFold) --------------------------
+Copyright 2026 TensorFold contributors. Licensed under the Apache License, Version 2.0
+(code prior to 0.6.0 retains its MIT notice in TensorFold's LICENSES/MIT.txt;
+third-party notices ship inside the release archive's THIRD_PARTY_NOTICES.md).
+
+TensorFold's NOTICE reads:
+    TensorFold
+    Copyright 2026 TensorFold contributors
+    https://github.com/ashhart/TensorFold
+
+    TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.0.
+    Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
+    MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
+    THIRD_PARTY_NOTICES.md.
+
+Upstream TensorFold v1.3.5 contributors whose Inkling-2-Mini and CUDA runtime
+work underpins this series include Ash Hart (ashhart), Jurgen Schmied
+(#4364, #4365, #4387, #4441, #4640, #4697, #4728, #4729), ajensenwaud
+(#4124-#4128), BlivionIaG (#4337, #4704), sethforprivacy (#4447), gilby, and
+akol1 (#4274).
+
+-- Maxrio9/TensorFold (https://github.com/Maxrio9/TensorFold) ------------------
+Branch inkling2-mini-exl3-v2, commit 353717987a736b47f87039c89cfa675c820506c7.
+Licensed under the Apache License, Version 2.0 (pre-0.6.0 code MIT).
+Ported and adapted onto v1.3.5 loop_engine / cuda_native in engine-patches/:
+- Shared paged FP8 KV pool (loop_pages.zig, kv_fp8.cuh, LRU prompt radix cache,
+  1M context cap, cuda_mini_capacity.zig).
+- Native DFlash2 CUDA drafter, FP8 drafter weights, and borrowed FP8 lazy head.
+- CUDA decode and shared verify graphs (loop_graphs.zig), lazy head
+  (loop_lazy_head.zig), native CUDA vision wiring (mini_vision.zig), and
+  masked structured output / tool-choice grammar (loop_masked_draw.zig).
+
+-- MiaAI-Lab (https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold) -
+Commit 9e3cf20b76e0140bebbbe6ed13f6e3a00e881f12. Licensed under the Apache License, Version 2.0.
+Ported, adapted, or used as design inspiration in engine-patches/:
+- TF_INKLING2_ATTN_FP8=1 FP8 attention projections via cuda.qmmf.Lane (from Mia 0012).
+- TF_INKLING2_PREFILL_TC=1 Blackwell native FP4/MXFP8 tensor-core MoE prefill
+  and 4096-row prompt chunks (from Mia 0015 / 0009 / 0011).
+- Lazy head, CUDA vision, DFlash2 calibrated chances, and server/prompt fixes.
+
+-- tonyd2wild (https://github.com/tonyd2wild/Inkling-2-Mini-NVFP4-DGX-Spark) ---
+Commit 2fe0eb57429013c0ccb1c6535339ae61a9e44d9a.
+MIT License (root and dflash2/), Apache-2.0 (tensorfold/).
+- Referenced for NVFP4 draft-head quantization (fp4Of), calibrated lone-stream
+  chances, and batched DFlash2 kernel layout concepts.
+
+-- sxuff (https://github.com/sxuff/inkling-2-mini-spark) -----------------------
+Commit 35a4fd8344f01148d35c899cc107aab0c537ce3d. Licensed under the Apache License, Version 2.0.
+- Referenced for eager safetensors loading and benchmark framing insights.
+
+-- DFlash (https://github.com/z-lab/dflash) ------------------------------------
+Jian Chen, Yesheng Liang, Zhijian Liu (z-lab). MIT License.
+- Block-diffusion speculative decoding algorithm implemented by the drafter.
+
+-- sfxnz modifications (Apache License, Version 2.0 in engine-patches/) --------
+Commits and patches 0001..0014:
+- Rebasing and unifying paged FP8 KV, DFlash2, CUDA vision, lazy head, CUDA
+  graphs, and structured output onto TensorFold v1.3.5.
+- Parallelized 512-thread tf_ink2moe_plan, persistent window cost_cache,
+  bounded verify_cache, and multi-threaded checkpoint prefetch.
+- Batched DFlash2 absorb + 5-layer propose across active concurrent streams
+  with graphed absorb/block/selector and dynamic shared draft guard.
+- 8x-tiled gateUp, cp.async prompt_tc, TF_INKLING2_GATE_FP8=1, Blackwell RT
+  verify TC MoE, zero-copy pool prefix_cache with batched tf_ink2_copy_spans,
+  8-warp 2x4 prompt_tc_coop, and tf_ink2moe_up_wide for multi-row verify.
+
+================================================================================
+2. Not included (fetched separately by each user under their own terms)
+================================================================================
+
+- thinkingmachines/Inkling-2-Mini at commit c9d028302cd0f035fdf8e7e91f089a4ce94d2195
+  (Apache-2.0 plus Thinking Machines Model AUP,
+  https://huggingface.co/thinkingmachines/Inkling-2-Mini). Mounted read-only.
+- incoai/Inkling-2-Mini-DFlash2 at commit 4f9088ea66c21f2b99ed657d1941c306b03e84d2
+  (Apache-2.0, https://huggingface.co/incoai/Inkling-2-Mini-DFlash2). Mounted read-only.
+- TensorFold v1.3.5 Linux aarch64 release archive
+  (tensorfold-1.3.5-linux-aarch64.tar.gz, sha256
+  9223b9fd3d1ab1b3f1a3493990533a2ca41f18404a882e872221fc94487ad65f, Apache-2.0,
+  https://github.com/ashhart/TensorFold/releases/tag/v1.3.5). Its LICENSES/
+  and THIRD_PARTY_NOTICES.md ship inside the archive.
+- xgrammar v0.2.8 (Apache-2.0, https://github.com/mlc-ai/xgrammar, commit
+  97787376faee5ed8466cfad57c99855e4ce2f6aa), dlpack (Apache-2.0,
+  https://github.com/dmlc/dlpack), and picojson (BSD-2-Clause), backing
+  libtfgrammar.so.
+- libjpeg-turbo 3.1.4.1 (IJG / BSD-3-Clause / zlib,
+  sha256 d3f9d7ddd998758e1850b37153a7904bdcdeb8cf54a782c772780b0bc50dd553) and
+  libwebp 1.6.0 (BSD-3-Clause,
+  sha256 e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564).
+- Zig 0.17.0 (MIT, https://ziglang.org,
+  sha256 9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8),
+  build-time compiler only.
+- NVIDIA CUDA base and devel images
+  (nvidia/cuda:13.0.0-base-ubuntu24.04@sha256:6e43a6b02e5f16e4a715953be8b29c40acbe84aed11a61357ef0fc899967fbd9
+  and nvidia/cuda:13.0.0-devel-ubuntu24.04, plus libcublas-13-0), governed by
+  the NVIDIA Software License Agreement.

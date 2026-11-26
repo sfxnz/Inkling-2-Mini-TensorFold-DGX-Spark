@@ -1,0 +1,837 @@
+From 3658f55ed05d982f6eddbd194f28582b276f0871 Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@spark1.tail1a9513.ts.net>
+Date: Wed, 25 Nov 2026 17:23:18 +0000
+Subject: [PATCH 03/14] inkling2: add qmmf attention projections, ATTN_FP8
+ opt-in, and sm_121a TC prefill
+
+---
+ zig/build/cuda_kernels.zig                 |   2 +-
+ zig/kernels/cuda/inkling2/modelopt.cu      | 239 ++++++++++++++++++++-
+ zig/kernels/cuda/inkling2/ops.cu           |  16 ++
+ zig/src/families/inkling2/loop_engine.zig  |  60 ++----
+ zig/src/families/inkling2/loop_kernels.zig |  73 +++++++
+ zig/src/families/inkling2/loop_scratch.zig |   1 +
+ zig/src/families/inkling2/loop_weights.zig |  88 +++++++-
+ zig/src/families/inkling2/modelopt.zig     |  97 ++++++++-
+ zig/src/families/inkling2/ops.zig          |  14 ++
+ 9 files changed, 538 insertions(+), 52 deletions(-)
+ create mode 100644 zig/src/families/inkling2/loop_kernels.zig
+
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 3d16874..72a3431 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -169,7 +169,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "ricursive", .flags = glue }, // ours: Ripple's glue (embed, add-norms, output gate, FFN activation), glue.metal step for step
+     .{ .name = "ricursive_prep", .flags = glue }, // ours: Ripple's attention prep (q/k head norms, RoPE, K and V into rings or pages)
+     .{ .name = "inkling2_experts", .src = "inkling2/experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // ours: Inkling 2's grouped experts
+-    .{ .name = "inkling2_modelopt", .src = "inkling2/modelopt", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // Mini packed experts on BF16 activations
++    .{ .name = "inkling2_modelopt", .src = "inkling2/modelopt", .flags = &.{ "-O3", "--expt-relaxed-constexpr" }, .arch_specific = true }, // Mini packed experts on BF16 activations and sm_121a TC prefill
+     .{ .name = "inkling2_loop_math", .src = "inkling2/loop_math", .flags = &.{"-O3"} }, // Mini residuals, cross-pass messages, gates and split QKV
+     .{ .name = "inkling2_vision", .src = "inkling2/vision", .flags = glue }, // ours: Inkling 2's vision tower glue and attention
+     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
+diff --git a/zig/kernels/cuda/inkling2/modelopt.cu b/zig/kernels/cuda/inkling2/modelopt.cu
+index 4533a93..e3b54f9 100644
+--- a/zig/kernels/cuda/inkling2/modelopt.cu
++++ b/zig/kernels/cuda/inkling2/modelopt.cu
+@@ -1,7 +1,10 @@
+-// Mini routed experts: checkpoint NVFP4/MXFP8 codes decode to BF16 mma fragments; no activation quantization.
++// Mini routed experts: checkpoint NVFP4/MXFP8 codes decode to BF16 mma fragments, plus optional sm_121a TC prefill.
+ #include <cuda_bf16.h>
++#include <cuda_fp8.h>
+ #include <stdint.h>
+ #include "experts.cuh"
++#include "../mma4.cuh"
++#include "../nvfp4q.cuh"
+ 
+ namespace ink2o {
+ 
+@@ -317,6 +320,146 @@ __device__ __forceinline__ void combine(const int32_t* __restrict__ pick, const
+   out[i] = __float2bfloat16_rn(total);
+ }
+ 
++#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
++__device__ __forceinline__ void mma_mxfp8(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1,
++                                          uint32_t sfa, uint32_t sfb) {
++  const uint16_t z = 0;
++  asm volatile(
++      "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
++      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
++      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1),
++        "r"(sfa), "h"(z), "h"(z), "r"(sfb), "h"(z), "h"(z));
++}
++#else
++__device__ __forceinline__ void mma_mxfp8(float (&)[4], const uint32_t (&)[4], uint32_t, uint32_t, uint32_t,
++                                          uint32_t) {
++  __trap();
++}
++#endif
++
++// Blackwell native block-scaled tensor-core prompt GEMM over ModelOpt row-major checkpoint weights.
++template <int FMT>
++__device__ __forceinline__ void prompt_tc_body(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc,
++                                               int x_stride, int slots, Weight w, int KG, int NB,
++                                               const int* __restrict__ items, const int* __restrict__ item_count,
++                                               const int* __restrict__ members, void* __restrict__ out, int N,
++                                               int skip) {
++  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
++  const int units = __ldg(item_count) * NB;
++  __shared__ __align__(16) uint4 sx_c[4][64][2];
++  __shared__ __align__(16) uint32_t sx_s[4][64];
++  __shared__ __align__(16) uint4 sw_c[4][32][2];
++  __shared__ __align__(16) uint32_t sw_s[4][32];
++  const int c_stride = FMT == 0 ? (x_stride >> 1) : x_stride;
++  const int s_stride = FMT == 0 ? (x_stride >> 4) : (x_stride >> 5);
++  const int steps = FMT == 0 ? (KG >> 1) : KG;
++  for (int unit = blockIdx.x * 4 + warp; unit < units; unit += gridDim.x * 4) {
++    const int it = unit / NB, cb = unit - it * NB;
++    const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
++    if (e == skip) continue;
++    const float outer = FMT == 0 ? outer_of(w, e) : 1.0f;
++    bool v[4][2];
++    int pr[4][2];
++#pragma unroll
++    for (int r = 0; r < 4; ++r)
++#pragma unroll
++      for (int h = 0; h < 2; ++h) {
++        const int i = 16 * r + gq + 8 * h;
++        v[r][h] = i < cnt;
++        pr[r][h] = v[r][h] ? __ldg(members + first + i) : 0;
++      }
++    float acc[1][4][4][4];
++#pragma unroll
++    for (int r = 0; r < 4; ++r)
++#pragma unroll
++      for (int j = 0; j < 4; ++j) acc[0][r][j][0] = acc[0][r][j][1] = acc[0][r][j][2] = acc[0][r][j][3] = 0.f;
++    for (int g = 0; g < steps; ++g) {
++#pragma unroll
++      for (int i = 0; i < 4; ++i) {
++        const int q = lane + 32 * i, rr = q >> 1, cc = q & 1;
++        if (rr < cnt) {
++          const int p = __ldg(members + first + rr);
++          const int tok = slots ? p / slots : p;
++          sx_c[warp][rr][cc] = __ldg(reinterpret_cast<const uint4*>(xc + static_cast<size_t>(tok) * c_stride +
++                                                                    static_cast<size_t>(g) * 32 + 16 * cc));
++        } else {
++          sx_c[warp][rr][cc] = make_uint4(0u, 0u, 0u, 0u);
++        }
++      }
++#pragma unroll
++      for (int i = 0; i < 2; ++i) {
++        const int rr = lane + 32 * i;
++        if (rr < cnt) {
++          const int p = __ldg(members + first + rr);
++          const int tok = slots ? p / slots : p;
++          if constexpr (FMT == 0) {
++            sx_s[warp][rr] = __ldg(reinterpret_cast<const uint32_t*>(xsc + static_cast<size_t>(tok) * s_stride + g * 4));
++          } else {
++            sx_s[warp][rr] = static_cast<uint32_t>(__ldg(xsc + static_cast<size_t>(tok) * s_stride + g));
++          }
++        } else {
++          sx_s[warp][rr] = 0u;
++        }
++      }
++#pragma unroll
++      for (int i = 0; i < 2; ++i) {
++        const int q = lane + 32 * i, lr = q >> 1, cc = q & 1;
++        const long long row = w.row0 + w.row_step * (cb * 32 + lr);
++        const long long z = (e * w.N + row) * w.K + (FMT == 0 ? 64LL : 32LL) * g;
++        sw_c[warp][lr][cc] = __ldg(reinterpret_cast<const uint4*>(w.codes + (FMT == 0 ? z / 2 : z) + 16 * cc));
++      }
++      {
++        const long long row = w.row0 + w.row_step * (cb * 32 + lane);
++        const long long z = (e * w.N + row) * w.K + (FMT == 0 ? 64LL : 32LL) * g;
++        if constexpr (FMT == 0) {
++          sw_s[warp][lane] = __ldg(reinterpret_cast<const uint32_t*>(w.scales + z / 16));
++        } else {
++          sw_s[warp][lane] = static_cast<uint32_t>(__ldg(w.scales + z / 32));
++        }
++      }
++      __syncwarp();
++      uint32_t a[4][4], sa[4];
++#pragma unroll
++      for (int r = 0; r < 4; ++r) {
++        const int r0 = 16 * r;
++        const uint32_t* p0 = reinterpret_cast<const uint32_t*>(&sx_c[warp][r0 + gq][0]);
++        const uint32_t* p1 = reinterpret_cast<const uint32_t*>(&sx_c[warp][r0 + gq + 8][0]);
++        a[r][0] = p0[t];
++        a[r][1] = p1[t];
++        a[r][2] = p0[4 + t];
++        a[r][3] = p1[4 + t];
++        sa[r] = (t & 1) ? sx_s[warp][r0 + gq + 8] : sx_s[warp][r0 + gq];
++      }
++#pragma unroll
++      for (int j = 0; j < 4; ++j) {
++        const uint32_t* wp = reinterpret_cast<const uint32_t*>(&sw_c[warp][8 * j + gq][0]);
++        const uint32_t b0 = wp[t], b1 = wp[4 + t];
++        const uint32_t sb = sw_s[warp][8 * j + gq];
++        if constexpr (FMT == 0) {
++#pragma unroll
++          for (int r = 0; r < 4; ++r) mma4::mma_fp4(acc[0][r][j], a[r], b0, b1, sa[r], sb);
++        } else {
++#pragma unroll
++          for (int r = 0; r < 4; ++r) mma_mxfp8(acc[0][r][j], a[r], b0, b1, sa[r], sb);
++        }
++      }
++      __syncwarp();
++    }
++    if constexpr (FMT == 0) {
++#pragma unroll
++      for (int r = 0; r < 4; ++r)
++#pragma unroll
++        for (int j = 0; j < 4; ++j)
++#pragma unroll
++          for (int q = 0; q < 4; ++q) acc[0][r][j][q] *= outer;
++    }
++#pragma unroll
++    for (int r = 0; r < 4; ++r)
++      store<4, 4>(acc, r, out, nullptr, N, cb * 32 + 2 * t, pr[r][0], pr[r][1], v[r][0], v[r][1]);
++  }
++}
++
+ } // namespace ink2o
+ 
+ // Pair indices are row * slots + slot. Items hold a physical expert ID, a global member offset and a count.
+@@ -362,3 +505,97 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2moe_combine(const int32
+     __nv_bfloat16* o, int rows, int hidden, int slots, int experts) {
+   ink2o::combine(p, w, e, o, rows, hidden, slots, experts);
+ }
++
++extern "C" __global__ void __launch_bounds__(256)
++    tf_ink2moe_quant_x_nvfp4(const __nv_bfloat16* __restrict__ X, int x_stride, int M, int K,
++                             uint8_t* __restrict__ codes, uint8_t* __restrict__ scales) {
++  const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
++  const int kb = K >> 4;
++  if (idx >= static_cast<long long>(M) * kb) return;
++  const int row = static_cast<int>(idx / kb), blk = static_cast<int>(idx % kb);
++  const __nv_bfloat16* src = X + static_cast<size_t>(row) * x_stride + blk * 16;
++  const uint4 v0 = *reinterpret_cast<const uint4*>(src);
++  const uint4 v1 = *reinterpret_cast<const uint4*>(src + 8);
++  const __nv_bfloat162* p0 = reinterpret_cast<const __nv_bfloat162*>(&v0);
++  const __nv_bfloat162* p1 = reinterpret_cast<const __nv_bfloat162*>(&v1);
++  float f[16];
++  float amax = 0.f;
++#pragma unroll
++  for (int i = 0; i < 4; ++i) {
++    const float2 a = __bfloat1622float2(p0[i]);
++    const float2 b = __bfloat1622float2(p1[i]);
++    f[2 * i] = a.x;
++    f[2 * i + 1] = a.y;
++    f[8 + 2 * i] = b.x;
++    f[8 + 2 * i + 1] = b.y;
++    amax = fmaxf(amax, fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(b.x), fabsf(b.y))));
++  }
++  const nvfp4q::Scale sc = nvfp4q::block_scale(amax, 1.0f);
++  uint32_t w0 = 0u, w1 = 0u;
++#pragma unroll
++  for (int i = 0; i < 8; ++i) {
++    w0 |= nvfp4q::e2m1(f[i] * sc.mul) << (4 * i);
++    w1 |= nvfp4q::e2m1(f[8 + i] * sc.mul) << (4 * i);
++  }
++  *reinterpret_cast<uint2*>(codes + static_cast<size_t>(row) * (K >> 1) + blk * 8) = make_uint2(w0, w1);
++  scales[static_cast<size_t>(row) * kb + blk] = static_cast<uint8_t>(sc.sf8);
++}
++
++extern "C" __global__ void __launch_bounds__(256)
++    tf_ink2moe_quant_x_mxfp8(const __nv_bfloat16* __restrict__ X, int x_stride, int M, int K,
++                             uint8_t* __restrict__ codes, uint8_t* __restrict__ scales) {
++  const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
++  const int kb = K >> 5;
++  if (idx >= static_cast<long long>(M) * kb) return;
++  const int row = static_cast<int>(idx / kb), blk = static_cast<int>(idx % kb);
++  const __nv_bfloat16* src = X + static_cast<size_t>(row) * x_stride + blk * 32;
++  float f[32];
++  float amax = 0.f;
++#pragma unroll
++  for (int i = 0; i < 4; ++i) {
++    const uint4 v = *reinterpret_cast<const uint4*>(src + i * 8);
++    const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&v);
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++      const float2 ab = __bfloat1622float2(p[j]);
++      f[i * 8 + 2 * j] = ab.x;
++      f[i * 8 + 2 * j + 1] = ab.y;
++      amax = fmaxf(amax, fmaxf(fabsf(ab.x), fabsf(ab.y)));
++    }
++  }
++  uint32_t ue = 127u;
++  float inv = 1.f;
++  if (amax > 0.f) {
++    const uint32_t u = __float_as_uint(amax * (1.f / 448.f));
++    ue = ((u >> 23) & 0xFFu) + ((u & 0x7FFFFFu) != 0u ? 1u : 0u);
++    if (ue < 1u) ue = 1u;
++    if (ue > 254u) ue = 254u;
++    inv = __uint_as_float((254u - ue) << 23);
++  }
++  scales[static_cast<size_t>(row) * kb + blk] = static_cast<uint8_t>(ue);
++  uint32_t* dst = reinterpret_cast<uint32_t*>(codes + static_cast<size_t>(row) * K + blk * 32);
++#pragma unroll
++  for (int k = 0; k < 8; ++k) {
++    const uint32_t b0 = __nv_cvt_float_to_fp8(f[4 * k + 0] * inv, __NV_SATFINITE, __NV_E4M3);
++    const uint32_t b1 = __nv_cvt_float_to_fp8(f[4 * k + 1] * inv, __NV_SATFINITE, __NV_E4M3);
++    const uint32_t b2 = __nv_cvt_float_to_fp8(f[4 * k + 2] * inv, __NV_SATFINITE, __NV_E4M3);
++    const uint32_t b3 = __nv_cvt_float_to_fp8(f[4 * k + 3] * inv, __NV_SATFINITE, __NV_E4M3);
++    dst[k] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
++  }
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ink2moe_prompt_tc_nvfp4(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc, int x_stride,
++                               int slots, ink2o::Weight w, int KG, int NB, const int* __restrict__ items,
++                               const int* __restrict__ item_count, const int* __restrict__ members,
++                               void* __restrict__ out, int N, int skip) {
++  ink2o::prompt_tc_body<0>(xc, xsc, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip);
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ink2moe_prompt_tc_mxfp8(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc, int x_stride,
++                               int slots, ink2o::Weight w, int KG, int NB, const int* __restrict__ items,
++                               const int* __restrict__ item_count, const int* __restrict__ members,
++                               void* __restrict__ out, int N, int skip) {
++  ink2o::prompt_tc_body<1>(xc, xsc, x_stride, slots, w, KG, NB, items, item_count, members, out, N, skip);
++}
+diff --git a/zig/kernels/cuda/inkling2/ops.cu b/zig/kernels/cuda/inkling2/ops.cu
+index d9b7ca6..b7f3003 100644
+--- a/zig/kernels/cuda/inkling2/ops.cu
++++ b/zig/kernels/cuda/inkling2/ops.cu
+@@ -598,3 +598,19 @@ extern "C" __global__ void tf_ink2_put_words(unsigned* __restrict__ dst, int n,
+     const int i = threadIdx.x;
+     if (i < n) dst[i] = words.w[i];
+ }
++
++// Pack row-major BF16 [n, k] into qmmf's [npad/64][k/64][8][4][32][4] layout.
++extern "C" __global__ void __launch_bounds__(256)
++    tf_ink2_pack_qmmf_bf16(const uint16_t* __restrict__ src, uint16_t* __restrict__ dst, int n, int k, long long total) {
++    const long long i = static_cast<long long>(blockIdx.x) * 256 + threadIdx.x;
++    if (i >= total) return;
++    const int e = static_cast<int>(i % 4);
++    const int lane = static_cast<int>((i / 4) % 32);
++    const int kt = static_cast<int>((i / 128) % 4);
++    const int jj = static_cast<int>((i / 512) % 8);
++    const long long tg = i / 4096;
++    const int kg = k / 64;
++    const long long row = (tg / kg) * 64 + jj * 8 + lane / 4;
++    const int col = static_cast<int>(tg % kg) * 64 + kt * 16 + 2 * (lane % 4) + (e & 1) + 8 * (e >> 1);
++    dst[i] = row < n ? src[row * k + col] : 0;
++}
+diff --git a/zig/src/families/inkling2/loop_engine.zig b/zig/src/families/inkling2/loop_engine.zig
+index 080db0f..ac93ed3 100644
+--- a/zig/src/families/inkling2/loop_engine.zig
++++ b/zig/src/families/inkling2/loop_engine.zig
+@@ -12,46 +12,7 @@ const loop_math = @import("loop_math_cuda.zig");
+ pub const prompt_rows: usize = 2048;
+ pub const window_rows: usize = 16;
+ 
+-pub const Kernels = struct {
+-    glue: ops.Kernels,
+-    attn: attention.Kernels,
+-    moe: modelopt.Kernels,
+-    loop: loop_math.Kernels,
+-    sample_mod: cuda.Module,
+-    draws: cuda.sample.Draws,
+-
+-    pub fn load(ctx: *const cuda.Context) !Kernels {
+-        const d = ctx.d;
+-        var glue = try ops.Kernels.load(d);
+-        errdefer glue.unload();
+-        var attn = try attention.Kernels.load(d);
+-        errdefer attn.unload();
+-        const sms: usize = @intCast(try ctx.attribute(.multiprocessor_count));
+-        var moe = try modelopt.Kernels.load(d, sms);
+-        errdefer moe.unload();
+-        var lm = try loop_math.Kernels.load(d);
+-        errdefer lm.unload();
+-        var sample_mod = try cuda.Module.load(d, cuda.kernels.sample);
+-        errdefer sample_mod.unload();
+-        return .{
+-            .glue = glue,
+-            .attn = attn,
+-            .moe = moe,
+-            .loop = lm,
+-            .sample_mod = sample_mod,
+-            .draws = try cuda.sample.Draws.resolve(sample_mod),
+-        };
+-    }
+-
+-    pub fn deinit(k: *Kernels) void {
+-        k.sample_mod.unload();
+-        k.loop.unload();
+-        k.moe.unload();
+-        k.attn.unload();
+-        k.glue.unload();
+-        k.* = undefined;
+-    }
+-};
++pub const Kernels = @import("loop_kernels.zig").Kernels;
+ 
+ const Scratch = struct {
+     ids: u64,
+@@ -403,9 +364,17 @@ pub const Model = struct {
+             const u_v = if (layer.kind == .global or messages) m.s.normalized + 2 * norm_stride else u_q;
+             const q_width: usize = @as(usize, layer.heads.q) * layer.heads.dim;
+             const kv_width: usize = @as(usize, layer.heads.kv) * layer.heads.dim;
+-            try loop_math.projectQkv(&k.loop, s, u_q, u_k, u_v, lw.attn.wq, lw.attn.wk, lw.attn.wv, m.s.q_raw, m.s.k_raw, m.s.v_raw, rows, h, q_width, kv_width);
+-            try ops.rowdot(&k.glue, s, u_q, lw.attn.wr, m.s.rel_raw, rows, layer.heads.q * c.d_rel, h, true, false);
+-            try ops.rowdot(&k.glue, s, u_q, lw.attn.gate, m.s.gate, rows, q_width, h, true, false);
++            if (lw.attn.qmmf) |qa| {
++                try k.projectQmmf(s, qa.wq, u_q, rows, m.s.q_raw, 0);
++                try k.projectQmmf(s, qa.wk, u_k, rows, m.s.k_raw, 0);
++                try k.projectQmmf(s, qa.wv, u_v, rows, m.s.v_raw, 0);
++                try k.projectQmmf(s, qa.wr, u_q, rows, m.s.rel_raw, 0);
++                try k.projectQmmf(s, qa.gate, u_q, rows, m.s.gate, 0);
++            } else {
++                try loop_math.projectQkv(&k.loop, s, u_q, u_k, u_v, lw.attn.wq, lw.attn.wk, lw.attn.wv, m.s.q_raw, m.s.k_raw, m.s.v_raw, rows, h, q_width, kv_width);
++                try ops.rowdot(&k.glue, s, u_q, lw.attn.wr, m.s.rel_raw, rows, layer.heads.q * c.d_rel, h, true, false);
++                try ops.rowdot(&k.glue, s, u_q, lw.attn.gate, m.s.gate, rows, q_width, h, true, false);
++            }
+             try ops.rowdot(&k.glue, s, u_q, lw.attn.sink, m.s.sink, rows, layer.heads.q, h, true, false);
+ 
+             const geometry = m.layerGeometry(visit.layer);
+@@ -452,7 +421,10 @@ pub const Model = struct {
+             try attention.prep(&k.attn, s, r, geometry, prep, .{ m.s.q_raw, m.s.k_conv, m.s.v_conv, m.s.rel_raw }, .{ lw.attn.q_scale, lw.attn.rel_scale }, m.s.q_prepared, m.s.rel_prepared, cache);
+             try attention.relTable(&k.attn, s, r, m.s.rel_prepared, lw.attn.rel_proj, m.s.rel_table);
+             try attention.attend(&k.attn, s, r, geometry, stride, part_capacity, m.s.q_prepared, cache, m.s.rel_table, m.s.part_o, m.s.part_ml, m.s.sink, m.s.gate, m.s.attn_heads);
+-            try ops.rowdot(&k.glue, s, m.s.attn_heads, lw.attn.wo, m.s.attn_out, rows, h, q_width, true, false);
++            if (lw.attn.qmmf) |qa|
++                try k.projectQmmf(s, qa.wo, m.s.attn_heads, rows, m.s.attn_out, 0)
++            else
++                try ops.rowdot(&k.glue, s, m.s.attn_heads, lw.attn.wo, m.s.attn_out, rows, h, q_width, true, false);
+ 
+             if (layer.boundary) {
+                 try m.copy(s, m.s.blocks[n_blocks], partial, rows * h * 2);
+diff --git a/zig/src/families/inkling2/loop_kernels.zig b/zig/src/families/inkling2/loop_kernels.zig
+new file mode 100644
+index 0000000..34a35e9
+--- /dev/null
++++ b/zig/src/families/inkling2/loop_kernels.zig
+@@ -0,0 +1,73 @@
++//! The CUDA kernels owned by one Mini modelOpt model, including qmmf dense projections.
++const std = @import("std");
++const cuda = @import("cuda");
++const ops = @import("ops.zig");
++const attention = @import("kernels.zig");
++const modelopt = @import("modelopt.zig");
++const loop_math = @import("loop_math_cuda.zig");
++const weights = @import("loop_weights.zig");
++
++pub const Kernels = struct {
++    glue: ops.Kernels,
++    attn: attention.Kernels,
++    moe: modelopt.Kernels,
++    qmmf: cuda.qmmf.Lane,
++    loop: loop_math.Kernels,
++    sample_mod: cuda.Module,
++    draws: cuda.sample.Draws,
++
++    pub fn load(ctx: *const cuda.Context) !Kernels {
++        const d = ctx.d;
++        var glue = try ops.Kernels.load(d);
++        errdefer glue.unload();
++        var attn = try attention.Kernels.load(d);
++        errdefer attn.unload();
++        var moe = try modelopt.Kernels.load(d, @intCast(try ctx.attribute(.multiprocessor_count)));
++        errdefer moe.unload();
++        const cap = try ctx.capability();
++        var qmmf = try cuda.qmmf.Lane.load(d, cap / 10);
++        errdefer qmmf.unload();
++        try qmmf.loadPrompt(d);
++        var lm = try loop_math.Kernels.load(d);
++        errdefer lm.unload();
++        var sample_mod = try cuda.Module.load(d, cuda.kernels.sample);
++        errdefer sample_mod.unload();
++        return .{
++            .glue = glue,
++            .attn = attn,
++            .moe = moe,
++            .qmmf = qmmf,
++            .loop = lm,
++            .sample_mod = sample_mod,
++            .draws = try cuda.sample.Draws.resolve(sample_mod),
++        };
++    }
++
++    pub fn maxPartBytes(k: *const Kernels, layers: []const weights.Layer, max_rows: usize) usize {
++        var best: usize = 0;
++        const probe_rows = [_]usize{ 1, 16, 32, 64, max_rows };
++        for (layers) |layer| {
++            const q = layer.attn.qmmf orelse continue;
++            for ([_]cuda.qmmf.Weight{ q.wq, q.wk, q.wv, q.wo, q.gate, q.wr }) |w| {
++                for (probe_rows) |m| if (m <= max_rows) {
++                    best = @max(best, k.qmmf.partBytes(m, w));
++                };
++            }
++        }
++        return best;
++    }
++
++    pub fn projectQmmf(k: *const Kernels, s: cuda.Stream, w: cuda.qmmf.Weight, x: u64, rows: usize, out: u64, part: u64) !void {
++        try k.qmmf.matmul(s, x, w.k, rows, w, out, part);
++    }
++
++    pub fn deinit(k: *Kernels) void {
++        k.sample_mod.unload();
++        k.loop.unload();
++        k.qmmf.unload();
++        k.moe.unload();
++        k.attn.unload();
++        k.glue.unload();
++        k.* = undefined;
++    }
++};
+diff --git a/zig/src/families/inkling2/loop_scratch.zig b/zig/src/families/inkling2/loop_scratch.zig
+index 27192f2..5c27d8f 100644
+--- a/zig/src/families/inkling2/loop_scratch.zig
++++ b/zig/src/families/inkling2/loop_scratch.zig
+@@ -43,6 +43,7 @@ pub const Scratch = struct {
+     moe_out: u64,
+     moe_scratch: u64,
+     exl3_scratch: ?cuda.exl3_experts.Scratch,
++    dense_part: u64 = 0,
+     hidden: u64,
+     logits: u64,
+ };
+diff --git a/zig/src/families/inkling2/loop_weights.zig b/zig/src/families/inkling2/loop_weights.zig
+index 7bc6263..5f40334 100644
+--- a/zig/src/families/inkling2/loop_weights.zig
++++ b/zig/src/families/inkling2/loop_weights.zig
+@@ -5,6 +5,25 @@ const core = @import("core");
+ const config = @import("config.zig");
+ const plan_ = @import("plan.zig");
+ const modelopt = @import("modelopt.zig");
++const ops = @import("ops.zig");
++const lazy_head = @import("loop_lazy_head.zig");
++
++pub const QmmfAttention = struct {
++    wq: cuda.qmmf.Weight,
++    wk: cuda.qmmf.Weight,
++    wv: cuda.qmmf.Weight,
++    wr: cuda.qmmf.Weight,
++    wo: cuda.qmmf.Weight,
++    gate: cuda.qmmf.Weight,
++};
++
++pub fn qmmfEnabled() bool {
++    return @import("sys").environment.read(bool, "TF_INKLING2_QMMF", true) catch true;
++}
++
++pub fn attnFp8Enabled() bool {
++    return @import("sys").environment.read(bool, "TF_INKLING2_ATTN_FP8", false) catch false;
++}
+ 
+ pub const Controller = struct {
+     down: u64,
+@@ -19,6 +38,7 @@ pub const Attention = struct {
+     wr: u64,
+     wo: u64,
+     gate: u64,
++    qmmf: ?QmmfAttention = null,
+     sink: u64,
+     q_scale: u64,
+     rel_scale: u64,
+@@ -96,6 +116,36 @@ const Loader = struct {
+         const name = try std.fmt.bufPrint(&buf, fmt, args);
+         return l.put((try ck.expect(name, dtype, dims)).bytes);
+     }
++
++    fn qmmfWeight(
++        l: *Loader,
++        ops_k: *const ops.Kernels,
++        d: *const cuda.Driver,
++        s: cuda.Stream,
++        stage: *cuda.DeviceBuffer,
++        ck: *core.Checkpoint,
++        comptime fmt: []const u8,
++        args: anytype,
++        n: usize,
++        k: usize,
++        fp8: bool,
++    ) !cuda.qmmf.Weight {
++        var buf: [256]u8 = undefined;
++        const name = try std.fmt.bufPrint(&buf, fmt, args);
++        const bytes = (try ck.expect(name, .bf16, &.{ n, k })).bytes;
++        try stage.upload(0, bytes);
++        if (fp8) {
++            const dst = try l.alloc(cuda.fp8.padded(n) * k);
++            var w = try lazy_head.pack(d, s, stage.ptr, dst, n, k);
++            w.sk = 0; // Allow split-K cluster schedules for decode and fused tiles for prefill.
++            return w;
++        }
++        const npad = (n + 127) / 128 * 128;
++        const dst = try l.alloc(npad * k * 2);
++        try ops.packQmmfBf16(ops_k, s, stage.ptr, dst, n, k);
++        try s.synchronize();
++        return .{ .mode = .bf16, .codes = dst, .scales = 0, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad) };
++    }
+ };
+ 
+ fn checkpointBytes(ck: *const core.Checkpoint) !usize {
+@@ -148,6 +198,15 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, ck: *core.Checkpoint,
+     w.mlp_queries = try gpa.alloc(u64, c.text.layers);
+     var l: Loader = .{ .w = &w, .arena = arena };
+     const h: usize = c.text.hidden;
++    const q_max = @as(usize, @max(c.text.local.q * c.text.local.dim, c.text.global.q * c.text.global.dim));
++    const use_qmmf = qmmfEnabled() and h % 64 == 0 and q_max % 128 == 0;
++    const use_attn_fp8 = use_qmmf and attnFp8Enabled();
++    var ops_k: ?ops.Kernels = if (use_qmmf) try ops.Kernels.load(d) else null;
++    defer if (ops_k) |*ok| ok.unload();
++    var pack_stream: ?cuda.Stream = if (use_qmmf) try cuda.Stream.init(d, false) else null;
++    defer if (pack_stream) |*ps| ps.deinit();
++    var stage: ?cuda.DeviceBuffer = if (use_qmmf) try cuda.DeviceBuffer.alloc(d, @max(q_max * h, h * q_max) * 2) else null;
++    defer if (stage) |*sb| sb.free();
+     w.embed = try l.tensor(ck, "model.llm.embed.weight", .{}, .bf16, &.{ c.text.vocab, h });
+     w.embed_norm = try l.tensor(ck, "model.llm.embed_norm.weight", .{}, .bf16, &.{h});
+     w.norm = try l.tensor(ck, "model.llm.norm.weight", .{}, .bf16, &.{h});
+@@ -175,7 +234,34 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, ck: *core.Checkpoint,
+                 return loader.tensor(checkpoint, fmt, args, .bf16, dims);
+             }
+         };
+-        layer.attn = .{
++        const pack_layer = use_qmmf and q % 128 == 0 and kv % 128 == 0 and (hd.q * c.text.d_rel) % 128 == 0;
++        layer.attn = if (pack_layer) blk: {
++            const ok = &ops_k.?;
++            const ps = pack_stream.?;
++            const sb = &stage.?;
++            const qw = try l.qmmfWeight(ok, d, ps, sb, ck, "model.llm.layers.{d}.attn.wq_du.weight", L, q, h, use_attn_fp8);
++            const kw = try l.qmmfWeight(ok, d, ps, sb, ck, "model.llm.layers.{d}.attn.wk_dv.weight", L, kv, h, use_attn_fp8);
++            const vw = try l.qmmfWeight(ok, d, ps, sb, ck, "model.llm.layers.{d}.attn.wv_dv.weight", L, kv, h, use_attn_fp8);
++            const rw = try l.qmmfWeight(ok, d, ps, sb, ck, "model.llm.layers.{d}.attn.wr_du.weight", L, @as(usize, hd.q) * c.text.d_rel, h, false);
++            const ow = try l.qmmfWeight(ok, d, ps, sb, ck, "model.llm.layers.{d}.attn.wo_ud.weight", L, h, q, use_attn_fp8);
++            const gw = try l.qmmfWeight(ok, d, ps, sb, ck, "model.llm.layers.{d}.attn.gate_attn.weight", L, q, h, false);
++            break :blk .{
++                .wq = 0,
++                .wk = 0,
++                .wv = 0,
++                .wr = 0,
++                .wo = 0,
++                .gate = 0,
++                .qmmf = .{ .wq = qw, .wk = kw, .wv = vw, .wr = rw, .wo = ow, .gate = gw },
++                .sink = try A.put(&l, ck, "model.llm.layers.{d}.attn.attn_sink_proj.weight", L, &.{ hd.q, h }),
++                .q_scale = try A.put(&l, ck, "model.llm.layers.{d}.attn.q_l2_clip.scale", L, &.{ hd.q, hd.dim }),
++                .rel_scale = try A.put(&l, ck, "model.llm.layers.{d}.attn.rel_l2_clip.scale", L, &.{ hd.q, c.text.d_rel }),
++                .rel_proj = try A.put(&l, ck, "model.llm.layers.{d}.attn.rel_logits_proj.proj", L, &.{ c.text.d_rel, c.text.extent(i) }),
++                .k_conv = undefined,
++                .v_conv = undefined,
++                .norms = undefined,
++            };
++        } else .{
+             .wq = try A.put(&l, ck, "model.llm.layers.{d}.attn.wq_du.weight", L, &.{ q, h }),
+             .wk = try A.put(&l, ck, "model.llm.layers.{d}.attn.wk_dv.weight", L, &.{ kv, h }),
+             .wv = try A.put(&l, ck, "model.llm.layers.{d}.attn.wv_dv.weight", L, &.{ kv, h }),
+diff --git a/zig/src/families/inkling2/modelopt.zig b/zig/src/families/inkling2/modelopt.zig
+index 7b5d84d..fb63add 100644
+--- a/zig/src/families/inkling2/modelopt.zig
++++ b/zig/src/families/inkling2/modelopt.zig
+@@ -6,8 +6,20 @@ const core = @import("core");
+ 
+ pub const Format = enum(i32) { nvfp4 = 0, mxfp8 = 1 };
+ pub const max_slots = 32;
++pub const max_rows = 4096;
+ const max_experts = 512;
+ 
++/// TF_INKLING2_PREFILL_TC=1: Blackwell sm_121a native mxf4nvf4/mxf8f6f4 block-scaled TC prefill.
++pub fn prefillTcMode() u8 {
++    const S = struct {
++        var v: ?u8 = null;
++    };
++    if (S.v == null) {
++        S.v = if (std.c.getenv("TF_INKLING2_PREFILL_TC")) |e| (if (e[0] != '0') @as(u8, 1) else 0) else 0;
++    }
++    return S.v.?;
++}
++
+ pub const Projection = struct {
+     codes: u64,
+     scales: u64,
+@@ -44,22 +56,33 @@ pub const Kernels = struct {
+     plan: cuda.Function,
+     decode: cuda.Function,
+     prompt: cuda.Function,
++    quant_x_nvfp4: cuda.Function,
++    quant_x_mxfp8: cuda.Function,
++    prompt_tc_nvfp4: cuda.Function,
++    prompt_tc_mxfp8: cuda.Function,
+     act: cuda.Function,
+     combine: cuda.Function,
+     resident: usize,
++    tc_ok: bool,
+ 
+     pub fn load(d: *const cuda.Driver, sms: usize) !Kernels {
+         var mod = try cuda.Module.load(d, cuda.kernels.inkling2_modelopt);
+         errdefer mod.unload();
+         const decode = try mod.function("tf_ink2moe_up");
++        const cap = try d.currentCapability();
+         return .{
+             .mod = mod,
+             .plan = try mod.function("tf_ink2moe_plan"),
+             .decode = decode,
+             .prompt = try mod.function("tf_ink2moe_prompt_up"),
++            .quant_x_nvfp4 = try mod.function("tf_ink2moe_quant_x_nvfp4"),
++            .quant_x_mxfp8 = try mod.function("tf_ink2moe_quant_x_mxfp8"),
++            .prompt_tc_nvfp4 = try mod.function("tf_ink2moe_prompt_tc_nvfp4"),
++            .prompt_tc_mxfp8 = try mod.function("tf_ink2moe_prompt_tc_mxfp8"),
+             .act = try mod.function("tf_ink2moe_act"),
+             .combine = try mod.function("tf_ink2moe_combine"),
+             .resident = @max(1, try decode.occupancy(128, 0)) * sms,
++            .tc_ok = cap == 120 or cap == 121,
+         };
+     }
+ 
+@@ -80,6 +103,8 @@ pub const Layout = struct {
+     items: u64,
+     item_count: u64,
+     members: u64,
++    x_tc_codes: u64,
++    x_tc_scales: u64,
+     bytes: usize,
+ };
+ 
+@@ -102,12 +127,25 @@ pub fn layout(base: u64, rows: usize, slots: usize, hidden: usize, intermediate:
+     const items = take(&at, items_max * 12);
+     const item_count = take(&at, 4);
+     const members = take(&at, pairs * 4);
+-    return .{ .gate = gate, .up = up, .act = act, .down = down, .items = items, .item_count = item_count, .members = members, .bytes = at - base };
++    const tc_codes = if (prefillTcMode() != 0) take(&at, @max(rows * hidden, pairs * intermediate)) else 0;
++    const tc_scales = if (prefillTcMode() != 0) take(&at, @max(rows * (hidden / 16), pairs * (intermediate / 16))) else 0;
++    return .{
++        .gate = gate,
++        .up = up,
++        .act = act,
++        .down = down,
++        .items = items,
++        .item_count = item_count,
++        .members = members,
++        .x_tc_codes = tc_codes,
++        .x_tc_scales = tc_scales,
++        .bytes = at - base,
++    };
+ }
+ 
+ /// Gate, up, activation and per-expert outputs, plus the ascending-expert group plan.
+ pub fn scratchBytes(rows: usize, slots: usize, hidden: usize, intermediate: usize) !usize {
+-    if (rows == 0 or rows > 2048 or slots == 0 or slots > max_slots) return error.BadExperts;
++    if (rows == 0 or rows > max_rows or slots == 0 or slots > max_slots) return error.BadExperts;
+     return layout(0, rows, slots, hidden, intermediate).bytes;
+ }
+ 
+@@ -156,9 +194,45 @@ fn projection(s: cuda.Stream, fn_: cuda.Function, prompt: bool, resident: usize,
+     try cuda.launch.launch(fn_, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &a);
+ }
+ 
++fn quantX(k: *const Kernels, s: cuda.Stream, format: Format, x: u64, x_stride: usize, rows: usize, k_dim: usize, codes: u64, scales: u64) !void {
++    const grp: usize = if (format == .nvfp4) 16 else 32;
++    const blocks = rows * (k_dim / grp);
++    const grid = (blocks + 255) / 256;
++    if (grid == 0) return;
++    var a: cuda.Args = .{};
++    a.add(x);
++    a.add(i32d(x_stride));
++    a.add(i32d(rows));
++    a.add(i32d(k_dim));
++    a.add(codes);
++    a.add(scales);
++    const fn_ = if (format == .nvfp4) k.quant_x_nvfp4 else k.quant_x_mxfp8;
++    try cuda.launch.launch(fn_, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &a);
++}
++
++fn projectionTc(s: cuda.Stream, fn_: cuda.Function, xc: u64, xsc: u64, x_stride: usize, slots: usize, w: Weight, items: u64, item_count: u64, members: u64, out: u64, item_bound: usize) !void {
++    const kg: usize = @intCast(@divExact(w.k, 32));
++    const outputs: usize = @intCast(if (w.row_step == 2) @divExact(w.n, 2) else w.n);
++    const nb = outputs / 32;
++    var a: cuda.Args = .{};
++    a.add(xc);
++    a.add(xsc);
++    a.add(i32d(x_stride));
++    a.add(i32d(slots));
++    a.add(w);
++    a.add(i32d(kg));
++    a.add(i32d(nb));
++    for ([_]u64{ items, item_count, members, out }) |v| a.add(v);
++    a.add(i32d(outputs));
++    a.add(@as(i32, -1));
++    const grid = (item_bound * nb + 3) / 4;
++    if (grid == 0) return;
++    try cuda.launch.launch(fn_, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &a);
++}
++
+ /// Run one MoE layer. `pick` is row-major int32 expert IDs; routing `weights` are fp32.
+ pub fn run(k: *const Kernels, s: cuda.Stream, l: Layer, caps: experts.Caps, x: u64, x_stride: usize, pick: u64, weights: u64, rows: usize, slots: usize, out: u64, scratch: u64) !void {
+-    if (rows == 0 or rows > 2048 or slots == 0 or slots > max_slots or l.experts == 0 or l.experts > max_experts) return error.BadExperts;
++    if (rows == 0 or rows > max_rows or slots == 0 or slots > max_slots or l.experts == 0 or l.experts > max_experts) return error.BadExperts;
+     if (l.w13.n % 64 != 0 or l.w13.k % 32 != 0 or l.w2.n % 32 != 0 or l.w2.k % 32 != 0) return error.BadExperts;
+     if (l.w13.k != l.w2.n or l.w13.n / 2 != l.w2.k or x_stride < l.w13.k) return error.BadExperts;
+     const hidden: usize = l.w2.n;
+@@ -174,8 +248,16 @@ pub fn run(k: *const Kernels, s: cuda.Stream, l: Layer, caps: experts.Caps, x: u
+     for ([_]usize{ rows, slots, l.experts, tile }) |v| g.add(i32d(v));
+     try cuda.launch.launch(k.plan, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 32 } }, s, &g);
+ 
++    const use_tc = listed and k.tc_ok and prefillTcMode() != 0 and
++        ((l.format == .nvfp4 and hidden % 64 == 0 and intermediate % 64 == 0) or
++        (l.format == .mxfp8 and hidden % 32 == 0 and intermediate % 32 == 0));
++    const tc_fn = if (l.format == .nvfp4) k.prompt_tc_nvfp4 else k.prompt_tc_mxfp8;
+     const fn_ = if (listed) k.prompt else k.decode;
+-    if (listed) {
++    if (use_tc) {
++        try quantX(k, s, l.format, x, x_stride, rows, hidden, b.x_tc_codes, b.x_tc_scales);
++        try projectionTc(s, tc_fn, b.x_tc_codes, b.x_tc_scales, hidden, slots, weight(l.w13, l, 0, 2), b.items, b.item_count, b.members, b.gate, item_bound);
++        try projectionTc(s, tc_fn, b.x_tc_codes, b.x_tc_scales, hidden, slots, weight(l.w13, l, 1, 2), b.items, b.item_count, b.members, b.up, item_bound);
++    } else if (listed) {
+         try projection(s, fn_, true, k.resident, x, x_stride, slots, weight(l.w13, l, 0, 2), b.items, b.item_count, b.members, b.gate, 0, item_bound);
+         try projection(s, fn_, true, k.resident, x, x_stride, slots, weight(l.w13, l, 1, 2), b.items, b.item_count, b.members, b.up, 0, item_bound);
+     } else {
+@@ -188,7 +270,12 @@ pub fn run(k: *const Kernels, s: cuda.Stream, l: Layer, caps: experts.Caps, x: u
+     aa.add(caps.gate);
+     aa.add(caps.up);
+     try cuda.launch.launch(k.act, .{ .grid = .{ .x = @intCast((pairs * intermediate + 255) / 256), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &aa);
+-    try projection(s, fn_, listed, k.resident, b.act, intermediate, 0, weight(l.w2, l, 0, 1), b.items, b.item_count, b.members, b.down, 0, item_bound);
++    if (use_tc) {
++        try quantX(k, s, l.format, b.act, intermediate, pairs, intermediate, b.x_tc_codes, b.x_tc_scales);
++        try projectionTc(s, tc_fn, b.x_tc_codes, b.x_tc_scales, intermediate, 0, weight(l.w2, l, 0, 1), b.items, b.item_count, b.members, b.down, item_bound);
++    } else {
++        try projection(s, fn_, listed, k.resident, b.act, intermediate, 0, weight(l.w2, l, 0, 1), b.items, b.item_count, b.members, b.down, 0, item_bound);
++    }
+ 
+     var ca: cuda.Args = .{};
+     for ([_]u64{ pick, weights, b.down, out }) |v| ca.add(v);
+diff --git a/zig/src/families/inkling2/ops.zig b/zig/src/families/inkling2/ops.zig
+index 81ce2a6..28ceed2 100644
+--- a/zig/src/families/inkling2/ops.zig
++++ b/zig/src/families/inkling2/ops.zig
+@@ -76,6 +76,7 @@ pub const Kernels = struct {
+     top1: cuda.Function,
+     tobf: cuda.Function,
+     put_words: cuda.Function,
++    pack_qmmf_bf16: cuda.Function,
+     rewind: cuda.Function,
+     race1: cuda.Function,
+ 
+@@ -104,6 +105,7 @@ pub const Kernels = struct {
+             .top1 = try mod.function("tf_ink2_top1"),
+             .tobf = try mod.function("tf_ink2_tobf"),
+             .put_words = try mod.function("tf_ink2_put_words"),
++            .pack_qmmf_bf16 = try mod.function("tf_ink2_pack_qmmf_bf16"),
+             .rewind = try mod.function("tf_ink2_conv_rewind"),
+             .race1 = try mod.function("tf_ink2_race1"),
+         };
+@@ -261,6 +263,18 @@ pub fn putWords(k: *const Kernels, s: cuda.Stream, dst: u64, n: usize, words: Wo
+     try go(k.put_words, s, .{ .x = 1 }, 128, &a);
+ }
+ 
++/// Pack row-major BF16 [n, k] into qmmf's [npad/64][k/64][8][4][32][4] layout.
++pub fn packQmmfBf16(k: *const Kernels, s: cuda.Stream, src: u64, dst: u64, n: usize, k_dim: usize) !void {
++    const npad = (n + 127) / 128 * 128;
++    const total = npad * k_dim;
++    var a: cuda.Args = .{};
++    for ([_]u64{ src, dst }) |v| a.add(v);
++    a.add(int(n));
++    a.add(int(k_dim));
++    a.add(@as(i64, @intCast(total)));
++    try go(k.pack_qmmf_bf16, s, .{ .x = @intCast((total + 255) / 256) }, 256, &a);
++}
++
+ test "ops: the argument structs keep ops.cu's layouts" {
+     try std.testing.expectEqual(@as(usize, 8 * 8 + 8 + 8 + 3 * 8 + 8 + 6 * 4), @sizeOf(MixArgs));
+     try std.testing.expectEqual(@as(usize, 9 * 8 + 2 * 8 + 7 * 4 + 4), @sizeOf(ConvArgs));
+-- 
+2.43.0
+
