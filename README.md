@@ -47,6 +47,13 @@ All runs below were measured on a single NVIDIA DGX Spark (GB10 `sm_121`, 48 SMs
 | Prose (greedy, thinking off) | **45.64 tok/s** (`52.94 ms/rnd`, `1.426 tok/rnd` at c4) | **78.05 tok/s** | **96.97 tok/s** |
 | Code (greedy, thinking off) | **49.59 tok/s** (`52.51 ms/rnd`) | **83.99 tok/s** | **116.74 tok/s** |
 
+### Clean-Checkout Build Verification (`tf-inkling2:clean-verify` from `c3f5ced`, `evidence/profiles/clean-verify-*`)
+
+Rebuilt from scratch via `./docker/build-patched.sh tf-inkling2:clean-verify` and bracketed against `tf-inkling2:m2-p9`:
+- **Warm startup (`clean-verify-startup.json`):** `15.818 s` to `/v1/models` 200 OK (`4,736,000` KV tokens).
+- **Acceptance gates (`clean-verify-gates.json`):** **12 / 12 PASS** (`needle_256k` `329.73 s`, `needle_1m` `2977.4 s` at `1,023,701` / `1,023,881` tokens, `soak` `c4`+`c8` `302.66 s`, `prefix_cache` `8704/8726`, `drafted_exactness` `4/4`).
+- **Interleaved A/B parity (`clean-verify-ab.json`, `runs=6`, `max_tokens=256`, `T=0`):** `c1` decode `55.205` vs `m2-p9` control mean `53.19 tok/s` (`+3.79%`); `c4` agg `79.09` vs `80.53 tok/s` (`-1.79%`); cold prefill `4K` `2,355.9` vs `2,427.0 tok/s` (`-2.93%`), `32K` `2,502.1` vs `2,465.5 tok/s` (`+1.48%`).
+
 *Note on thinking effort, dense FP8 flags, and NLL harness:* `Inkling-2-Mini`'s chat template emits `Thinking effort level: 0` when `enable_thinking=False`; the model weights may still emit a brief separated `<|content_thinking|>` segment before the final answer, which TensorFold places in `reasoning_content` cleanly. `TF_INKLING2_ATTN_FP8=1` and `TF_INKLING2_GATE_FP8=1` trade a small amount of greedy code acceptance for +17-19% prose decode speed; unset them in `EXTRA_ENV` if you want pure BF16 dense projections. Note that paired teacher-forced NLL (`tools/nll.py`) is currently unsupported by TensorFold's `inkling2` backend (`prompt_logprobs` is unimplemented in `loop_backend.zig` / `cuda.zig`, returning HTTP 400); quality parity is verified instead via `plain` (`DRAFTER=""`) vs `drafted` (`DFlash2`) 4/4 greedy exactness and 12/12 `tools/gates.py` (including 256K and 1M needle retrieval).
 
 ---

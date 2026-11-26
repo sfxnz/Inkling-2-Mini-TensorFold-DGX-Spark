@@ -1,0 +1,48 @@
+{
+  "url": "http://127.0.0.1:8000",
+  "container": "tf-inkling2",
+  "started": "2026-11-26T00:58:01Z",
+  "results": [
+    {
+      "mode": "warm",
+      "ok": true,
+      "models_200_s": 16.056,
+      "wall_s": 16.056,
+      "error": null,
+      "phases": [
+        "[tensorfold] chat template: the checkpoint's",
+        "[tensorfold] warning: non-loopback server has no API key; requests are open",
+        "[tensorfold] open-file limit raised: soft 1024 -> 524288",
+        "[tensorfold] CUDA sm_121 device 0 (NVIDIA GB10, memory shared with the host): model 102.88 GiB; 8 streams at once, the engine's own and 7 more taking 18500 pages of 256 rows (74.52 GiB) as they need them (enough for 4 at a 1048576-token window), 499 MiB fixed each, of 0.0 GiB left after a 13.0 GiB reserve; prompts in passes of up to 4096 rows, the prompt cache over the pool's pages; own glue kernels",
+        "[tensorfold] profile: stable; registered overrides: none",
+        "[tensorfold] serving inkling-2-mini at http://0.0.0.0:8000/v1 (sampling: temperature 1.0; drafts: DFlash2 ($HOME/.cache/huggingface/hub/models--incoai--Inkling-2-Mini-DFlash2/snapshots/4f9088ea66c21f2b99ed657d1941c306b03e84d2); context: 1048576; loaded in 15.7s)",
+        "[tensorfold] 127.0.0.1 \"GET /v1/models HTTP/1.1\" 200 -",
+        "[tensorfold] 127.0.0.1 \"GET /health HTTP/1.1\" 200 -",
+        "info: Mini CUDA sized the pool from the free memory measured after loading weights",
+        "info: Mini CUDA memory: target weights 18889368576 bytes, drafter weights 522273240 bytes, fp8 target KV 16896 bytes per global token, 523025932 bytes allocated per stream",
+        "info: KV page groups: one page 4.13 MiB, 256 rows of the full group; full: 8 layers x 2.06 KiB a row, 256 rows a layer's page, 0 B padding (0.0 %); window, outside the pool: 40 layers x 2.06 KiB a row (1.00x a full row), 256 rows a layer's page, 0 B padding (0.0 %)",
+        "info: Mini CUDA KV: 4736000 pool tokens, 1048576 per request, 523025932 fixed bytes per stream, 0 snapshot slots, 110466705780 allocated bytes"
+      ],
+      "run_sh_tail": [
+        "== thinkingmachines/Inkling-2-Mini, TensorFold 1.3.5, 1x DGX Spark (dgx-spark)",
+        "ok     host dgx-spark has docker curl hf ss free stat awk grep",
+        "ok     no other GPU container running",
+        "ok     image tf-inkling2:m2-p9: sha256:c40fc126ad99f8cca2ce18bbf4552a08b2169a3b86661ba1d1c8efd64c4d7554, TensorFold archive sha256 9223b9fd3d1a",
+        "ok     target snapshot complete: 1 model shard + mtp, 19526019168 + 635801416 bytes",
+        "ok     drafter snapshot complete: 989975616 bytes",
+        "ok     port 8000 free",
+        "ok     MemAvailable 116.6 GiB >= 108 GiB",
+        "...    start tf-inkling2 on dgx-spark",
+        "...    wait for /health (up to 900s)",
+        "ready after 16s",
+        "[tensorfold] warning: non-loopback server has no API key; requests are open",
+        "[tensorfold] CUDA sm_121 device 0 (NVIDIA GB10, memory shared with the host): model 102.88 GiB; 8 streams at once, the engine's own and 7 more taking 18500 pages of 256 rows (74.52 GiB) as they need them (enough for 4 at a 1048576-token window), 499 MiB fixed each, of 0.0 GiB left after a 13.0 GiB reserve; prompts in passes of up to 4096 rows, the prompt cache over the pool's pages; own glue kernels",
+        "[tensorfold] serving inkling-2-mini at http://0.0.0.0:8000/v1 (sampling: temperature 1.0; drafts: DFlash2 ($HOME/.cache/huggingface/hub/models--incoai--Inkling-2-Mini-DFlash2/snapshots/4f9088ea66c21f2b99ed657d1941c306b03e84d2); context: 1048576; loaded in 15.7s)",
+        "endpoint  http://dgx-spark:8000/v1",
+        "try       curl -s http://dgx-spark:8000/v1/chat/completions -H 'content-type: application/json' \\",
+        "            -d '{\"model\": \"inkling-2-mini\", \"messages\": [{\"role\": \"user\", \"content\": \"Hello\"}]}'",
+        "stop      $HOME/projects/ai-lab/recipe-home/workspaces/inkling-2-mini-tensorfold-1x-spark/stop.sh"
+      ]
+    }
+  ]
+}

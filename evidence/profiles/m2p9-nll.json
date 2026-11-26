@@ -1,0 +1,38 @@
+{
+  "gate": "nll_corpus_v1",
+  "status": "unsupported_by_backend",
+  "image": "tf-inkling2:m2-p9",
+  "image_sha256": "c40fc126ad99f8cca2ce18bbf4552a08b2169a3b86661ba1d1c8efd64c4d7554",
+  "config": {
+    "MEMORY_RESERVE_GIB": "13.0",
+    "EXTRA_ENV": "TF_INKLING2_ATTN_FP8=1 TF_INKLING2_PREFILL_TC=1 TF_INKLING2_GATE_FP8=1",
+    "DRAFTER": "incoai/Inkling-2-Mini-DFlash2"
+  },
+  "command": "python3 tools/nll.py capture --label probe --out /tmp/nll-probe-test --url http://127.0.0.1:8000 --model thinkingmachines/Inkling-2-Mini",
+  "http_probe": {
+    "endpoint": "POST /v1/completions",
+    "request": {
+      "model": "thinkingmachines/Inkling-2-Mini",
+      "prompt": "Hello world",
+      "max_tokens": 1,
+      "prompt_logprobs": 1
+    },
+    "status_code": 400,
+    "response": {
+      "error": {
+        "message": "prompt_logprobs are not supported by this model or backend",
+        "type": "invalid_request_error"
+      }
+    }
+  },
+  "nll_py_error": "refused: chunk 0: HTTP 400: {\"error\": {\"message\": \"prompt_logprobs are not supported by this model or backend\", \"type\": \"invalid_request_error\"}}",
+  "engine_source_gap": {
+    "vtable": "zig/src/families/inkling2/loop_backend.zig:498-510 (neither prompt_rows nor first_row is implemented on inkling2 Backend.VTable)",
+    "wiring": "zig/src/native/cuda.zig:487-488 (.prompt_logprobs = served.backend.vtable.prompt_rows, defaults false)",
+    "server_check": "zig/src/server/fields.zig:366 (refuses prompt_logprobs when !supported)"
+  },
+  "existing_quality_evidence": {
+    "plain_vs_drafted": "profiles/m2p9-plain-vs-drafted.json (all_exact: true, 4/4 greedy exact match)",
+    "acceptance_gates": "profiles/m2p9-qual-gates.json (12/12 PASSED including needle_256k and needle_1m)"
+  }
+}

@@ -1,0 +1,342 @@
+{
+  "load": {
+    "ok": true,
+    "wall_s": 0.02,
+    "detail": {
+      "health": 200,
+      "models_status": 200,
+      "want_context": 1048576,
+      "got_context": 1048576,
+      "health_body": {
+        "status": "ok",
+        "model": "inkling-2-mini",
+        "model_ids": [
+          "inkling-2-mini"
+        ],
+        "max_batch_size": 8,
+        "warming": false,
+        "memory": {
+          "active": 110466705780,
+          "cache": 0,
+          "peak": 110466705780
+        },
+        "live": {
+          "connections": 0,
+          "waiting": 0,
+          "decode_tokens_per_second": 0.0,
+          "prefill_tokens_per_second": 0.0
+        },
+        "version": "1.3.5",
+        "backend": "cuda",
+        "device": "NVIDIA GB10"
+      }
+    }
+  },
+  "chat": {
+    "ok": true,
+    "wall_s": 0.58,
+    "detail": {
+      "status": 200,
+      "content": "INKLING_OK"
+    }
+  },
+  "reasoning": {
+    "ok": true,
+    "wall_s": 1.32,
+    "detail": {
+      "thinking_on": {
+        "ok": true,
+        "reasoning_chars": 122,
+        "content": "391"
+      },
+      "thinking_off": {
+        "ok": true,
+        "reasoning_chars": 116,
+        "content": "391"
+      }
+    }
+  },
+  "tools": {
+    "ok": true,
+    "wall_s": 3.52,
+    "detail": {
+      "call_args": {
+        "city": "Paris, France",
+        "unit": "celsius"
+      },
+      "turn2_status": 200,
+      "turn2_content": "Paris, France: 19\u00b0C, sunny."
+    }
+  },
+  "structured": {
+    "ok": true,
+    "wall_s": 2.5,
+    "detail": {
+      "json_schema": {
+        "ok": true,
+        "parsed": {
+          "city": "Tokyo",
+          "population_millions": 14
+        },
+        "status": 200
+      },
+      "json_object": {
+        "ok": true,
+        "parsed": {
+          "prompt": "Reply with a JSON object having keys "
+        },
+        "status": 200
+      },
+      "tool_choice": {
+        "ok": true,
+        "calls": [
+          {
+            "id": "call_0",
+            "type": "function",
+            "function": {
+              "name": "pick_number",
+              "arguments": "{\"n\":42}"
+            }
+          }
+        ],
+        "status": 200
+      }
+    }
+  },
+  "vision": {
+    "ok": true,
+    "wall_s": 3.89,
+    "detail": {
+      "png": {
+        "ok": true,
+        "status": 200,
+        "content": "{\"left\": {\"color\": \"red\", \"shape\": \"square\"}, \"right\": {\"color\": \"blue\", \"shape\": \"circle\"}}"
+      },
+      "jpeg": {
+        "ok": true,
+        "status": 200,
+        "content": "{\"left\": {\"color\": \"red\", \"shape\": \"square\"}, \"right\": {\"color\": \"blue\", \"shape\": \"circle\"}}"
+      },
+      "webp": {
+        "ok": true,
+        "status": 200,
+        "content": "{\"left\": {\"color\": \"red\", \"shape\": \"square\"}, \"right\": {\"color\": \"blue\", \"shape\": \"circle\"}}"
+      }
+    }
+  },
+  "drafted_exactness": {
+    "ok": true,
+    "wall_s": 32.09,
+    "detail": {
+      "drafted_active": true,
+      "serial_vs_concurrent_exact": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "plain_url": null,
+      "plain_vs_drafted_exact": null
+    }
+  },
+  "multilingual": {
+    "ok": true,
+    "wall_s": 11.78,
+    "detail": {
+      "ko": {
+        "ok": true,
+        "status": 200,
+        "has_fffd": false,
+        "len": 21,
+        "preview": "\uc778\uacf5\uc9c0\ub2a5 \uae30\uc220\uc774 \ube60\ub974\uac8c \ubc1c\uc804\ud558\uace0 \uc788\ub2e4."
+      },
+      "ja": {
+        "ok": true,
+        "status": 200,
+        "has_fffd": false,
+        "len": 31,
+        "preview": "The weather is very nice today."
+      },
+      "zh": {
+        "ok": true,
+        "status": 200,
+        "has_fffd": false,
+        "len": 43,
+        "preview": "\u5206\u5e03\u5f0f\u7cfb\u7edf\u662f\u7531\u591a\u4e2a\u901a\u8fc7\u7f51\u7edc\u534f\u4f5c\u7684\u72ec\u7acb\u8282\u70b9\u7ec4\u6210\u3001\u5171\u540c\u5b8c\u6210\u4efb\u52a1\u5e76\u5bf9\u5916\u8868\u73b0\u4e3a\u4e00\u4e2a\u6574\u4f53\u7684\u7cfb\u7edf\u3002"
+      },
+      "ar": {
+        "ok": true,
+        "status": 200,
+        "has_fffd": false,
+        "len": 181,
+        "preview": "\u0627\u0644\u0630\u0643\u0627\u0621 \u0627\u0644\u0627\u0635\u0637\u0646\u0627\u0639\u064a \u0647\u0648 \u0645\u062c\u0627\u0644 \u0641\u064a \u0639\u0644\u0648\u0645 \u0627\u0644\u062d\u0627\u0633\u0648\u0628 \u064a\u0647\u062f\u0641 \u0625\u0644\u0649 \u062a\u0645\u0643\u064a\u0646 \u0627\u0644\u0623\u0646\u0638\u0645\u0629 \u0645\u0646 \u0623\u062f\u0627\u0621 \u0645\u0647\u0627\u0645 \u062a\u062a\u0637\u0644\u0628 \u0639\u0627\u062f\u0629\u064b \u0630\u0643\u0627\u0621\u064b \u0628\u0634\u0631\u064a\u064b\u0627\u060c \u0645\u062b\u0644 \u0627\u0644\u062a\u0639\u0644\u0645\u060c \u0648\u0627\u062a\u062e\u0627"
+      },
+      "emoji": {
+        "ok": true,
+        "status": 200,
+        "has_fffd": false,
+        "len": 121,
+        "preview": "In software releases, \ud83d\ude80 signals a launch/deployment or new release, while \ud83d\udd0d signals investigation or issue-focused chang"
+      }
+    }
+  },
+  "prefix_cache": {
+    "ok": true,
+    "wall_s": 5.73,
+    "detail": {
+      "turn1_status": 200,
+      "turn1_cached": 0,
+      "turn2_status": 200,
+      "turn2_cached": 8704,
+      "turn2_prompt_tokens": 8726
+    }
+  },
+  "needle_256k": {
+    "ok": true,
+    "wall_s": 329.73,
+    "detail": {
+      "depth_50": {
+        "target": 256000,
+        "depth": 0.5,
+        "prompt_tokens": 255079,
+        "expected": "7416-BRAVO-43",
+        "answer": "7416-BRAVO-43",
+        "wall_s": 162.35,
+        "status": 200
+      },
+      "depth_92": {
+        "target": 256000,
+        "depth": 0.92,
+        "prompt_tokens": 255224,
+        "expected": "7513-CEDAR-44",
+        "answer": "7513-CEDAR-44",
+        "wall_s": 163.02,
+        "status": 200
+      }
+    }
+  },
+  "needle_1m": {
+    "ok": true,
+    "wall_s": 2977.4,
+    "detail": {
+      "depth_50": {
+        "target": 1024000,
+        "depth": 0.5,
+        "prompt_tokens": 1023701,
+        "expected": "7610-DELTA-45",
+        "answer": "7610-DELTA-45",
+        "wall_s": 1492.12,
+        "status": 200
+      },
+      "depth_92": {
+        "target": 1024000,
+        "depth": 0.92,
+        "prompt_tokens": 1023881,
+        "expected": "7707-EMBER-46",
+        "answer": "7707-EMBER-46",
+        "wall_s": 1484.71,
+        "status": 200
+      }
+    }
+  },
+  "soak": {
+    "ok": true,
+    "wall_s": 302.66,
+    "detail": {
+      "c4": {
+        "ok": true,
+        "streams": [
+          {
+            "status": 200,
+            "chars": 2025,
+            "reasoning_chars": 2064,
+            "loop": false,
+            "wall_s": 109.57
+          },
+          {
+            "status": 200,
+            "chars": 1599,
+            "reasoning_chars": 2019,
+            "loop": false,
+            "wall_s": 105.26
+          },
+          {
+            "status": 200,
+            "chars": 1271,
+            "reasoning_chars": 733,
+            "loop": false,
+            "wall_s": 92.71
+          },
+          {
+            "status": 200,
+            "chars": 914,
+            "reasoning_chars": 394,
+            "loop": false,
+            "wall_s": 85.79
+          }
+        ]
+      },
+      "c8": {
+        "ok": true,
+        "streams": [
+          {
+            "status": 200,
+            "chars": 2297,
+            "reasoning_chars": 1021,
+            "loop": false,
+            "wall_s": 183.9
+          },
+          {
+            "status": 200,
+            "chars": 1863,
+            "reasoning_chars": 1912,
+            "loop": false,
+            "wall_s": 193.09
+          },
+          {
+            "status": 200,
+            "chars": 1987,
+            "reasoning_chars": 1311,
+            "loop": false,
+            "wall_s": 190.35
+          },
+          {
+            "status": 200,
+            "chars": 1600,
+            "reasoning_chars": 761,
+            "loop": false,
+            "wall_s": 181.04
+          },
+          {
+            "status": 200,
+            "chars": 1311,
+            "reasoning_chars": 1634,
+            "loop": false,
+            "wall_s": 189.76
+          },
+          {
+            "status": 200,
+            "chars": 1632,
+            "reasoning_chars": 1506,
+            "loop": false,
+            "wall_s": 192.2
+          },
+          {
+            "status": 200,
+            "chars": 1199,
+            "reasoning_chars": 1310,
+            "loop": false,
+            "wall_s": 180.42
+          },
+          {
+            "status": 200,
+            "chars": 1014,
+            "reasoning_chars": 562,
+            "loop": false,
+            "wall_s": 156.75
+          }
+        ]
+      }
+    }
+  }
+}

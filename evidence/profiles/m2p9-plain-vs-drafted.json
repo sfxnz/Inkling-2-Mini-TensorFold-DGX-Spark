@@ -1,0 +1,57 @@
+{
+  "all_exact": true,
+  "cases": [
+    {
+      "prompt": "Explain in two sentences why paged KV caching helps concurrent LLM serving.",
+      "exact": true,
+      "drafted": "Paged KV caching stores key/value tensors in fixed-size blocks,",
+      "plain": "Paged KV caching stores key/value tensors in fixed-size blocks,",
+      "drafted_spec": {
+        "rounds": 50,
+        "drafted": 254,
+        "accepted": 77,
+        "acceptance_rate": 0.3031496062992126,
+        "tokens_per_round": 2.56
+      }
+    },
+    {
+      "prompt": "Write a Python function `quicksort(xs)` without comments.",
+      "exact": true,
+      "drafted": "",
+      "plain": "",
+      "drafted_spec": {
+        "rounds": 39,
+        "drafted": 187,
+        "accepted": 88,
+        "acceptance_rate": 0.47058823529411764,
+        "tokens_per_round": 3.282051282051282
+      }
+    },
+    {
+      "prompt": "List three differences between TCP and UDP.",
+      "exact": true,
+      "drafted": "- TCP is connection-oriented; UDP is connectionless.\n- TCP provides reliable, ordered delivery with error checking; UDP ",
+      "plain": "- TCP is connection-oriented; UDP is connectionless.\n- TCP provides reliable, ordered delivery with error checking; UDP ",
+      "drafted_spec": {
+        "rounds": 30,
+        "drafted": 206,
+        "accepted": 97,
+        "acceptance_rate": 0.470873786407767,
+        "tokens_per_round": 4.266666666666667
+      }
+    },
+    {
+      "prompt": "What is 17 * 23? Answer with just the number.",
+      "exact": true,
+      "drafted": "391",
+      "plain": "391",
+      "drafted_spec": {
+        "rounds": 10,
+        "drafted": 57,
+        "accepted": 34,
+        "acceptance_rate": 0.5964912280701754,
+        "tokens_per_round": 4.4
+      }
+    }
+  ]
+}
