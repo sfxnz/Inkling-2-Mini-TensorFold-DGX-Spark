@@ -1,7 +1,7 @@
 From 48328bff7a64d37350eedf2316a6c3e5e97004ad Mon Sep 17 00:00:00 2001
 From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 17:08:43 +0000
-Subject: [PATCH 01/14] inkling2: add paged FP8 KV pool, LRU radix reclaim, and
+Subject: [PATCH] inkling2: add paged FP8 KV pool, LRU radix reclaim, and
  capacity options
 
 ---
@@ -1908,6 +1908,3 @@ index f192bb1..ff1c72c 100644
          .{ "--prompt-precision", !std.mem.eql(u8, args.prompt_precision, "bf16") },
          .{ "--rope-yarn", args.rope_yarn != null },
      };
--- 
-2.43.0
-

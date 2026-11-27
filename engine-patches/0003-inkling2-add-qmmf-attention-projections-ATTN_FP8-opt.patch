@@ -1,8 +1,8 @@
 From 3658f55ed05d982f6eddbd194f28582b276f0871 Mon Sep 17 00:00:00 2001
 From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 17:23:18 +0000
-Subject: [PATCH 03/14] inkling2: add qmmf attention projections, ATTN_FP8
- opt-in, and sm_121a TC prefill
+Subject: [PATCH] inkling2: add qmmf attention projections, ATTN_FP8 opt-in,
+ and sm_121a TC prefill
 
 ---
  zig/build/cuda_kernels.zig                 |   2 +-
@@ -832,6 +832,3 @@ index 81ce2a6..28ceed2 100644
  test "ops: the argument structs keep ops.cu's layouts" {
      try std.testing.expectEqual(@as(usize, 8 * 8 + 8 + 8 + 3 * 8 + 8 + 6 * 4), @sizeOf(MixArgs));
      try std.testing.expectEqual(@as(usize, 9 * 8 + 2 * 8 + 7 * 4 + 4), @sizeOf(ConvArgs));
--- 
-2.43.0
-

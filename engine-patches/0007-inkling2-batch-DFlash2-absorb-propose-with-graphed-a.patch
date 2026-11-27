@@ -1,8 +1,8 @@
 From 8db05bcec5f115ef8c912dac316fec40cc7a9c24 Mon Sep 17 00:00:00 2001
 From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 20:09:22 +0000
-Subject: [PATCH 07/14] inkling2: batch DFlash2 absorb/propose with graphed
- absorb and batched shared_guard pricing
+Subject: [PATCH] inkling2: batch DFlash2 absorb/propose with graphed absorb
+ and batched shared_guard pricing
 
 ---
  zig/kernels/cuda/inkling2/dflash2.cuh      | 150 ++++++++
@@ -963,6 +963,3 @@ index ff35908..9a3721b 100644
          try std.testing.expectEqual(331_120_276 + 173_015_040, r.result.tracked.?.per_stream);
          try std.testing.expectEqual(35 * 4, r.result.paging.?.pool.pages);
          try std.testing.expect(r.result.tracked.?.ready <= 32 * gib - 4 * gib);
--- 
-2.43.0
-

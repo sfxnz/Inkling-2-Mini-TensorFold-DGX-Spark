@@ -1,8 +1,8 @@
 From 2e64f8b63e920f40b2cc3769d3bda3f0ad2452e4 Mon Sep 17 00:00:00 2001
 From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 22:28:34 +0000
-Subject: [PATCH 11/14] inkling2: cooperative TC prefill, wide decode MoE, FP8
- bulk prompt qmmf, and uncached loop_ar
+Subject: [PATCH] inkling2: cooperative TC prefill, wide decode MoE, FP8 bulk
+ prompt qmmf, and uncached loop_ar
 
 ---
  zig/kernels/cuda/inkling2/modelopt.cu        | 163 ++++++++++++++++++-
@@ -544,6 +544,3 @@ index 821094b..38c496c 100644
      .{ .name = "TF_INKLING2_TOPK_WARP", .raw = "1", .n = 1 },
      .{ .name = "TF_INKLING2_LAZY_HEAD", .raw = "1", .n = 1 },
      .{ .name = "TF_INKLING2_ATTN_FP8_PREFETCH", .raw = "1", .n = 1 },
--- 
-2.43.0
-

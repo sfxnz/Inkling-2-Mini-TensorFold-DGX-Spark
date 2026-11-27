@@ -1,8 +1,8 @@
 From 296d55af36f9b0f1b6a227bb0b85d1cf9cb017a3 Mon Sep 17 00:00:00 2001
 From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 23:27:31 +0000
-Subject: [PATCH 12/14] inkling2: batch prefix StateCopy spans, 8-row/32-row
- loop gates, and reg-cached ar/messages
+Subject: [PATCH] inkling2: batch prefix StateCopy spans, 8-row/32-row loop
+ gates, and reg-cached ar/messages
 
 ---
  zig/kernels/cuda/inkling2/loop_math.cu       | 278 ++++++++++++++++---
@@ -581,6 +581,3 @@ index fef8438..98b0ba6 100644
          if (!out) {
              if (session) |state| {
                  state.reset();
--- 
-2.43.0
-

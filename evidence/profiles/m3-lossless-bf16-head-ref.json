@@ -1,0 +1,45 @@
+{
+  "description": "M3 lossless BF16 Tensor Core sampled unembed reference (TF_INKLING2_SAMPLED_FP8_HEAD=0) and 4K-context Lever 9 decode A/B on tf-inkling2:m3-p9 (dba99e8, 0001..0023, MEMORY_RESERVE_GIB=13.0, pswpout_delta=0)",
+  "sampled_bf16_tc_unembed_outer_prose_nothink": {
+    "m3_p9_base": {
+      "extra_env": "TF_INKLING2_ATTN_FP8=1 TF_INKLING2_PREFILL_TC=1 TF_INKLING2_GATE_FP8=1 TF_INKLING2_SAMPLED_FP8_HEAD=0",
+      "runs": 6,
+      "c1_decode_tok_s": 47.92,
+      "c1_ms_per_round": 45.499,
+      "c4_agg_tok_s": 105.13,
+      "c4_per_stream_tok_s": 27.5,
+      "c4_ms_per_round": 75.167
+    },
+    "m3_p9_half_bn_1": {
+      "extra_env": "TF_INKLING2_ATTN_FP8=1 TF_INKLING2_PREFILL_TC=1 TF_INKLING2_GATE_FP8=1 TF_QMMF_HALF_BN=1 TF_INKLING2_SAMPLED_FP8_HEAD=0",
+      "runs": 4,
+      "c1_decode_tok_s": 49.325,
+      "c1_ms_per_round": 43.939,
+      "c4_agg_tok_s": 106.67,
+      "c4_per_stream_tok_s": 27.635,
+      "c4_ms_per_round": 74.129
+    },
+    "m3_p9_moe_waves_1": {
+      "extra_env": "TF_INKLING2_ATTN_FP8=1 TF_INKLING2_PREFILL_TC=1 TF_INKLING2_GATE_FP8=1 TF_INKLING2_MOE_WAVES=1 TF_INKLING2_SAMPLED_FP8_HEAD=0",
+      "runs": 4,
+      "c1_decode_tok_s": 48.56,
+      "c1_ms_per_round": 42.577,
+      "c4_agg_tok_s": 106.13,
+      "c4_per_stream_tok_s": 28.08,
+      "c4_ms_per_round": 73.715
+    }
+  },
+  "lever9_4k_context_decode_ab_greedy_prose": {
+    "runs": 4,
+    "m3_p8_before_bf16_tc_df_attn": {
+      "decode_tok_s": 49.76,
+      "ms_per_round": 50.19
+    },
+    "m3_p9_after_bf16_tc_df_attn": {
+      "decode_tok_s": 54.55,
+      "ms_per_round": 41.67,
+      "delta_ms_per_round": -8.52,
+      "delta_pct": 9.63
+    }
+  }
+}

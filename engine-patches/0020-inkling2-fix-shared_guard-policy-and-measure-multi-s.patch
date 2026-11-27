@@ -1,0 +1,588 @@
+From 2831881cfd8c054d5e36daecb664d4478a62d014 Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 12:26:08 +0000
+Subject: [PATCH] inkling2: fix shared_guard policy and measure multi-stream
+ shared/hold costs
+
+Fix multi-stream shared drafting policy (100% lossless) so c4 decode sustains
+uniform fixed-block drafting without graph-miss thrashing or single-stream vetoes:
+
+- shared_guard.zig:
+  - Enforce uniform shared draft depth for batched fixed-block drafters (minimizing
+    verify_cache shapes to 1 key per depth), capped at TF_INKLING2_SHARED_MAX_ROWS
+    (default 16, avoiding MoE tile=16 double-reads; 0 = uncapped).
+  - Replace hard all-or-nothing 1.02 per-stream veto with aggregate throughput
+    maximization (>1.01x plain) plus a softer per-stream floor
+    (TF_INKLING2_SHARED_STREAM_FLOOR, default 0.85).
+  - Probe d=2 on rounds 1-2 instead of round 16 so drafting starts by round 3,
+    probe d=3 on rounds 24-25 when room permits, and refresh plain_ms at round 16
+    after early stream divergence.
+  - Dampen single-round graph-capture spike outliers in block_costs (alpha=0.04
+    above 1.25x), rescale block_costs on sharp plain_ms divergence jumps so ratios
+    stay anchored to measured ms, and use hold_costs + same-regime shared_costs
+    priors.
+
+- loop_backend.zig:
+  - Measure diverged 4-stream verify costs at widths 12, 16, 24, 32 (using distinct
+    token IDs per slot so MoE routing reflects real multi-stream divergence) and
+    batched DFlash2 hold_costs at 1, 2, 4, 8 streams during warm(), plus lazy vs
+    dense sampled head delta.
+  - Persist extended costs in WarmRecord schema v2 (cache key inkling2-warm-v3)
+    and export shared_costs + hold_costs in facts().
+
+Credits (for NOTICE, Apache-2.0 / MIT):
+- Shared fixed-block pricing and batched hold_costs concepts adapted from
+  MiaAI-Lab (commit 9e3cf20b, patches 0006-mini-drafts.patch and
+  0018-mini-dflash2-drafter.patch) and tonyd2wild (commit 2fe0eb57, patch 0018).
+---
+ zig/src/core/lanes/shared_guard.zig        | 204 +++++++++++++++++++--
+ zig/src/families/inkling2/loop_backend.zig | 162 +++++++++++++++-
+ 2 files changed, 336 insertions(+), 30 deletions(-)
+
+diff --git a/zig/src/core/lanes/shared_guard.zig b/zig/src/core/lanes/shared_guard.zig
+index 24f7c03..2643c01 100644
+--- a/zig/src/core/lanes/shared_guard.zig
++++ b/zig/src/core/lanes/shared_guard.zig
+@@ -3,6 +3,21 @@ const std = @import("std");
+ const Engine = @import("engine.zig").Engine;
+ const win = @import("windows.zig");
+ const Table = @import("table.zig").Table;
++const hold_price = @import("hold_price.zig");
++
++/// Cap shared verify total rows for fixed-block drafters (0: uncapped batch_rows). Default 16 avoids MoE tile=16 double-reads.
++fn sharedMaxRows() usize {
++    const raw = std.c.getenv("TF_INKLING2_SHARED_MAX_ROWS") orelse return 16;
++    return std.fmt.parseInt(usize, std.mem.span(raw), 10) catch 16;
++}
++
++/// Minimum per-stream speed ratio relative to plain decode in batched fixed-block shared mode.
++fn sharedStreamFloor() f64 {
++    const raw = std.c.getenv("TF_INKLING2_SHARED_STREAM_FLOOR") orelse return 0.85;
++    const v = std.fmt.parseFloat(f64, std.mem.span(raw)) catch return 0.85;
++    if (!std.math.isFinite(v)) return 0.85;
++    return std.math.clamp(v, 0.50, 1.05);
++}
+ 
+ const Prices = struct {
+     streams: usize,
+@@ -19,16 +34,41 @@ const Prices = struct {
+         p.rounds +%= 1;
+         if (!std.math.isFinite(ms) or ms <= 0) return;
+         if (rows == p.streams) {
+-            blend(&p.plain_ms, ms);
++            // Faster tracking after early correlated prefix rounds diverge into steady-state multi-stream decode.
++            if (p.plain_ms) |old| {
++                const jump = ms > old * 1.15;
++                const alpha: f64 = if (jump) 0.50 else if (p.rounds >= 8 and ms > old) 0.35 else 0.15;
++                const next = old + alpha * (ms - old);
++                // Keep previously measured block ratios anchored to their real ms when plain_ms jumps on divergence.
++                if (next > old * 1.10) {
++                    if (p.block_costs) |*costs| {
++                        const scale = old / next;
++                        for (costs.slots) |*slot| {
++                            if (slot.*) |ratio| {
++                                if (ratio > 0) slot.* = @max(1.0, ratio * scale);
++                            }
++                        }
++                    }
++                }
++                p.plain_ms = next;
++            } else p.plain_ms = ms;
+         } else if (p.plain_ms) |plain| {
+             const extra = rows - p.streams;
+             if (p.block_costs) |*costs| {
+-                // First use may capture a graph. Measure replay from the second occurrence on.
++                // First use may capture a graph. Measure replay from the second occurrence on, and dampen
++                // single-round capture-spike outliers so a miss on a new slot tuple cannot poison block_costs.
+                 const key: i64 = @intCast(extra);
+                 const seen = costs.get(key);
+-                var ratio = if (seen == 0) null else seen;
+-                blend(&ratio, @max(1, ms / plain));
+-                try costs.put(gpa, key, if (seen == null) 0 else ratio.?);
++                const obs = @max(1.0, ms / plain);
++                if (seen == null) {
++                    try costs.put(gpa, key, 0);
++                } else if (seen.? == 0) {
++                    try costs.put(gpa, key, obs);
++                } else {
++                    const old = seen.?;
++                    const alpha: f64 = if (obs > old * 1.25) 0.04 else 0.15;
++                    try costs.put(gpa, key, old + alpha * (obs - old));
++                }
+             }
+             blend(&p.extra_row_ms, @max(0, ms - plain) / @as(f64, @floatFromInt(extra)));
+         }
+@@ -86,36 +126,67 @@ pub fn budgets(e: *Engine, plans: []const win.Plan, heads: []const usize, out: [
+     try prices.observe(e.gpa, rows, ms);
+     if (heads.len == 0 or prices.plain_ms == null) return;
+     for (plans) |p| if (p.stream.finished or p.stream.paused or p.kind == .forced) return;
+-    if (block and prices.rounds % 64 == 63) return; // refresh the plain price during sustained drafting
++    // Refresh plain_ms once after early stream divergence (round 16) and periodically during sustained drafting.
++    if (block and (prices.rounds == 16 or prices.rounds % 64 == 63)) return;
+ 
+     const a = e.arena.allocator();
+     const chances = try a.alloc([]const f64, plans.len);
+     @memset(chances, &.{});
+     for (heads) |i| {
+         const s = plans[i].stream;
+-        const room: usize = @intCast(@max(0, s.draftRoom() - 1));
+-        const most = @min(e.cfg.most_drafts, room);
++        const room_s: usize = @intCast(@max(0, s.draftRoom() - 1));
++        const most = @min(e.cfg.most_drafts, room_s);
+         if (most == 0 or s.force.items.len != 0) continue;
+         chances[i] = try @import("allocate.zig").chainProbabilities(a, try e.rule.rates(win.who(s)), most);
+     }
+     const selected = try a.alloc(i64, plans.len);
+     @memset(selected, 0);
+-    const room = e.cfg.batch_rows -| plans.len;
+-    const load_head = e.rule.sharedStepMs();
++    const max_rows_cap = if (block) sharedMaxRows() else 0;
++    const max_total: usize = if (max_rows_cap > 0) @min(e.cfg.batch_rows, max_rows_cap) else e.cfg.batch_rows;
++    const room = max_total -| plans.len;
++    const load_head = if (block and e.rule.k.hold_costs.len > 0)
++        hold_price.holdMs(e.rule.k.hold_costs, plans.len, 2)
++    else
++        e.rule.sharedStepMs();
+     const head_ms = if (block) prices.head_ms orelse load_head else @max(load_head, prices.head_ms orelse 0);
+     const costs = prices.block_costs orelse Table{};
++    const prior_costs: ?*const Table = if (block and !e.cfg.shared_costs.empty()) &e.cfg.shared_costs else null;
+     const row_ms = prices.extra_row_ms orelse 0;
+     if (prices.extra_row_ms != null and (!block or hasMeasured(costs))) {
+-        try chooseMode(a, chances, room, prices.plain_ms.?, row_ms, head_ms, costs, batched, selected);
++        if (batched) {
++            try chooseUniform(a, chances, room, prices.plain_ms.?, row_ms, head_ms, costs, prior_costs, sharedStreamFloor(), selected);
++        } else {
++            try chooseMode(a, chances, room, prices.plain_ms.?, row_ms, head_ms, costs, false, selected);
++        }
+     }
+-    // Adjacent fixed-block probes let an unseen width warm up and replay once.
+-    const phase = prices.rounds % 128;
+-    if ((phase == 16 or (block and phase == 17)) and (block or std.mem.allEqual(i64, selected, 0))) {
+-        const probe: usize = if (block and (prices.rounds / 128) % 2 == 1) 4 else 2;
+-        const width = @min(probe, room / plans.len);
+-        for (chances) |p| {
+-            if (p.len < width) break;
+-        } else @memset(selected, @intCast(width));
++    // Fast initial fixed-block probe on rounds 1-2 (capture + replay) so drafting starts by round 3,
++    // plus a probe for d=3 on rounds 24-25 when room permits, and periodic re-probes every 128 rounds.
++    const max_uniform = room / plans.len;
++    if (block) {
++        var probe_w: usize = 0;
++        if (prices.rounds == 1 or prices.rounds == 2) {
++            probe_w = @min(2, max_uniform);
++        } else if ((prices.rounds == 24 or prices.rounds == 25) and max_uniform >= 3 and (costs.get(@intCast(3 * plans.len)) orelse 0) <= 0) {
++            probe_w = 3;
++        } else if (prices.rounds > 25) {
++            const phase = prices.rounds % 128;
++            if (phase == 64 or phase == 65) {
++                const target: usize = if ((prices.rounds / 128) % 2 == 1) 3 else 2;
++                probe_w = @min(target, max_uniform);
++            }
++        }
++        if (probe_w > 0) {
++            for (chances) |p| {
++                if (p.len < probe_w) break;
++            } else @memset(selected, @intCast(probe_w));
++        }
++    } else if (prices.rounds % 128 == 16 and std.mem.allEqual(i64, selected, 0)) {
++        const width = @min(@as(usize, 2), max_uniform);
++        if (width > 0) {
++            for (chances) |p| {
++                if (p.len < width) break;
++            } else @memset(selected, @intCast(width));
++        }
+     }
+     for (heads, out) |i, *d| {
+         d.* = selected[i];
+@@ -129,6 +200,10 @@ fn hasMeasured(costs: Table) bool {
+ }
+ 
+ fn forwardMs(costs: Table, extra: usize, plain_ms: f64, row_ms: f64) f64 {
++    return forwardMsPrior(costs, null, 0, extra, plain_ms, row_ms);
++}
++
++fn forwardMsPrior(costs: Table, prior: ?*const Table, streams: usize, extra: usize, plain_ms: f64, row_ms: f64) f64 {
+     var lo: usize = 0;
+     var low_ms = plain_ms;
+     for (costs.slots, 0..) |v, i| {
+@@ -142,6 +217,17 @@ fn forwardMs(costs: Table, extra: usize, plain_ms: f64, row_ms: f64) f64 {
+         lo = i;
+         low_ms = high_ms;
+     }
++    if (prior) |table| if (streams > 0 and lo > 0) {
++        const base_w: i64 = @intCast(streams + lo);
++        const target_w: i64 = @intCast(streams + extra);
++        // Never divide a multi-stream diverged cost by a 1-stream correlated cost across the width=8 boundary.
++        const same_regime = (base_w <= 8 and target_w <= 8) or (base_w >= 12 and target_w >= 12);
++        if (same_regime) {
++            if (table.get(base_w)) |s_lo| if (table.get(target_w)) |s_hi| if (s_lo > 0 and s_hi >= s_lo) {
++                return low_ms * (s_hi / s_lo);
++            };
++        }
++    };
+     return low_ms + row_ms * @as(f64, @floatFromInt(extra - lo));
+ }
+ 
+@@ -149,7 +235,48 @@ fn choose(a: std.mem.Allocator, chances: []const []const f64, room: usize, plain
+     return chooseMode(a, chances, room, plain_ms, row_ms, head_ms, costs, false, out);
+ }
+ 
++/// Uniform-depth selection for batched fixed-block drafters: keeps verify_cache shapes minimal (1 key per depth)
++/// and maximizes aggregate tokens/ms subject to a softer per-stream floor so one unlucky stream cannot veto all streams.
++fn chooseUniform(a: std.mem.Allocator, chances: []const []const f64, room: usize, plain_ms: f64, row_ms: f64, head_ms: f64, costs: Table, prior: ?*const Table, floor: f64, out: []i64) !void {
++    if (chances.len == 0 or room == 0) return;
++    const taken = try a.alloc(i64, chances.len);
++    defer a.free(taken);
++    const tokens = try a.alloc(f64, chances.len);
++    defer a.free(tokens);
++    var max_len: usize = 0;
++    for (chances) |p| max_len = @max(max_len, p.len);
++    const plain_rate = @as(f64, @floatFromInt(chances.len)) / plain_ms;
++    var best = plain_rate * 1.01;
++    var d: usize = 1;
++    while (d <= max_len) : (d += 1) {
++        var extra: usize = 0;
++        var sum: f64 = 0;
++        var any_head = false;
++        for (chances, taken, tokens) |p, *tk, *tok| {
++            const n = @min(d, p.len);
++            tk.* = @intCast(n);
++            extra += n;
++            if (n > 0) any_head = true;
++            var expected: f64 = 1.0;
++            for (p[0..n]) |chance| expected += chance;
++            tok.* = expected;
++            sum += expected;
++        }
++        if (!any_head or extra > room) break;
++        const ms = forwardMsPrior(costs, prior, chances.len, extra, plain_ms, row_ms) + head_ms;
++        const rate = sum / ms;
++        if (rate <= best) continue;
++        for (tokens) |expected| {
++            if (expected * plain_ms < ms * floor) break;
++        } else {
++            best = rate;
++            @memcpy(out, taken);
++        }
++    }
++}
++
+ fn chooseMode(a: std.mem.Allocator, chances: []const []const f64, room: usize, plain_ms: f64, row_ms: f64, head_ms: f64, costs: Table, batched: bool, out: []i64) !void {
++    if (batched) return chooseUniform(a, chances, room, plain_ms, row_ms, head_ms, costs, null, 0.85, out);
+     const taken = try a.alloc(i64, chances.len);
+     defer a.free(taken);
+     @memset(taken, 0);
+@@ -177,7 +304,7 @@ fn chooseMode(a: std.mem.Allocator, chances: []const []const f64, room: usize, p
+         taken[pick] += 1;
+         tokens[pick] += chance;
+         sum += chance;
+-        const head_cost = if (batched) (if (heads > 0) head_ms else 0) else head_ms * @as(f64, @floatFromInt(heads));
++        const head_cost = head_ms * @as(f64, @floatFromInt(heads));
+         const ms = forwardMs(costs, extra, plain_ms, row_ms) + head_cost;
+         const rate = sum / ms;
+         if (rate <= best) continue;
+@@ -228,3 +355,40 @@ test "fixed block pricing learns replay cost by width and retains the per-stream
+     try chooseMode(a, &.{ &prose, &prose, &prose, &prose }, 12, 35, 3, 5, .{}, true, &c4_depths);
+     try std.testing.expect(c4_depths[0] > 0 and c4_depths[1] > 0 and c4_depths[2] > 0 and c4_depths[3] > 0);
+ }
++
++test "uniform shared mode dampens spikes, rescales on plain jump, and honors stream floor" {
++    const a = std.testing.allocator;
++    var prices: Prices = .{ .streams = 4, .sampled = false, .batched = true, .block_costs = .{} };
++    defer prices.block_costs.?.deinit(a);
++    try prices.observe(a, 4, 16);
++    try prices.observe(a, 12, 95); // capture ignored
++    try prices.observe(a, 12, 36); // replay: ratio = 2.25
++    try prices.observe(a, 12, 90); // graph-miss spike dampened
++    try std.testing.expect(prices.block_costs.?.get(8).? < 2.45);
++    // Plain jumps from 16 -> 32 on divergence: plain_ms moves to 24 and block_costs rescales down.
++    try prices.observe(a, 4, 32);
++    try std.testing.expectApproxEqAbs(@as(f64, 24), prices.plain_ms.?, 1e-9);
++    try std.testing.expect(prices.block_costs.?.get(8).? * prices.plain_ms.? < 40);
++
++    var prior: Table = .{};
++    defer prior.deinit(a);
++    try prior.put(a, 12, 36.0);
++    try prior.put(a, 16, 39.0);
++    // At plain=31.5 and measured costs[8]=36/31.5, d=3 uses prior ratio 39/36.
++    var measured: Table = .{};
++    defer measured.deinit(a);
++    try measured.put(a, 8, 36.0 / 31.5);
++    try std.testing.expectApproxEqAbs(@as(f64, 39.0), forwardMsPrior(measured, &prior, 4, 12, 31.5, 5.0), 1e-9);
++
++    const strong = [_]f64{ 0.85, 0.70, 0.55 };
++    const mild = [_]f64{ 0.30, 0.15, 0.05 };
++    const very_weak = [_]f64{ 0.01, 0.0, 0.0 };
++    var out: [4]i64 = @splat(0);
++    // With floor=0.85, mild stream (expected ~1.45 vs 41/31.5*0.85=1.11) passes and uniform d>0 wins aggregate.
++    try chooseUniform(a, &.{ &strong, &strong, &strong, &mild }, 12, 31.5, 1.0, 5.0, measured, &prior, 0.85, &out);
++    try std.testing.expect(out[0] > 0 and out[0] == out[1] and out[1] == out[2] and out[2] == out[3]);
++    // With a very weak stream (expected ~1.06 < 41/31.5*0.85=1.11), floor vetoes drafting.
++    out = @splat(0);
++    try chooseUniform(a, &.{ &strong, &strong, &strong, &very_weak }, 12, 31.5, 1.0, 5.0, measured, &prior, 0.85, &out);
++    try std.testing.expectEqualSlices(i64, &.{ 0, 0, 0, 0 }, &out);
++}
+diff --git a/zig/src/families/inkling2/loop_backend.zig b/zig/src/families/inkling2/loop_backend.zig
+index 5cb5645..8c3607c 100644
+--- a/zig/src/families/inkling2/loop_backend.zig
++++ b/zig/src/families/inkling2/loop_backend.zig
+@@ -74,19 +74,30 @@ pub const Backend = struct {
+     copy_spans_buf: ?cuda.DeviceBuffer = null,
+     prompts: ?core.kv_prompts.Prompts = null,
+     costs: [dspark.depth + 1]lanes.config.Cost = undefined,
+-    shared_costs: [dspark.depth + 1]lanes.config.Cost = undefined,
++    shared_costs: [dspark.depth + 1 + extra_shared_widths.len]lanes.config.Cost = undefined,
++    shared_costs_len: usize = 0,
++    hold_costs: [hold_stream_counts.len * 2]lanes.hold_price.HoldCost = undefined,
++    hold_costs_len: usize = 0,
+     propose_ms: f64 = 0,
++    sampled_head_delta_ms: f64 = 0,
+     priced_width: usize = 0,
+     shared_block_streams: u32 = 0,
+ 
++    const extra_shared_widths = [_]u32{ 12, 16, 24, 32 };
++    const hold_stream_counts = [_]u32{ 1, 2, 4, 8 };
+     const be = lanes.backend;
+ 
+     const WarmRecord = extern struct {
+-        schema: u32 = 1,
++        schema: u32 = 2,
+         priced_width: u32,
++        shared_count: u32,
++        hold_count: u32,
+         propose_ms: f64,
++        sampled_head_delta_ms: f64,
+         total_ms: [dspark.depth + 1]f64,
+         verify_ms: [dspark.depth + 1]f64,
++        extra_shared_ms: [extra_shared_widths.len]f64,
++        hold_ms: [hold_stream_counts.len]f64,
+         key: [32]u8,
+         digest: [32]u8,
+ 
+@@ -95,12 +106,21 @@ pub const Backend = struct {
+         }
+ 
+         fn valid(rec: *const WarmRecord, expected_key: [32]u8, max_w: usize) bool {
+-            if (rec.schema != 1 or rec.priced_width != max_w or !std.mem.eql(u8, &rec.key, &expected_key)) return false;
++            if (rec.schema != 2 or rec.priced_width != max_w or !std.mem.eql(u8, &rec.key, &expected_key)) return false;
++            if (rec.shared_count < max_w or rec.shared_count > max_w + extra_shared_widths.len) return false;
++            if (rec.hold_count > hold_stream_counts.len) return false;
+             if (!std.math.isFinite(rec.propose_ms) or rec.propose_ms < 0) return false;
++            if (!std.math.isFinite(rec.sampled_head_delta_ms) or rec.sampled_head_delta_ms < 0) return false;
+             for (0..max_w) |i| {
+                 if (!std.math.isFinite(rec.total_ms[i]) or rec.total_ms[i] <= 0) return false;
+                 if (!std.math.isFinite(rec.verify_ms[i]) or rec.verify_ms[i] <= 0) return false;
+             }
++            for (0..rec.shared_count - max_w) |i| {
++                if (!std.math.isFinite(rec.extra_shared_ms[i]) or rec.extra_shared_ms[i] <= 0) return false;
++            }
++            for (0..rec.hold_count) |i| {
++                if (!std.math.isFinite(rec.hold_ms[i]) or rec.hold_ms[i] <= 0) return false;
++            }
+             var copy = rec.*;
+             copy.seal();
+             return std.mem.eql(u8, &rec.digest, &copy.digest);
+@@ -113,6 +133,8 @@ pub const Backend = struct {
+         const cap_str = std.fmt.bufPrint(&cap_buf, "sm{d}", .{cap}) catch return null;
+         var ctx_buf: [24]u8 = undefined;
+         const ctx_str = std.fmt.bufPrint(&ctx_buf, "ctx{d}", .{b.m.context}) catch return null;
++        var slots_buf: [16]u8 = undefined;
++        const slots_str = std.fmt.bufPrint(&slots_buf, "s{d}", .{@min(b.m.n_slots, 8)}) catch return null;
+         const attn_str: []const u8 = if (b.m.w.layers.len > 0)
+             if (b.m.w.layers[0].attn.qmmf) |qa|
+                 if (qa.wq.mode == .fp8g)
+@@ -138,7 +160,7 @@ pub const Backend = struct {
+         var tc_buf: [24]u8 = undefined;
+         const tc_str = std.fmt.bufPrint(&tc_buf, "tc{d}_v{d}", .{ modelopt.prefillTcMode(), modelopt.verifyTcRows() }) catch return null;
+         const parts = [_][]const u8{
+-            "inkling2-warm-v2",
++            "inkling2-warm-v3",
+             cap_str,
+             @tagName(d.*),
+             draft_mode,
+@@ -147,14 +169,78 @@ pub const Backend = struct {
+             tc_str,
+             @tagName(b.m.layout.format),
+             ctx_str,
++            slots_str,
+         };
+         return lanes.cost_cache.key(b.gpa, io, &parts) catch null;
+     }
+ 
++    /// Time a diverged multi-stream verify forward on `streams` slots x `per_stream` rows with distinct token IDs.
++    fn priceMulti(b: *Backend, g: *graph.Graphs, io: std.Io, streams: usize, per_stream: usize, lazy: bool, samples: usize) !f64 {
++        const vocab: usize = b.m.w.c.text.unpadded_vocab;
++        var toks: [4][window_rows]u32 = undefined;
++        var chains: [4]round.Chain = undefined;
++        for (0..streams) |slot| {
++            for (0..per_stream) |j| {
++                toks[slot][j] = @intCast((1000 + slot * 4099 + j * 131) % vocab);
++            }
++            chains[slot] = .{ .slot = slot, .position = 0, .tokens = toks[slot][0..per_stream], .record = per_stream > 1 };
++        }
++        const total_rows = streams * per_stream;
++        const saved_slot = b.m.slot;
++        defer b.m.slot = saved_slot;
++        for (0..streams) |slot| {
++            b.m.slot = slot;
++            try b.m.reset(b.s);
++        }
++        // Warm and capture graph once before timing replays.
++        try g.forward(b.m, b.k, b.s, chains[0..streams], total_rows, true, lazy);
++        try b.s.synchronize();
++        var times: [3]f64 = undefined;
++        for (times[0..samples]) |*ms| {
++            for (0..streams) |slot| {
++                b.m.slot = slot;
++                try b.m.reset(b.s);
++            }
++            try b.s.synchronize();
++            const t = std.Io.Clock.awake.now(io);
++            try g.forward(b.m, b.k, b.s, chains[0..streams], total_rows, true, lazy);
++            try b.s.synchronize();
++            ms.* = graph.elapsed(io, t);
++        }
++        return graph.median(times[0..samples]);
++    }
++
++    /// Time a batched DFlash2 proposeBatch pass for `streams` active streams.
++    fn priceHoldBatch(b: *Backend, d: *draft_runtime.Drafter, io: std.Io, streams: usize, samples: usize) !f64 {
++        const vocab: usize = b.m.w.c.text.unpadded_vocab;
++        var absorbs: [engine.max_slots]dflash.AbsorbItem = undefined;
++        var proposes: [engine.max_slots]dflash.ProposeItem = undefined;
++        for (0..streams) |slot| {
++            d.session(slot).reset();
++            absorbs[slot] = .{ .slot = slot, .from = b.m.taps.?.buffer, .pos = 0, .rows = 1 };
++            proposes[slot] = .{ .slot = slot, .pending = @intCast((1000 + slot * 4099) % vocab), .n = 2, .rule = null };
++        }
++        try d.absorbBatch(&b.k.glue, b.s, absorbs[0..streams]);
++        try b.s.synchronize();
++        // Warm and capture proposal graph for this stream count.
++        try d.proposeBatch(b.m, b.k, b.s, proposes[0..streams]);
++        var times: [3]f64 = undefined;
++        for (times[0..samples]) |*ms| {
++            const t = std.Io.Clock.awake.now(io);
++            try d.proposeBatch(b.m, b.k, b.s, proposes[0..streams]);
++            ms.* = graph.elapsed(io, t);
++        }
++        for (0..streams) |slot| d.session(slot).reset();
++        return graph.median(times[0..samples]);
++    }
++
+     pub fn warm(b: *Backend, io: std.Io) !void {
+-        var lease: kv.Lease = .{};
+-        defer pages.finish(b.m, &lease);
+-        try pages.reserve(b.m, b.s, 0, &lease, pages.need(window_rows, 0));
++        var leases: [4]kv.Lease = @splat(.{});
++        const warm_slots = @min(b.m.n_slots, leases.len);
++        defer for (leases[0..warm_slots]) |*l| pages.finish(b.m, l);
++        for (0..warm_slots) |slot| {
++            try pages.reserve(b.m, b.s, slot, &leases[slot], pages.need(window_rows, 0));
++        }
+         const environment = @import("sys").environment;
+         const separate = try environment.read(bool, "TF_INKLING2_VERIFY_GRAPHS", true);
+         b.graphs = @as(@TypeOf(b.graphs.?), undefined);
+@@ -185,13 +271,26 @@ pub const Backend = struct {
+                         b.costs[idx] = .{ .width = @intCast(idx + 1), .ms = rec.total_ms[idx] };
+                         b.shared_costs[idx] = .{ .width = @intCast(idx + 1), .ms = rec.verify_ms[idx] };
+                     }
++                    b.shared_costs_len = max;
++                    for (0..rec.shared_count - max) |i| {
++                        b.shared_costs[b.shared_costs_len] = .{ .width = extra_shared_widths[i], .ms = rec.extra_shared_ms[i] };
++                        b.shared_costs_len += 1;
++                    }
++                    b.hold_costs_len = 0;
++                    for (0..rec.hold_count) |i| {
++                        const sc = hold_stream_counts[i];
++                        b.hold_costs[b.hold_costs_len] = .{ .streams = sc, .depth = 1, .ms = rec.hold_ms[i] };
++                        b.hold_costs[b.hold_costs_len + 1] = .{ .streams = sc, .depth = dspark.depth, .ms = rec.hold_ms[i] };
++                        b.hold_costs_len += 2;
++                    }
+                     b.propose_ms = rec.propose_ms;
++                    b.sampled_head_delta_ms = rec.sampled_head_delta_ms;
+                     b.priced_width = max;
+                     if (lazy) try g.warm(b.m, b.k, b.s, 1, false, true);
+                     if (max >= 2) try g.warm(b.m, b.k, b.s, max, true, lazy);
+                     try b.m.reset(b.s);
+                     try b.s.synchronize();
+-                    std.log.info("Mini CUDA loaded cached window costs ({d} widths, propose {d:.2} ms)", .{ max, b.propose_ms });
++                    std.log.info("Mini CUDA loaded cached window costs ({d} widths, {d} shared, {d} hold, propose {d:.2} ms, sampled +{d:.2} ms)", .{ max, b.shared_costs_len, rec.hold_count, b.propose_ms, b.sampled_head_delta_ms });
+                     return;
+                 }
+             }
+@@ -219,12 +318,49 @@ pub const Backend = struct {
+             if (width == 2 or (d.* == .dflash2 and width == max)) b.propose_ms = propose_ms;
+         }
+         b.priced_width = max;
++        b.shared_costs_len = max;
++        b.hold_costs_len = 0;
++        b.sampled_head_delta_ms = 0;
++        if (lazy) {
++            const dense1_ms = try g.price(b.m, b.k, b.s, io, 1, false, 2);
++            b.sampled_head_delta_ms = @max(0, dense1_ms - b.shared_costs[0].ms);
++        }
++        var extra_ms: [extra_shared_widths.len]f64 = @splat(0);
++        var hold_ms_arr: [hold_stream_counts.len]f64 = @splat(0);
++        var hold_count: u32 = 0;
++        if (d.* == .dflash2) {
++            if (warm_slots >= 4) {
++                for (extra_shared_widths, 0..) |w, idx| {
++                    const per: usize = w / 4;
++                    if (per > b.m.context or per > window_rows) break;
++                    const ms = try b.priceMulti(g, io, 4, per, lazy, samples);
++                    b.shared_costs[b.shared_costs_len] = .{ .width = w, .ms = ms };
++                    b.shared_costs_len += 1;
++                    extra_ms[idx] = ms;
++                }
++            }
++            const avail_draft_slots = @min(b.m.n_slots, d.dflash2.count);
++            for (hold_stream_counts, 0..) |sc, idx| {
++                if (sc > avail_draft_slots) break;
++                const ms = try b.priceHoldBatch(d, io, sc, samples);
++                hold_ms_arr[idx] = ms;
++                b.hold_costs[b.hold_costs_len] = .{ .streams = sc, .depth = 1, .ms = ms };
++                b.hold_costs[b.hold_costs_len + 1] = .{ .streams = sc, .depth = dspark.depth, .ms = ms };
++                b.hold_costs_len += 2;
++                hold_count += 1;
++            }
++        }
+         if (cache_key) |ckey| {
+             var rec: WarmRecord = .{
+                 .priced_width = @intCast(max),
++                .shared_count = @intCast(b.shared_costs_len),
++                .hold_count = hold_count,
+                 .propose_ms = b.propose_ms,
++                .sampled_head_delta_ms = b.sampled_head_delta_ms,
+                 .total_ms = @splat(0),
+                 .verify_ms = @splat(0),
++                .extra_shared_ms = extra_ms,
++                .hold_ms = hold_ms_arr,
+                 .key = ckey,
+                 .digest = undefined,
+             };
+@@ -235,9 +371,14 @@ pub const Backend = struct {
+             rec.seal();
+             lanes.cost_cache.save(WarmRecord, b.gpa, io, ckey, rec);
+         }
++        for (0..warm_slots) |slot| {
++            b.m.slot = slot;
++            try b.m.reset(b.s);
++        }
++        b.m.slot = 0;
+         d.session(0).reset();
+-        try b.m.reset(b.s);
+         try b.s.synchronize();
++        std.log.info("Mini CUDA measured window costs ({d} widths, {d} shared, {d} hold, propose {d:.2} ms, sampled +{d:.2} ms)", .{ max, b.shared_costs_len, hold_count, b.propose_ms, b.sampled_head_delta_ms });
+     }
+ 
+     pub fn decode(b: *Backend, tokens: []const u32, position: usize, record: bool) !void {
+@@ -333,7 +474,8 @@ pub const Backend = struct {
+             .draft_streams = is_dflash2,
+             .window_costs = b.costs[0..b.priced_width],
+             .window_costs_lone = drafting,
+-            .shared_costs = b.shared_costs[0..b.priced_width],
++            .shared_costs = b.shared_costs[0..b.shared_costs_len],
++            .hold_costs = b.hold_costs[0..b.hold_costs_len],
+             .shared_step_ms = if (drafting) b.propose_ms else null,
+             .learn_row_costs = drafting,
+             .copy_drafts = !drafting,

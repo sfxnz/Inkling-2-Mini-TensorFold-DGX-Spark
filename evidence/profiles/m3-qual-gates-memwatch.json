@@ -1,0 +1,9 @@
+{
+  "samples": 684,
+  "min_mem_avail_gib": 10.45,
+  "peak_gpu_res_gib": 102.89,
+  "peak_proc_anon_gib": 1.43,
+  "pswpout_delta": 0,
+  "max_load_1m": 2.47,
+  "alerts": []
+}

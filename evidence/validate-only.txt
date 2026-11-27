@@ -16,7 +16,7 @@ config (recipe.conf, environment wins):
   DRAFTER_SHA256=217980ab00d116693fa5946df7bbfd967caf5fac1f529afd541fbd470ddb54ee
   DRAFTER_BITS=4
   BASE_IMAGE=tf-inkling2:1.3.5
-  IMAGE=tf-inkling2:m2-p9
+  IMAGE=tf-inkling2:m3-p9
   TF_VERSION=1.3.5
   TF_SHA256=9223b9fd3d1ab1b3f1a3493990533a2ca41f18404a882e872221fc94487ad65f
   SERVED_NAME=inkling-2-mini
@@ -29,7 +29,7 @@ config (recipe.conf, environment wins):
   PROMPT_CACHE_GIB=
   API_KEY_FILE=
   ENGINE_CACHE=tf-inkling2-cache-135
-  EXTRA_ENV=TF_INKLING2_ATTN_FP8=1 TF_INKLING2_PREFILL_TC=1 TF_INKLING2_GATE_FP8=1
+  EXTRA_ENV=TF_INKLING2_ATTN_FP8=1 TF_INKLING2_PREFILL_TC=1 TF_INKLING2_GATE_FP8=1 TF_QMMF_HALF_BN=1 TF_INKLING2_MOE_WAVES=1 TF_INKLING2_SAMPLED_FP8_HEAD=1
   EXTRA_ARGS=
   MEM_GATE_GIB=108
   MEM_FLOOR_GIB=8.0
@@ -41,11 +41,11 @@ config (recipe.conf, environment wins):
   drafter_snapshot=$HOME/.cache/huggingface/hub/models--incoai--Inkling-2-Mini-DFlash2/snapshots/4f9088ea66c21f2b99ed657d1941c306b03e84d2
 ok     host dgx-spark has docker curl hf ss free stat awk grep
 ok     no other GPU container running
-ok     image tf-inkling2:m2-p9: sha256:c40fc126ad99f8cca2ce18bbf4552a08b2169a3b86661ba1d1c8efd64c4d7554, TensorFold archive sha256 9223b9fd3d1a
+ok     image tf-inkling2:m3-p9: sha256:9ae0ffd1de2b271d9407523b30db4a30b6c918f5c7a349b6cfb1085ba92e0217, TensorFold archive sha256 9223b9fd3d1a
 ok     target snapshot complete: 1 model shard + mtp, 19526019168 + 635801416 bytes
 ok     drafter snapshot complete: 989975616 bytes
 ok     port 8000 free
 ok     MemAvailable 116.7 GiB >= 108 GiB
-argv   dgx-spark: docker run -d --name tf-inkling2 --label ai-lab.recipe=inkling2-mini-tensorfold --gpus all --network host --ipc host --ulimit memlock=-1 --ulimit core=0 --oom-score-adj 1000 -v $HOME/.cache/huggingface/hub/models--thinkingmachines--Inkling-2-Mini:$HOME/.cache/huggingface/hub/models--thinkingmachines--Inkling-2-Mini:ro -v tf-inkling2-cache-135:/root/.cache/tensorfold -v $HOME/.cache/huggingface/hub/models--incoai--Inkling-2-Mini-DFlash2:$HOME/.cache/huggingface/hub/models--incoai--Inkling-2-Mini-DFlash2:ro -e TENSORFOLD_MEMORY_RESERVE_GIB=13.0 -e TF_INKLING2_ATTN_FP8=1 -e TF_INKLING2_PREFILL_TC=1 -e TF_INKLING2_GATE_FP8=1 tf-inkling2:m2-p9 tensorfold-native serve $HOME/.cache/huggingface/hub/models--thinkingmachines--Inkling-2-Mini/snapshots/c9d028302cd0f035fdf8e7e91f089a4ce94d2195 --host 0.0.0.0 --port 8000 --name inkling-2-mini --context 1048576 --parallel 8 --vision --vision-video-tokens 64 --drafter $HOME/.cache/huggingface/hub/models--incoai--Inkling-2-Mini-DFlash2/snapshots/4f9088ea66c21f2b99ed657d1941c306b03e84d2 --drafter-bits 4 --no-update-check
+argv   dgx-spark: docker run -d --name tf-inkling2 --label ai-lab.recipe=inkling2-mini-tensorfold --gpus all --network host --ipc host --ulimit memlock=-1 --ulimit core=0 --oom-score-adj 1000 -v $HOME/.cache/huggingface/hub/models--thinkingmachines--Inkling-2-Mini:$HOME/.cache/huggingface/hub/models--thinkingmachines--Inkling-2-Mini:ro -v tf-inkling2-cache-135:/root/.cache/tensorfold -v $HOME/.cache/huggingface/hub/models--incoai--Inkling-2-Mini-DFlash2:$HOME/.cache/huggingface/hub/models--incoai--Inkling-2-Mini-DFlash2:ro -e TENSORFOLD_MEMORY_RESERVE_GIB=13.0 -e TF_INKLING2_ATTN_FP8=1 -e TF_INKLING2_PREFILL_TC=1 -e TF_INKLING2_GATE_FP8=1 -e TF_QMMF_HALF_BN=1 -e TF_INKLING2_MOE_WAVES=1 -e TF_INKLING2_SAMPLED_FP8_HEAD=1 tf-inkling2:m3-p9 tensorfold-native serve $HOME/.cache/huggingface/hub/models--thinkingmachines--Inkling-2-Mini/snapshots/c9d028302cd0f035fdf8e7e91f089a4ce94d2195 --host 0.0.0.0 --port 8000 --name inkling-2-mini --context 1048576 --parallel 8 --vision --vision-video-tokens 64 --drafter $HOME/.cache/huggingface/hub/models--incoai--Inkling-2-Mini-DFlash2/snapshots/4f9088ea66c21f2b99ed657d1941c306b03e84d2 --drafter-bits 4 --no-update-check
 WOULD  wait up to 900s for http://127.0.0.1:8000/health
 VALIDATE_ONLY: every check passes; run.sh would start tf-inkling2

@@ -1,0 +1,279 @@
+... building patched TensorFold binary in Docker (BUILD_GRAMMAR=0)
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile.builder
+#1 transferring dockerfile: 2.00kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04
+#2 DONE 0.6s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 94B done
+#3 DONE 0.0s
+
+#4 [1/9] FROM docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04@sha256:1e8ac7a54c184a1af8ef2167f28fa98281892a835c981ebcddb1fad04bdd452d
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 1.05MB 0.0s done
+#5 DONE 0.0s
+
+#6 [3/9] RUN curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/0.17.0/zig-aarch64-linux-0.17.0.tar.xz"  && echo "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8  /tmp/zig.tar.xz" | sha256sum -c -  && mkdir -p /opt/zig  && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1  && rm -f /tmp/zig.tar.xz
+#6 CACHED
+
+#7 [4/9] WORKDIR /src
+#7 CACHED
+
+#8 [2/9] RUN apt-get update && apt-get install -y --no-install-recommends       ca-certificates curl git python3 xz-utils build-essential  && rm -rf /var/lib/apt/lists/*
+#8 CACHED
+
+#9 [5/9] RUN git clone --no-checkout "https://github.com/ashhart/TensorFold.git" tensorfold  && git -C tensorfold checkout "02b324ae9767253d9911d753d5c835a5070eed1b"
+#9 CACHED
+
+#10 [6/9] COPY engine-patches /src/engine-patches
+#10 DONE 0.0s
+
+#11 [7/9] RUN cd /src/tensorfold  && git config user.name "TensorFold Builder"  && git config user.email "builder@localhost"  && while IFS= read -r p; do       [ -n "$p" ] || continue;       git am "/src/engine-patches/$p";     done < /src/engine-patches/series
+#11 4.637 Applying: inkling2: add paged FP8 KV pool, LRU radix reclaim, and capacity options
+#11 4.686 Applying: inkling2: add gatePrepare, warp router, lazy head, and CUDA graph structures
+#11 4.734 Applying: inkling2: add qmmf attention projections, ATTN_FP8 opt-in, and sm_121a TC prefill
+#11 4.776 Applying: inkling2: enable DFlash2/DSpark drafters, CUDA vision, multi-stream graphs, and paged FP8 KV
+#11 4.813 Applying: inkling2: add framed schema tool/JSON constraints, reasoning_effort, and TF_REASONING_FIELD
+#11 4.867 Applying: inkling2: parallelize MoE plan and gateDownPrepared, cache warm costs, expand verify graph cache, prefetch weights
+#11 4.913 Applying: inkling2: batch DFlash2 absorb/propose with graphed absorb and batched shared_guard pricing
+#11 4.942 Applying: inkling2: tile gateUp 8x, pipeline prompt_tc with cp.async, add NVFP4 DFlash2 head and TF_INKLING2_GATE_FP8
+#11 4.994 Applying: inkling2: add RT=1 Blackwell verify TC MoE (rows>=12), bound verify_cache=64, include flags in warmCacheKey
+#11 5.041 Applying: inkling2: enable zero-copy pool prefix_cache, add SMEM-cached loop_ar, restore verify_tc=32 and FP8 draft head default
+#11 5.073 Applying: inkling2: cooperative TC prefill, wide decode MoE, FP8 bulk prompt qmmf, and uncached loop_ar
+#11 5.118 Applying: inkling2: batch prefix StateCopy spans, 8-row/32-row loop gates, and reg-cached ar/messages
+#11 5.162 Applying: inkling2: restore loop_ar/gateUpTiled occupancy and use 4-row SMEM gateDownPrepared
+#11 5.208 Applying: inkling2: 8-warp 2x4 prompt_tc_coop with RT=2 and 2-row r+=8 gateDownPrepared
+#11 5.259 Applying: inkling2: deduplicate loop AR, batch pass messages, tile small-M gates, use mix_rows
+#11 5.290 Applying: inkling2: batch multi-stream conv/attn, bucket global last_pos, slot-agnostic graphs
+#11 5.322 Applying: inkling2: pack NVFP4 experts into BLOCK4 with fused softcap SwiGLU and sm_121a TC prefill
+#11 5.354 Applying: inkling2: lossless BF16 TC unembed with fused softcap, opt-in FP8 sampled head, batched drawRows
+#11 5.385 Applying: inkling2: group-64 FP8 attention/gate/wr weights and qmmf_group dense projection fusion
+#11 5.416 Applying: inkling2: fix shared_guard policy and measure multi-stream shared/hold costs
+#11 5.447 Applying: inkling2: fuse keyed DFlash2 selector, fix graph key, and wire calibrated CHANCES + Landing
+#11 5.503 Applying: inkling2: add vocab-pruned FP8 draft head and wire --drafter-bits 4 NVFP4 draft layers
+#11 5.551 Applying: inkling2: rewrite tf_ink2_df_attn_batch with BF16 Tensor Cores and 16 balanced chunks
+#11 DONE 5.6s
+
+#12 [8/9] RUN cd /src/tensorfold  && zig build -Dgpu=spark -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=ReleaseFast  && mkdir -p /out  && cp zig-out/native/bin/tensorfold-native /out/tensorfold-native
+#12 65.11 install
+#12 65.11 +- install tensorfold-native
+#12 65.11    +- compile exe tensorfold-native safe native
+#12 65.11       +- run /usr/local/cuda/bin/nvcc (flashnext_fact.fatbin) w
+#12 65.11 ./zig/kernels/cuda/flashnext_fact.cu(175): warning #128-D: loop is not reachable
+#12 65.11               for (int kt = 0; kt < GS / 16; ++kt) {
+#12 65.11               ^
+#12 65.11           detected during instantiation of "void fact::fact_kernel<BM,BN,WM,WN,STAGES,GPS,DBUF,MINB,FOLD,OUT16,BLOCKED>(const __nv_bfloat16 *, const float *, const uint32_t *, const __nv_bfloat16 *, const __nv_bfloat16 *, void *, float *, int, int, int, int, int, int, int) [with BM=64, BN=128, WM=2, WN=4, STAGES=3, GPS=2, DBUF=false, MINB=2, FOLD=true, OUT16=true, BLOCKED=true]" at line 264
+#12 65.11 
+#12 65.11 Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+#12 65.11 
+#12 65.11 
+#12 68.33 install
+#12 68.33 +- install tensorfold-native
+#12 68.33    +- compile exe tensorfold-native safe native
+#12 68.33       +- run /usr/local/cuda/bin/nvcc (fp8_experts.fatbin) w
+#12 68.33 ./zig/kernels/cuda/fp8_experts.cu(143): warning #177-D: variable "RW" was declared but never referenced
+#12 68.33     constexpr int RW = PromptCfg<M, RT, CW>::RW;
+#12 68.33                   ^
+#12 68.33 
+#12 68.33 Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+#12 68.33 
+#12 68.33 
+#12 69.48 install
+#12 69.48 +- install tensorfold-native
+#12 69.48    +- compile exe tensorfold-native safe native
+#12 69.48       +- run /usr/local/cuda/bin/nvcc (drama3_fp8.fatbin) w
+#12 69.48 ./zig/kernels/cuda/drama3_fp8.cu(179): warning #177-D: variable "RW" was declared but never referenced
+#12 69.48     constexpr int RW = PromptCfg<M, RT, CW>::RW;
+#12 69.48                   ^
+#12 69.48 
+#12 69.48 Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+#12 69.48 
+#12 69.48 
+#12 75.79 install
+#12 75.79 +- install tensorfold-native
+#12 75.79    +- compile exe tensorfold-native safe native
+#12 75.79       +- run /usr/local/cuda/bin/nvcc (glm_mm.fatbin) w
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=16, BM=64, WM=2, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+#12 75.79 
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=16, BM=32, WM=1, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=16, BM=16, WM=1, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=8, BM=128, WM=2, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=8, BM=64, WM=2, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=8, BM=32, WM=1, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=8, BM=16, WM=1, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=6, BM=128, WM=2, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=6, BM=64, WM=2, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=6, BM=32, WM=1, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=6, BM=16, WM=1, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=4, BM=128, WM=2, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=4, BM=64, WM=2, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=4, BM=32, WM=1, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=4, BM=16, WM=1, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 ./zig/kernels/cuda/glm_mm.cu(85): warning #177-D: member "<unnamed>::Tile<BITS, BM, WM, STAGES>::SMEM [with BITS=16, BM=128, WM=2, STAGES=3]" was declared but never referenced
+#12 75.79       static constexpr int SMEM = STAGES * STAGE;
+#12 75.79                            ^
+#12 75.79 
+#12 75.79 
+#12 77.76 install
+#12 77.76 +- install tensorfold-native
+#12 77.76    +- compile exe tensorfold-native safe native
+#12 77.76       +- run /usr/local/cuda/bin/nvcc (flashnext_attn.fatbin) w
+#12 77.76 ./zig/kernels/cuda/flashnext_attn.cu(436): warning #128-D: loop is not reachable
+#12 77.76       for (int h = 0; h < 2; ++h) {
+#12 77.76       ^
+#12 77.76           detected during instantiation of "void attn_chunks<NB,ONE,FUSE,PAGED>(const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const int *, float *, float *, float *, const int *, const int *, const int *, int, int, int, int, int, float, int, int, fn_attn::Pg) [with NB=1, ONE=true, FUSE=true, PAGED=false]" at line 483
+#12 77.76 
+#12 77.76 Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+#12 77.76 
+#12 77.76 ./zig/kernels/cuda/flashnext_attn.cu(436): warning #128-D: loop is not reachable
+#12 77.76       for (int h = 0; h < 2; ++h) {
+#12 77.76       ^
+#12 77.76           detected during instantiation of "void attn_chunks<NB,ONE,FUSE,PAGED>(const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const int *, float *, float *, float *, const int *, const int *, const int *, int, int, int, int, int, float, int, int, fn_attn::Pg) [with NB=1, ONE=true, FUSE=true, PAGED=true]" at line 512
+#12 77.76 
+#12 77.76 
+#12 93.50 install
+#12 93.50 +- install tensorfold-native
+#12 93.50    +- compile exe tensorfold-native safe native
+#12 93.50       +- run /usr/local/cuda/bin/nvcc (exl3_linear.fatbin) w
+#12 93.50 ./zig/kernels/cuda/exl3_linear_wc.cuh(179): warning #128-D: loop is not reachable
+#12 93.50       for (int idx = threadIdx.x; idx < rows * 32; idx += NTH) {
+#12 93.50       ^
+#12 93.50           detected during instantiation of "void tf_exl3::linear_wc_body<K2,MT,KS,NS,FOLD>(const tf_exl3::WcArgs &) [with K2=8, MT=2, KS=2, NS=4, FOLD=true]" at line 215
+#12 93.50 
+#12 93.50 Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+#12 93.50 
+#12 93.50 ./zig/kernels/cuda/exl3_linear_wc.cuh(179): warning #128-D: loop is not reachable
+#12 93.50       for (int idx = threadIdx.x; idx < rows * 32; idx += NTH) {
+#12 93.50       ^
+#12 93.50           detected during instantiation of "void tf_exl3::linear_wc_body<K2,MT,KS,NS,FOLD>(const tf_exl3::WcArgs &) [with K2=8, MT=2, KS=4, NS=4, FOLD=true]" at line 215
+#12 93.50 
+#12 93.50 ./zig/kernels/cuda/exl3_linear_wc.cuh(179): warning #128-D: loop is not reachable
+#12 93.50       for (int idx = threadIdx.x; idx < rows * 32; idx += NTH) {
+#12 93.50       ^
+#12 93.50           detected during instantiation of "void tf_exl3::linear_wc_body<K2,MT,KS,NS,FOLD>(const tf_exl3::WcArgs &) [with K2=8, MT=4, KS=2, NS=4, FOLD=true]" at line 215
+#12 93.50 
+#12 93.50 ./zig/kernels/cuda/exl3_linear_wc.cuh(179): warning #128-D: loop is not reachable
+#12 93.50       for (int idx = threadIdx.x; idx < rows * 32; idx += NTH) {
+#12 93.50       ^
+#12 93.50           detected during instantiation of "void tf_exl3::linear_wc_body<K2,MT,KS,NS,FOLD>(const tf_exl3::WcArgs &) [with K2=8, MT=4, KS=4, NS=4, FOLD=true]" at line 215
+#12 93.50 
+#12 93.50 ./zig/kernels/cuda/exl3_linear_wc.cuh(179): warning #128-D: loop is not reachable
+#12 93.50       for (int idx = threadIdx.x; idx < rows * 32; idx += NTH) {
+#12 93.50       ^
+#12 93.50           detected during instantiation of "void tf_exl3::linear_wc_body<K2,MT,KS,NS,FOLD>(const tf_exl3::WcArgs &) [with K2=12, MT=2, KS=2, NS=4, FOLD=true]" at line 215
+#12 93.50 
+#12 93.50 ./zig/kernels/cuda/exl3_linear_wc.cuh(179): warning #128-D: loop is not reachable
+#12 93.50       for (int idx = threadIdx.x; idx < rows * 32; idx += NTH) {
+#12 93.50       ^
+#12 93.50           detected during instantiation of "void tf_exl3::linear_wc_body<K2,MT,KS,NS,FOLD>(const tf_exl3::WcArgs &) [with K2=12, MT=2, KS=4, NS=4, FOLD=true]" at line 215
+#12 93.50 
+#12 93.50 ./zig/kernels/cuda/exl3_linear_wc.cuh(179): warning #128-D: loop is not reachable
+#12 93.50       for (int idx = threadIdx.x; idx < rows * 32; idx += NTH) {
+#12 93.50       ^
+#12 93.50           detected during instantiation of "void tf_exl3::linear_wc_body<K2,MT,KS,NS,FOLD>(const tf_exl3::WcArgs &) [with K2=12, MT=4, KS=2, NS=4, FOLD=true]" at line 215
+#12 93.50 
+#12 93.50 ./zig/kernels/cuda/exl3_linear_wc.cuh(179): warning #128-D: loop is not reachable
+#12 93.50       for (int idx = threadIdx.x; idx < rows * 32; idx += NTH) {
+#12 93.50       ^
+#12 93.50           detected during instantiation of "void tf_exl3::linear_wc_body<K2,MT,KS,NS,FOLD>(const tf_exl3::WcArgs &) [with K2=12, MT=4, KS=4, NS=4, FOLD=true]" at line 215
+#12 93.50 
+#12 93.50 
+#12 DONE 307.0s
+
+#13 [9/9] RUN if [ "0" = "1" ]; then       git clone --branch "v0.2.8" --depth 1 --recurse-submodules https://github.com/mlc-ai/xgrammar /src/xgrammar &&       cd /src/tensorfold &&       zig build grammar -Dxgrammar=/src/xgrammar &&       cp zig-out/native/lib/libtfgrammar.so /out/libtfgrammar.so;     fi
+#13 DONE 0.2s
+
+#14 exporting to image
+#14 exporting layers
+#14 exporting layers 1.1s done
+#14 writing image sha256:a88c711dbc9be1be6c70aba562a7346283aa4d082315259ef77863b32d0907a3 done
+#14 naming to docker.io/library/tf-inkling2-builder:tmp-1132884 done
+#14 DONE 1.1s
+... overlaying patched binary onto tf-inkling2:1.3.5 -> tf-inkling2:clean-verify-m3
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile.patched
+#1 transferring dockerfile: 1.79kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/tf-inkling2:1.3.5
+#2 DONE 0.0s
+
+#3 [context engine] load .dockerignore
+#3 transferring engine: 2B done
+#3 DONE 0.0s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 2B done
+#4 DONE 0.0s
+
+#5 [stage-0 1/2] FROM docker.io/library/tf-inkling2:1.3.5
+#5 CACHED
+
+#6 [context engine] load from client
+#6 transferring engine: 63.90MB 0.1s done
+#6 DONE 0.2s
+
+#7 [stage-0 2/2] RUN --mount=type=bind,from=engine,target=/engine     test -n "12a9c9ca413736ecc618f111c82977f921ab09da87588905901ba43b795565ec"  && echo "12a9c9ca413736ecc618f111c82977f921ab09da87588905901ba43b795565ec  /engine/tensorfold-native" | sha256sum -c -  && install -m 0755 /engine/tensorfold-native /opt/tensorfold/bin/tensorfold-native  && cd /opt/tensorfold  && sed -i "s|^[0-9a-f]\{64\}  \./bin/tensorfold-native$|12a9c9ca413736ecc618f111c82977f921ab09da87588905901ba43b795565ec  ./bin/tensorfold-native|" SHA256SUMS  && grep -q "^12a9c9ca413736ecc618f111c82977f921ab09da87588905901ba43b795565ec  ./bin/tensorfold-native$" SHA256SUMS  && if [ -n "" ]; then       echo "  /engine/libtfgrammar.so" | sha256sum -c - &&       install -m 0755 /engine/libtfgrammar.so /opt/tensorfold/lib/libtfgrammar.so &&       sed -i "s|^[0-9a-f]\{64\}  \./lib/libtfgrammar.so$|  ./lib/libtfgrammar.so|" SHA256SUMS &&       grep -q "^  ./lib/libtfgrammar.so$" SHA256SUMS;     fi  && sha256sum -c --quiet SHA256SUMS
+#7 0.183 /engine/tensorfold-native: OK
+#7 DONE 0.3s
+
+#8 exporting to image
+#8 exporting layers
+#8 exporting layers 0.1s done
+#8 writing image sha256:9ae0ffd1de2b271d9407523b30db4a30b6c918f5c7a349b6cfb1085ba92e0217 done
+#8 naming to docker.io/library/tf-inkling2:clean-verify-m3 done
+#8 DONE 0.1s
+built tf-inkling2:clean-verify-m3 (patches=38d486856695b5852b9219eb3e20733e99ae390426c707b9b99f03f20f329249)

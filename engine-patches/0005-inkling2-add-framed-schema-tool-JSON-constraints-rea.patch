@@ -1,7 +1,7 @@
 From 64f5c290637bb52d44d5e8f5e2b60d190676bb9f Mon Sep 17 00:00:00 2001
 From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 17:57:26 +0000
-Subject: [PATCH 05/14] inkling2: add framed schema tool/JSON constraints,
+Subject: [PATCH] inkling2: add framed schema tool/JSON constraints,
  reasoning_effort, and TF_REASONING_FIELD
 
 ---
@@ -795,6 +795,3 @@ index 92cab3c..8ead3d1 100644
      const on = thinking.enable orelse srv.config.enable_thinking;
      cx.clear_thinking = thinking.clear;
      cx.named_effort = fields.namedEffort(thinking.effort, srv.effort_levels);
--- 
-2.43.0
-

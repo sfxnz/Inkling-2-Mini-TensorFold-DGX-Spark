@@ -1,0 +1,361 @@
+From e97517278bf3c0314b84116d9d926faa20dc9b93 Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 12:36:34 +0000
+Subject: [PATCH] inkling2: lossless BF16 TC unembed with fused softcap, opt-in
+ FP8 sampled head, batched drawRows
+
+Commit 3 (Lever 3, zero extra VRAM, 100% lossless default):
+- Add lossless row-major BF16 Tensor Core unembed kernels (tf_ink2_unembed_tc16 and
+  tf_ink2_unembed_tc32, double-buffered cp.async + m16n8k16 MMA) with fused A9(a)
+  BF16-round + FP32 softcap epilogue, reading resident row-major m.w.unembed once across
+  up to 32 rows (TF_INKLING2_UNEMBED_TC=1 default, 0 reverts to scalar rowdot).
+- Add opt-in TF_INKLING2_SAMPLED_FP8_HEAD=1 (default 0) reusing resident m.lazy_head.weight
+  (461 MB FP8 qmmf, zero extra VRAM) + fused tf_ink2_round_softcap for fast A/B testing.
+- Batch verify taps copies into one tf_ink2_copy_spans launch, batch unmasked greedy top1
+  into one launch, and batch unmasked sampled verify rows into one ops.tobf + sliced
+  Draws.drawRows (tf_draw_slice_top + tf_draw_rows_finish across 25 vocab slices) using
+  post-forward m.s.raw scratch (zero extra VRAM).
+---
+ zig/kernels/cuda/inkling2/ops.cu           | 104 +++++++++++++++++++++
+ zig/src/families/inkling2/loop_backend.zig |  72 ++++++++++++--
+ zig/src/families/inkling2/loop_round.zig   |  10 ++
+ zig/src/families/inkling2/ops.zig          |  34 +++++++
+ zig/src/platform/environment.zig           |   2 +
+ 5 files changed, 216 insertions(+), 6 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/ops.cu b/zig/kernels/cuda/inkling2/ops.cu
+index f9aa082..91e0478 100644
+--- a/zig/kernels/cuda/inkling2/ops.cu
++++ b/zig/kernels/cuda/inkling2/ops.cu
+@@ -3,6 +3,7 @@
+ #include <cuda_bf16.h>
+ #include <cuda_fp16.h>
+ #include <cuda_pipeline.h>
++#include "common/qmm_frag.cuh"
+ #include "exl3_decode.cuh"
+ 
+ namespace ink2o {
+@@ -492,6 +493,109 @@ extern "C" __global__ void tf_ink2_softcap(float* __restrict__ x, long long n, f
+     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+     if (i < n) x[i] = logitCap(x[i], cap);
+ }
++
++// Fused BF16 round + FP32 logit softcap in place (A9(a) boundary).
++extern "C" __global__ void __launch_bounds__(256) tf_ink2_round_softcap(float* __restrict__ x, long long n, float cap) {
++    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i < n) x[i] = logitCap(bfr(x[i]), cap);
++}
++
++namespace ink2u {
++
++// Lossless BF16 Tensor Core unembed directly on row-major [vocab, k] with fused A9(a) BF16-round + softcap epilogue.
++template <int BM>
++__device__ __forceinline__ void unembedTc(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
++                                          float* __restrict__ out, int rows, int vocab, int k, float cap) {
++    constexpr int kBN = 32;
++    constexpr int kBK = 64;
++    constexpr int kPad = kBK + 8;
++    constexpr int kMT = BM / 16;
++    __shared__ __align__(16) uint16_t sx[2][BM][kPad];
++    __shared__ __align__(16) uint16_t sw[2][kBN][kPad];
++    const int m0 = static_cast<int>(blockIdx.x) * BM;
++    const int n0 = static_cast<int>(blockIdx.y) * kBN;
++    const int tid = threadIdx.x;
++    const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
++    const int num_k = k / kBK;
++
++    auto loadStage = [&](int st, int k0) {
++#pragma unroll
++        for (int e = tid; e < BM * (kBK / 8); e += 128) {
++            const int r = e >> 3, c = (e & 7) * 8;
++            const bool ok = m0 + r < rows;
++            const uint16_t* src = ok ? (x + static_cast<size_t>(m0 + r) * k + k0 + c) : x;
++            tf_common::cp16z(&sx[st][r][c], src, ok);
++        }
++#pragma unroll
++        for (int e = tid; e < kBN * (kBK / 8); e += 128) {
++            const int r = e >> 3, c = (e & 7) * 8;
++            const bool ok = n0 + r < vocab;
++            const uint16_t* src = ok ? (w + static_cast<size_t>(n0 + r) * k + k0 + c) : w;
++            tf_common::cp16z(&sw[st][r][c], src, ok);
++        }
++    };
++
++    float acc[kMT][4];
++#pragma unroll
++    for (int mt = 0; mt < kMT; ++mt) acc[mt][0] = acc[mt][1] = acc[mt][2] = acc[mt][3] = 0.0f;
++
++    loadStage(0, 0);
++    tf_common::cp_commit();
++    for (int st = 0; st < num_k; ++st) {
++        const int cur = st & 1;
++        if (st + 1 < num_k) {
++            loadStage(cur ^ 1, (st + 1) * kBK);
++            tf_common::cp_commit();
++            tf_common::cp_wait<1>();
++        } else {
++            tf_common::cp_wait<0>();
++        }
++        __syncthreads();
++        const uint16_t* wrow = &sw[cur][warp * 8 + g][2 * t];
++#pragma unroll
++        for (int kk = 0; kk < 4; ++kk) {
++            const uint32_t b0 = *reinterpret_cast<const uint32_t*>(wrow + 16 * kk);
++            const uint32_t b1 = *reinterpret_cast<const uint32_t*>(wrow + 16 * kk + 8);
++#pragma unroll
++            for (int mt = 0; mt < kMT; ++mt) {
++                const uint32_t* x0 = reinterpret_cast<const uint32_t*>(&sx[cur][mt * 16 + g][16 * kk + 2 * t]);
++                const uint32_t* x1 = reinterpret_cast<const uint32_t*>(&sx[cur][mt * 16 + g + 8][16 * kk + 2 * t]);
++                const uint32_t a[4] = {x0[0], x1[0], x0[4], x1[4]};
++                qmm_frag::mma(acc[mt], a, b0, b1);
++            }
++        }
++        __syncthreads();
++    }
++    const int c0 = n0 + warp * 8 + 2 * t;
++    const int c1 = c0 + 1;
++#pragma unroll
++    for (int mt = 0; mt < kMT; ++mt) {
++        const int r0 = m0 + mt * 16 + g;
++        const int r1 = r0 + 8;
++        if (r0 < rows) {
++            if (c0 < vocab) out[static_cast<size_t>(r0) * vocab + c0] = cap > 0.0f ? logitCap(bfr(acc[mt][0]), cap) : bfr(acc[mt][0]);
++            if (c1 < vocab) out[static_cast<size_t>(r0) * vocab + c1] = cap > 0.0f ? logitCap(bfr(acc[mt][1]), cap) : bfr(acc[mt][1]);
++        }
++        if (r1 < rows) {
++            if (c0 < vocab) out[static_cast<size_t>(r1) * vocab + c0] = cap > 0.0f ? logitCap(bfr(acc[mt][2]), cap) : bfr(acc[mt][2]);
++            if (c1 < vocab) out[static_cast<size_t>(r1) * vocab + c1] = cap > 0.0f ? logitCap(bfr(acc[mt][3]), cap) : bfr(acc[mt][3]);
++        }
++    }
++}
++
++}  // namespace ink2u
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ink2_unembed_tc16(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w, float* __restrict__ out,
++                         int rows, int vocab, int k, float cap) {
++    ink2u::unembedTc<16>(x, w, out, rows, vocab, k, cap);
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ink2_unembed_tc32(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w, float* __restrict__ out,
++                         int rows, int vocab, int k, float cap) {
++    ink2u::unembedTc<32>(x, w, out, rows, vocab, k, cap);
++}
+ #include "decode_head.cuh"
+ 
+ namespace ink2o {
+diff --git a/zig/src/families/inkling2/loop_backend.zig b/zig/src/families/inkling2/loop_backend.zig
+index 0585227..0ef880e 100644
+--- a/zig/src/families/inkling2/loop_backend.zig
++++ b/zig/src/families/inkling2/loop_backend.zig
+@@ -28,6 +28,7 @@ const Lane = struct {
+     rows: std.ArrayList(u32) = .empty,
+     last: u64,
+     rule: u64,
++    rule_host: cuda.sample.Rule = undefined,
+     sampled: bool = false,
+     lease: kv.Lease = .{},
+     cache: prefix.State = .{},
+@@ -417,6 +418,7 @@ pub const Backend = struct {
+         l.sampled = false;
+         if (cuda.sample.ruleFor(s.sampling)) |r| {
+             try b.upload(l.rule, std.mem.asBytes(&r));
++            l.rule_host = r;
+             l.sampled = true;
+         }
+         l.len = 0;
+@@ -486,6 +488,34 @@ pub const Backend = struct {
+         try b.k.draws.draw(b.s, b.logits16.ptr, v, l.rule, b.meta.ptr, 0, b.tokens.ptr + at * 4, rows, null, null);
+     }
+ 
++    /// Batch all sampled verify rows into one BF16 cast + sliced drawRows using post-forward m.s.raw scratch.
++    fn drawSampledBatch(b: *Backend, windows: []const be.Window, chains: []const round.Chain, rows: usize, v: usize) !bool {
++        const raw_bytes = 3 * b.m.promptRows() * b.m.w.c.text.hidden * 4;
++        const rules_off: usize = 0;
++        const meta_off: usize = std.mem.alignForward(usize, rows * @sizeOf(cuda.sample.Rule), 256);
++        const scratch_off: usize = std.mem.alignForward(usize, meta_off + rows * 4, 256);
++        const logits16_off: usize = std.mem.alignForward(usize, scratch_off + rows * cuda.sample.Draws.row_scratch, 256);
++        const need = logits16_off + rows * v * 2;
++        if (need > raw_bytes) return false;
++        var rules_host: [engine.round_rows]cuda.sample.Rule = undefined;
++        var meta_host: [engine.round_rows]i32 = undefined;
++        var row: usize = 0;
++        for (windows, chains) |w, chain| {
++            const l = &b.lanes_[chain.slot].?;
++            for (w.positions) |pos| {
++                rules_host[row] = l.rule_host;
++                meta_host[row] = @intCast(pos - 1);
++                row += 1;
++            }
++        }
++        const base = b.m.s.raw;
++        try b.upload(base + rules_off, std.mem.sliceAsBytes(rules_host[0..rows]));
++        try b.upload(base + meta_off, std.mem.sliceAsBytes(meta_host[0..rows]));
++        try ops.tobf(&b.k.glue, b.s, b.m.s.logits, rows, v, v, base + logits16_off, v, 0, v);
++        try b.k.draws.drawRows(b.s, base + logits16_off, v, base + rules_off, base + meta_off, b.tokens.ptr + token_ring * 4, rows, base + scratch_off);
++        return true;
++    }
++
+     fn read(ptr: *anyopaque, h: u64) anyerror!u32 {
+         const b = self(ptr);
+         if (h >= b.next or b.next - h > token_ring) return error.NoSuchToken;
+@@ -598,6 +628,11 @@ pub const Backend = struct {
+         }
+         try b.decodeRoundMode(chains[0..windows.len], rows, taps, lazy);
+         const v: usize = b.m.w.c.text.unpadded_vocab;
++        const loop_math = @import("loop_math_cuda.zig");
++        var tap_spans: [engine.max_slots]loop_math.CopySpan = undefined;
++        var n_taps: usize = 0;
++        var all_unmasked_greedy = true;
++        var all_unmasked_sampled = true;
+         var row0: usize = 0;
+         for (windows, chains[0..windows.len]) |w, chain| {
+             const l = &b.lanes_[chain.slot].?;
+@@ -606,15 +641,40 @@ pub const Backend = struct {
+                 const d = &b.drafter.?;
+                 const from = b.m.taps.?.buffer + row0 * dspark.tap_stride;
+                 const session = d.session(chain.slot);
+-                try b.m.copy(b.s, session.taps + session.pending * dspark.tap_stride, from, n * dspark.tap_stride);
++                tap_spans[n_taps] = .{
++                    .dst = session.taps + session.pending * dspark.tap_stride,
++                    .src = from,
++                    .bytes = n * dspark.tap_stride,
++                };
++                n_taps += 1;
+             }
+-            const src = b.m.s.logits + row0 * v * 4;
+-            if (w.masks.len == 0)
+-                try b.drawRows(l, src, n, w.positions[0], token_ring + row0)
+-            else
+-                try b.drawMasked(w.stream, src, w.positions, token_ring + row0, w.masks);
++            if (w.masks.len != 0 or l.sampled) all_unmasked_greedy = false;
++            if (w.masks.len != 0 or !l.sampled) all_unmasked_sampled = false;
+             row0 += n;
+         }
++        if (n_taps == 1) {
++            try b.m.copy(b.s, tap_spans[0].dst, tap_spans[0].src, @intCast(tap_spans[0].bytes));
++        } else if (n_taps > 1) {
++            try b.upload(b.m.s.copy_spans, std.mem.sliceAsBytes(tap_spans[0..n_taps]));
++            try loop_math.copySpans(&b.k.loop, b.s, b.m.s.copy_spans, n_taps);
++        }
++        if (all_unmasked_greedy) {
++            try ops.top1(&b.k.glue, b.s, b.m.s.logits, rows, v, v, 0, b.m.s.t + token_ring * 4, b.tokens.ptr + token_ring * 4);
++        } else if (all_unmasked_sampled and try b.drawSampledBatch(windows, chains[0..windows.len], rows, v)) {
++            // Batched BF16 conversion + sliced top-k draw across all sampled rows in m.s.raw scratch.
++        } else {
++            row0 = 0;
++            for (windows, chains[0..windows.len]) |w, chain| {
++                const l = &b.lanes_[chain.slot].?;
++                const n = chain.tokens.len;
++                const src = b.m.s.logits + row0 * v * 4;
++                if (w.masks.len == 0)
++                    try b.drawRows(l, src, n, w.positions[0], token_ring + row0)
++                else
++                    try b.drawMasked(w.stream, src, w.positions, token_ring + row0, w.masks);
++                row0 += n;
++            }
++        }
+         var got: [engine.round_rows]u32 = undefined;
+         try b.s.synchronize();
+         try b.tokens.download(token_ring * 4, std.mem.sliceAsBytes(got[0..rows]));
+diff --git a/zig/src/families/inkling2/loop_round.zig b/zig/src/families/inkling2/loop_round.zig
+index 8df103d..ff2b8ea 100644
+--- a/zig/src/families/inkling2/loop_round.zig
++++ b/zig/src/families/inkling2/loop_round.zig
+@@ -364,6 +364,16 @@ pub fn executePrompt(m: *Model, k: *Kernels, s: cuda.Stream, shape: Shape, image
+     const head0: usize = shape.head0;
+     const hidden = m.s.hidden + head0 * h * 2;
+     if (shape.lazy) return m.lazy_head.?.forward(s, hidden, m.w.unembed, heads, m.s.logits);
++    if (k.glue.sampled_fp8_head and m.lazy_head != null and heads <= @import("loop_lazy_head.zig").max_rows) {
++        const lh = &m.lazy_head.?;
++        try lh.lane.matmulOut(s, hidden, h, heads, lh.weight, m.s.logits, .f32, 0);
++        try ops.roundSoftcap(&k.glue, s, m.s.logits, heads * c.unpadded_vocab, c.logit_cap);
++        return;
++    }
++    if (k.glue.unembed_tc and h % 64 == 0) {
++        try ops.unembedTc(&k.glue, s, hidden, m.w.unembed, m.s.logits, heads, c.unpadded_vocab, h, c.logit_cap);
++        return;
++    }
+     try ops.rowdot(&k.glue, s, hidden, m.w.unembed, m.s.logits, heads, c.unpadded_vocab, h, false, false);
+     try loop_math.roundBf16(&k.loop, s, m.s.logits, m.s.logits, heads * c.unpadded_vocab);
+     try ops.softcap(&k.glue, s, m.s.logits, heads * c.unpadded_vocab, c.logit_cap);
+diff --git a/zig/src/families/inkling2/ops.zig b/zig/src/families/inkling2/ops.zig
+index cc26d75..a6e08e5 100644
+--- a/zig/src/families/inkling2/ops.zig
++++ b/zig/src/families/inkling2/ops.zig
+@@ -76,6 +76,11 @@ pub const Kernels = struct {
+     gateup: cuda.Function,
+     conv: cuda.Function,
+     softcap: cuda.Function,
++    round_softcap: cuda.Function,
++    unembed_tc16: cuda.Function,
++    unembed_tc32: cuda.Function,
++    unembed_tc: bool,
++    sampled_fp8_head: bool,
+     top1: cuda.Function,
+     tobf: cuda.Function,
+     put_words: cuda.Function,
+@@ -91,6 +96,8 @@ pub const Kernels = struct {
+         errdefer rows_mod.unload();
+         const warp_router = try @import("sys").environment.read(bool, "TF_INKLING2_TOPK_WARP", true);
+         const mix_narrow = try @import("sys").environment.read(bool, "TF_INKLING2_MIX_NARROW", false);
++        const unembed_tc = try @import("sys").environment.read(bool, "TF_INKLING2_UNEMBED_TC", true);
++        const sampled_fp8_head = try @import("sys").environment.read(bool, "TF_INKLING2_SAMPLED_FP8_HEAD", false);
+         return .{
+             .mod = mod,
+             .rows_mod = rows_mod,
+@@ -107,6 +114,11 @@ pub const Kernels = struct {
+             .gateup = try mod.function("tf_ink2_gateup"),
+             .conv = try mod.function("tf_ink2_conv"),
+             .softcap = try mod.function("tf_ink2_softcap"),
++            .round_softcap = try mod.function("tf_ink2_round_softcap"),
++            .unembed_tc16 = try mod.function("tf_ink2_unembed_tc16"),
++            .unembed_tc32 = try mod.function("tf_ink2_unembed_tc32"),
++            .unembed_tc = unembed_tc,
++            .sampled_fp8_head = sampled_fp8_head,
+             .top1 = try mod.function("tf_ink2_top1"),
+             .tobf = try mod.function("tf_ink2_tobf"),
+             .put_words = try mod.function("tf_ink2_put_words"),
+@@ -217,6 +229,28 @@ pub fn softcap(k: *const Kernels, s: cuda.Stream, x: u64, n: usize, cap: f32) !v
+     try go(k.softcap, s, .{ .x = @intCast((n + 255) / 256) }, 256, &a);
+ }
+ 
++/// Fused BF16 round + tanh(x / cap) * cap over `n` fp32 logits in place.
++pub fn roundSoftcap(k: *const Kernels, s: cuda.Stream, x: u64, n: usize, cap: f32) !void {
++    var a: cuda.Args = .{};
++    a.add(x);
++    a.add(@as(i64, @intCast(n)));
++    a.add(cap);
++    try go(k.round_softcap, s, .{ .x = @intCast((n + 255) / 256) }, 256, &a);
++}
++
++/// Lossless row-major BF16 Tensor Core unembed [rows, k] x [vocab, k]^T with fused BF16-round + softcap epilogue.
++pub fn unembedTc(k: *const Kernels, s: cuda.Stream, x: u64, w: u64, out: u64, rows: usize, vocab: usize, hidden: usize, cap: f32) !void {
++    var a: cuda.Args = .{};
++    for ([_]u64{ x, w, out }) |v| a.add(v);
++    for ([_]i32{ int(rows), int(vocab), int(hidden) }) |v| a.add(v);
++    a.add(cap);
++    if (rows <= 16) {
++        try go(k.unembed_tc16, s, .{ .x = 1, .y = @intCast((vocab + 31) / 32) }, 128, &a);
++    } else {
++        try go(k.unembed_tc32, s, .{ .x = @intCast((rows + 31) / 32), .y = @intCast((vocab + 31) / 32) }, 128, &a);
++    }
++}
++
+ /// Each of `rows` fp32 rows (`stride` apart): its largest value among the first `n` (lowest id on ties), id + `base`.
+ pub fn top1(k: *const Kernels, s: cuda.Stream, x: u64, rows: usize, stride: usize, n: usize, base: usize, val: u64, id: u64) !void {
+     var a: cuda.Args = .{};
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 36191a1..07ea1ed 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -64,6 +64,8 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_NVFP4_SPLIT_DOWN", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 splits Mini NVFP4 down projection into 16-column half units when resident; default 0)" },
+     .{ .name = "TF_INKLING2_TOPK_WARP", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 uses the Mini warp router)" },
+     .{ .name = "TF_INKLING2_LAZY_HEAD", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 prunes certified losers in Mini greedy decode)" },
++    .{ .name = "TF_INKLING2_UNEMBED_TC", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 uses lossless BF16 Tensor Core unembed on Mini multi-row sampled decode; default 1)" },
++    .{ .name = "TF_INKLING2_SAMPLED_FP8_HEAD", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 uses resident FP8 lazy_head for Mini sampled unembed, opt-in lossy; default 0)" },
+     .{ .name = "TF_INKLING2_ATTN_FP8_PREFETCH", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 prefetches Mini FP8 KV in decode)" },
+     .{ .name = "TF_INKLING2_VERIFY_GRAPHS", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 gives Mini shared verify its own graph cache)" },
+     .{ .name = "TF_INKLING2_DRAFT_FP8_LAYERS", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (FP8 Mini draft projections; default 1 for DFlash2 on Blackwell)" },

@@ -1,8 +1,8 @@
 From c56a8960d48fcc379a1f4d3ffc3d1f3c42d37d0f Mon Sep 17 00:00:00 2001
 From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 21:44:41 +0000
-Subject: [PATCH 10/14] inkling2: enable zero-copy pool prefix_cache, add
- SMEM-cached loop_ar, restore verify_tc=32 and FP8 draft head default
+Subject: [PATCH] inkling2: enable zero-copy pool prefix_cache, add SMEM-cached
+ loop_ar, restore verify_tc=32 and FP8 draft head default
 
 ---
  zig/kernels/cuda/inkling2/loop_math.cu       | 43 +++++++++++++++++---
@@ -225,6 +225,3 @@ index 0d027ff..821094b 100644
      .{ .name = "TF_INKLING2_TOPK_WARP", .raw = "1", .n = 1 },
      .{ .name = "TF_INKLING2_LAZY_HEAD", .raw = "1", .n = 1 },
      .{ .name = "TF_INKLING2_ATTN_FP8_PREFETCH", .raw = "1", .n = 1 },
--- 
-2.43.0
-

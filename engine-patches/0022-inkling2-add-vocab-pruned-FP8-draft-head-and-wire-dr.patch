@@ -1,0 +1,828 @@
+From 88ae043b934be45ef03506ea287b246664eb173c Mon Sep 17 00:00:00 2001
+From: sfxnz <sfxnz@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 12:40:19 +0000
+Subject: [PATCH] inkling2: add vocab-pruned FP8 draft head and wire
+ --drafter-bits 4 NVFP4 draft layers
+
+Implement Lever 8a and Lever 8b (target-lossless) for Inkling-2-Mini DFlash2:
+
+- Vocab-pruned draft head (TF_INKLING2_DRAFT_VOCAB, default 0 = full 200,058):
+  - Verified Inkling-2-Mini tokenizer.json layout: 199,998 BPE tokens ordered by
+    merge rank (0..199997) plus 60 added special tokens at 199998..200057
+    (including EOS, thinking, chat, and tool tokens).
+  - Pack top K - 60 BPE rows + 60 special tail rows into a compact FP8 (or FP4)
+    draft head (tf_ink2_draft_pack_fp8_pruned / tf_ink2_draft_pack_fp4_matrix),
+    run topkRows over K rows, and remap local candidate IDs back to global token
+    IDs inside tf_ink2_df_select[8]_batch before codebook lookup and Gumbel race.
+  - Exact VRAM accounting in draft_fp8.Options.baseBytes -> cuda_capacity.
+
+- Wire up --drafter-bits 4 NVFP4 draft layers (TF_INKLING2_DRAFT_LAYER_BITS=4|8):
+  - Add drafter_bits to cuda_native.Options, cuda_mini_capacity.Query, and
+    cuda_capacity.Checkpoint.read so CLI --drafter-bits 4|8|0 flows through both
+    admission planning (pg.ready_bytes) and weight loading with byte-exact match.
+  - Pack the 5 heavy DFlash2 transformer layers (qkv, out, gate_up, down) and fc
+    in NVFP4 (qmmf::Mode::fp4 via tf_ink2_draft_pack_fp4_matrix, ~208 MB vs
+    ~393 MB FP8G64) while keeping small conv/selector projections in FP8G64.
+  - Support Matrix.afterRows() for NVFP4 qkv -> kv suffix slicing and include
+    layer precision + draft_vocab in loop_backend warmCacheKey.
+
+Credits (for NOTICE, Apache-2.0 / MIT):
+- Draft FP8/FP4 packing framework builds on MiaAI-Lab patch 0006 (commit 9e3cf20b)
+  and TensorFold upstream nvfp4q.cuh / qmmf.cu.
+---
+ zig/kernels/cuda/inkling2/dflash2.cuh         |  20 +-
+ zig/kernels/cuda/inkling2/draft_fp8.cuh       |  92 +++++++
+ zig/src/families/inkling2/cuda_capacity.zig   |   8 +-
+ zig/src/families/inkling2/cuda_native.zig     |   3 +-
+ zig/src/families/inkling2/dflash2_cuda.zig    |  10 +-
+ zig/src/families/inkling2/dflash2_weights.zig |  26 +-
+ zig/src/families/inkling2/draft_fp8.zig       | 230 +++++++++++++++++-
+ zig/src/families/inkling2/loop_backend.zig    |   9 +-
+ zig/src/families/inkling2/loop_drafter.zig    |  18 +-
+ zig/src/native/cuda_mini_capacity.zig         |   4 +-
+ zig/src/platform/environment.zig              |   1 +
+ 11 files changed, 375 insertions(+), 46 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/dflash2.cuh b/zig/kernels/cuda/inkling2/dflash2.cuh
+index 9aa4fc2..9525175 100644
+--- a/zig/kernels/cuda/inkling2/dflash2.cuh
++++ b/zig/kernels/cuda/inkling2/dflash2.cuh
+@@ -237,7 +237,7 @@ __device__ __forceinline__ void ink2DfSelectBatch(
+     unsigned* __restrict__ walk, float* __restrict__ chances,
+     const ink2df::DraftKey* __restrict__ keys,
+     const int* __restrict__ row_offs, const int* __restrict__ stream_ns,
+-    int vocab, float cap) {
++    int vocab, int draft_vocab, int vocab_split, float cap) {
+     using namespace ink2d;
+     using namespace ink2df;
+     __shared__ float scores[kTop];
+@@ -254,7 +254,13 @@ __device__ __forceinline__ void ink2DfSelectBatch(
+     __syncthreads();
+     for (int step = 0; step < n; ++step) {
+         const unsigned* entries = top + static_cast<size_t>(row0 + step) * kLogprobWords;
+-        const unsigned id = entries[2 + candidate];
++        const unsigned raw_id = entries[2 + candidate];
++        // Remap local pruned-vocab candidate index to global token ID (identity when draft_vocab == vocab).
++        const unsigned id = (raw_id < static_cast<unsigned>(vocab_split))
++            ? raw_id
++            : (raw_id < static_cast<unsigned>(draft_vocab)
++                ? raw_id + static_cast<unsigned>(vocab - draft_vocab)
++                : static_cast<unsigned>(vocab));
+         const unsigned parent = parent_s;
+         float score = -INFINITY;
+         if (id < static_cast<unsigned>(vocab) && parent < static_cast<unsigned>(vocab)) {
+@@ -319,8 +325,9 @@ extern "C" __global__ void __launch_bounds__(512) tf_ink2_df_select_batch(
+     const unsigned* __restrict__ top, const uint16_t* __restrict__ projected,
+     const uint16_t* __restrict__ predecessor, const uint16_t* __restrict__ successor,
+     unsigned* __restrict__ walk, float* __restrict__ chances, const ink2df::DraftKey* __restrict__ keys,
+-    const int* __restrict__ row_offs, const int* __restrict__ stream_ns, int vocab, float cap) {
+-    ink2DfSelectBatch(top, projected, predecessor, successor, nullptr, nullptr, walk, chances, keys, row_offs, stream_ns, vocab, cap);
++    const int* __restrict__ row_offs, const int* __restrict__ stream_ns,
++    int vocab, int draft_vocab, int vocab_split, float cap) {
++    ink2DfSelectBatch(top, projected, predecessor, successor, nullptr, nullptr, walk, chances, keys, row_offs, stream_ns, vocab, draft_vocab, vocab_split, cap);
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(512) tf_ink2_df_select8_batch(
+@@ -328,6 +335,7 @@ extern "C" __global__ void __launch_bounds__(512) tf_ink2_df_select8_batch(
+     const uint8_t* __restrict__ predecessor, const uint8_t* __restrict__ successor,
+     const float* __restrict__ prev_scales, const float* __restrict__ next_scales,
+     unsigned* __restrict__ walk, float* __restrict__ chances, const ink2df::DraftKey* __restrict__ keys,
+-    const int* __restrict__ row_offs, const int* __restrict__ stream_ns, int vocab, float cap) {
+-    ink2DfSelectBatch(top, projected, predecessor, successor, prev_scales, next_scales, walk, chances, keys, row_offs, stream_ns, vocab, cap);
++    const int* __restrict__ row_offs, const int* __restrict__ stream_ns,
++    int vocab, int draft_vocab, int vocab_split, float cap) {
++    ink2DfSelectBatch(top, projected, predecessor, successor, prev_scales, next_scales, walk, chances, keys, row_offs, stream_ns, vocab, draft_vocab, vocab_split, cap);
+ }
+diff --git a/zig/kernels/cuda/inkling2/draft_fp8.cuh b/zig/kernels/cuda/inkling2/draft_fp8.cuh
+index 2063811..1e99e54 100644
+--- a/zig/kernels/cuda/inkling2/draft_fp8.cuh
++++ b/zig/kernels/cuda/inkling2/draft_fp8.cuh
+@@ -2,6 +2,7 @@
+ 
+ #include <cuda_fp16.h>
+ #include <cuda_fp8.h>
++#include "../nvfp4q.cuh"
+ 
+ namespace ink2d {
+ __device__ __forceinline__ float fp8Value(uint8_t code) {
+@@ -17,6 +18,16 @@ __device__ __forceinline__ float fp8Scale(float max_abs) {
+ __device__ __forceinline__ uint8_t fp8Code(float value, float scale) {
+     return __nv_cvt_float_to_fp8(value / scale, __NV_SATFINITE, __NV_E4M3);
+ }
++
++__device__ __forceinline__ int fp8Col(int lane, int b) {
++    const int p = 16 * (b / 4) + 4 * (lane % 4) + b % 4;
++    return 16 * (p / 16) + 2 * ((p % 16) / 4) + p % 2 + 8 * ((p % 4) / 2);
++}
++
++__device__ __forceinline__ unsigned warpMaxU(unsigned v) {
++    for (int o = 16; o > 0; o >>= 1) v = max(v, __shfl_xor_sync(0xffffffffu, v, o));
++    return v;
++}
+ }  // namespace ink2d
+ 
+ // A warp packs one row of a 64x64 qmmf FP8G tile, including its FP32 scale.
+@@ -74,3 +85,84 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2_dsp_vocab8(
+     const float x = bfr(bf(base[v]) + b);
+     out[v] = v < valid ? bfr(tanhf(x / cap) * cap) : -INFINITY;
+ }
++
++// Largest absolute BF16 code across a BF16 weight matrix (for NVFP4 / pruned FP8 global scaling).
++extern "C" __global__ void __launch_bounds__(256) tf_ink2_draft_amax(
++    const uint16_t* __restrict__ weights, long long total, unsigned* __restrict__ result) {
++    unsigned hi = 0;
++    for (long long i = static_cast<long long>(blockIdx.x) * 256 + threadIdx.x; i < total; i += gridDim.x * 256)
++        hi = max(hi, static_cast<unsigned>(weights[i]) & 0x7fffu);
++    hi = ink2d::warpMaxU(hi);
++    if ((threadIdx.x & 31) == 0) atomicMax(result, hi);
++}
++
++// Pack a (optionally vocab-pruned) BF16 matrix into qmmf::Mode::fp8 per-tensor tiled E4M3 codes.
++// Rows [0, split) copy directly from source [0, split); rows [split, draft_n) copy the tail [full_n - (draft_n - split), full_n).
++extern "C" __global__ void __launch_bounds__(256) tf_ink2_draft_pack_fp8_pruned(
++    const uint16_t* __restrict__ weights, uint8_t* __restrict__ codes,
++    int full_n, int draft_n, int split, int k, float inv, long long total) {
++    using namespace ink2d;
++    const long long i = static_cast<long long>(blockIdx.x) * 256 + threadIdx.x;
++    if (i >= total) return;
++    const int lane = (i / 16) % 32, kg = k / 64;
++    const long long tile = i / 4096;
++    const long long row = (tile / kg) * 64 + (i / 512 % 8) * 8 + lane / 4;
++    const int col = (tile % kg) * 64 + (i / 8 % 2) * 32 + fp8Col(lane, i % 8);
++    uint8_t code = 0;
++    if (row < draft_n) {
++        const long long src_row = (row < split) ? row : (row + (full_n - draft_n));
++        code = __nv_cvt_float_to_fp8(bf(weights[src_row * k + col]) * inv, __NV_SATFINITE, __NV_E4M3);
++    }
++    codes[i] = code;
++}
++
++// Pack any BF16 [full_n, k] (optionally pruned to draft_n) into qmmf::Mode::fp4 tiled words + 16-input E4M3 scales.
++extern "C" __global__ void __launch_bounds__(256) tf_ink2_draft_pack_fp4_matrix(
++    const uint16_t* __restrict__ weights, uint32_t* __restrict__ words, uint8_t* __restrict__ scales,
++    int full_n, int draft_n, int split, int k, float inv_global) {
++    using namespace ink2d;
++    __shared__ uint8_t s_nib[8][8][64];
++    const int kg = k >> 6;
++    const int tg = static_cast<int>(blockIdx.x);
++    const int t = tg / kg, g = tg - t * kg;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int r = lane >> 2, q = lane & 3;
++    const int row = t * 64 + warp * 8 + r;
++    float vals[16];
++    float amax = 0.0f;
++    if (row < draft_n) {
++        const int src_row = (row < split) ? row : (row + (full_n - draft_n));
++        const uint4* wp = reinterpret_cast<const uint4*>(weights + static_cast<size_t>(src_row) * k + g * 64 + q * 16);
++        const uint4 v0 = wp[0], v1 = wp[1];
++        const uint32_t u[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
++#pragma unroll
++        for (int p = 0; p < 8; ++p) {
++            const float a = bf(static_cast<uint16_t>(u[p] & 0xffffu));
++            const float b = bf(static_cast<uint16_t>(u[p] >> 16));
++            vals[2 * p] = a;
++            vals[2 * p + 1] = b;
++            amax = fmaxf(amax, fmaxf(fabsf(a), fabsf(b)));
++        }
++    }
++    const nvfp4q::Scale sc = nvfp4q::block_scale(amax, inv_global);
++    scales[(static_cast<size_t>(tg) * 64 + warp * 8 + r) * 4 + q] =
++        (row < draft_n) ? static_cast<uint8_t>(sc.sf8) : 0u;
++#pragma unroll
++    for (int p = 0; p < 16; ++p) {
++        s_nib[warp][r][q * 16 + p] = (row < draft_n) ? static_cast<uint8_t>(nvfp4q::e2m1(vals[p] * sc.mul)) : 0u;
++    }
++    __syncwarp();
++    constexpr int offs[8] = {0, 8, 16, 24, 1, 9, 17, 25};
++#pragma unroll
++    for (int v = 0; v < 2; ++v) {
++        uint32_t word = 0u;
++        if (row < draft_n) {
++#pragma unroll
++            for (int p = 0; p < 8; ++p) {
++                const int col = 32 * v + 2 * q + offs[p];
++                word |= static_cast<uint32_t>(s_nib[warp][r][col]) << (4 * p);
++            }
++        }
++        words[((static_cast<size_t>(tg) * 8 + warp) * 32 + lane) * 2 + v] = word;
++    }
++}
+diff --git a/zig/src/families/inkling2/cuda_capacity.zig b/zig/src/families/inkling2/cuda_capacity.zig
+index 8d89840..1017fcd 100644
+--- a/zig/src/families/inkling2/cuda_capacity.zig
++++ b/zig/src/families/inkling2/cuda_capacity.zig
+@@ -40,7 +40,7 @@ pub const Checkpoint = struct {
+         return n;
+     }
+ 
+-    pub fn read(a: std.mem.Allocator, io: std.Io, dir: []const u8, drafts: bool, drafter_dir: ?[]const u8, vision: ?native.VisionOptions, capability: u32, why: *config.Why) !Checkpoint {
++    pub fn read(a: std.mem.Allocator, io: std.Io, dir: []const u8, drafts: bool, drafter_dir: ?[]const u8, drafter_bits: u8, vision: ?native.VisionOptions, capability: u32, why: *config.Why) !Checkpoint {
+         const c = try native.readConfig(a, io, dir, why);
+         try loop.validateLoad(&c, 1, false);
+         if (vision) |limits| try @import("mini_vision.zig").validate(c.vision, limits);
+@@ -48,13 +48,13 @@ pub const Checkpoint = struct {
+         defer ck.close();
+         const schedule = try native.checkpointPlan(a, &ck, &c);
+         const bytes = try weights.checkpointBytes(&ck);
+-        const src = try native.drafterSource(a, io, dir, &c, .{ .drafts = drafts, .context = 1, .drafter = drafter_dir });
++        const src = try native.drafterSource(a, io, dir, &c, .{ .drafts = drafts, .context = 1, .drafter = drafter_dir, .drafter_bits = drafter_bits });
+         defer if (src) |d| d.deinit(a);
+         const lazy_bytes = if (capability >= 120 and lazy_head.enabled() and lazy_head.eligible(c.text.unpadded_vocab, c.text.hidden))
+             lazy_head.allocationBytes(c.text.unpadded_vocab, c.text.hidden)
+         else
+             0;
+-        const drafter = if (src) |d| try d.checkpointBytes(a, io, &c, capability, lazy_bytes != 0) else 0;
++        const drafter = if (src) |d| try d.checkpointBytes(a, io, &c, capability, lazy_bytes != 0, drafter_bits) else 0;
+         return .{
+             .text = c.text,
+             .schedule = schedule,
+@@ -62,7 +62,7 @@ pub const Checkpoint = struct {
+             .checkpoint_bytes = bytes,
+             .target_arena = weights.arenaBytes(bytes),
+             .draft_arena = drafter,
+-            .draft_prepared_head = if (src) |d| d.preparedHeadBytes(&c, capability, lazy_bytes != 0) else 0,
++            .draft_prepared_head = if (src) |d| d.preparedHeadBytes(&c, capability, lazy_bytes != 0, drafter_bits) else 0,
+             .draft_kind = if (src) |d| d.kind else .dspark,
+             .lazy_head_bytes = lazy_bytes,
+             .dense_scratch = 0,
+diff --git a/zig/src/families/inkling2/cuda_native.zig b/zig/src/families/inkling2/cuda_native.zig
+index 99fe490..f67de18 100644
+--- a/zig/src/families/inkling2/cuda_native.zig
++++ b/zig/src/families/inkling2/cuda_native.zig
+@@ -51,6 +51,7 @@ pub const Options = struct {
+     paging: ?Paging = null,
+     replan: ?Replan = null,
+     drafter: ?[]const u8 = null,
++    drafter_bits: u8 = 8,
+     tp: usize = 1,
+     rank: usize = 0,
+     master: ?[]const u8 = null,
+@@ -257,7 +258,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     else
+         null;
+     errdefer if (lazy) |*head| head.deinit();
+-    var dw = if (drafter) |src| try src.load(gpa, io, ctx.d, &c, &ck, stream, w.unembed, if (lazy) |head| head.weight else null) else null;
++    var dw = if (drafter) |src| try src.load(gpa, io, ctx.d, &c, &ck, stream, w.unembed, if (lazy) |head| head.weight else null, o.drafter_bits) else null;
+     errdefer if (dw) |*d| d.deinit();
+     ck.release();
+     const target_weights = w.bytes;
+diff --git a/zig/src/families/inkling2/dflash2_cuda.zig b/zig/src/families/inkling2/dflash2_cuda.zig
+index e9064e4..81910e1 100644
+--- a/zig/src/families/inkling2/dflash2_cuda.zig
++++ b/zig/src/families/inkling2/dflash2_cuda.zig
+@@ -465,7 +465,7 @@ pub const Drafter = struct {
+         try launch(d.conv_batch, s, rows, 1, 256, .{ a.conv, a.delta, cv.base, a.residual, @as(i32, h), @as(i32, 1) });
+     }
+ 
+-    fn selectAllBatch(d: *const Drafter, s: cuda.Stream, count: usize, vocab: usize) !void {
++    fn selectAllBatch(d: *const Drafter, s: cuda.Stream, count: usize, vocab: usize, draft_vocab: usize, vocab_split: usize) !void {
+         const a = d.scratch;
+         const p = d.w.predecessor;
+         const q = d.w.successor;
+@@ -477,6 +477,8 @@ pub const Drafter = struct {
+         }
+         for ([_]u64{ a.walk(), a.chances(), a.keys(), a.rowOffs(), a.streamNs() }) |ptr| args.add(ptr);
+         args.add(@as(i32, @intCast(vocab)));
++        args.add(@as(i32, @intCast(draft_vocab)));
++        args.add(@as(i32, @intCast(vocab_split)));
+         args.add(@as(f32, w_.cap));
+         try cuda.launch.launch(d.select_batch, .{ .grid = .{ .x = @intCast(count) }, .block = .{ .x = 512 } }, s, &args);
+     }
+@@ -514,6 +516,8 @@ pub const Drafter = struct {
+                 break :blk a.head_in;
+             };
+             const v = target.unpadded_vocab;
++            const dv = if (d.w.base != null) d.w.draft_vocab else v;
++            const vsplit = if (d.w.base != null) d.w.vocab_split else v;
+             // The target's padding rows cannot be offered by the draft.
+             if (d.w.base) |w| {
+                 try d.lane.?.matmul(s, head_x, h, sum_n, w, a.logits, 0);
+@@ -526,9 +530,9 @@ pub const Drafter = struct {
+                     off += chunk_n;
+                 }
+             }
+-            try b.k.draws.topkRows(s, a.logits, v, w_.top_k, a.top_parts, a.top, sum_n);
++            try b.k.draws.topkRows(s, a.logits, dv, w_.top_k, a.top_parts, a.top, sum_n);
+             try d.project(k, s, head_x, d.w.project, a.projected, sum_n, w_.rank, h);
+-            try d.selectAllBatch(s, count, v);
++            try d.selectAllBatch(s, count, v, dv, vsplit);
+         }
+     };
+ 
+diff --git a/zig/src/families/inkling2/dflash2_weights.zig b/zig/src/families/inkling2/dflash2_weights.zig
+index e421b7c..4bc4a05 100644
+--- a/zig/src/families/inkling2/dflash2_weights.zig
++++ b/zig/src/families/inkling2/dflash2_weights.zig
+@@ -121,7 +121,10 @@ pub const Weights = struct {
+     predecessor: fp8.Table,
+     successor: fp8.Table,
+     base: ?cuda.qmmf.Weight,
++    draft_vocab: usize,
++    vocab_split: usize,
+     fp8_layers: bool,
++    fp4_layers: bool,
+ 
+     pub fn deinit(w: *Weights) void {
+         w.memory.free();
+@@ -164,11 +167,11 @@ const Reader = struct {
+     fn conv(r: *Reader, layer: usize, comptime prefix: []const u8) !Conv {
+         return .{
+             .base = try r.at(layer, prefix ++ ".base_kernel", &.{ 2, 2, hidden }),
+-            .projection = try r.matrix(layer, &.{prefix ++ ".kernel_projection.weight"}, .{4 * groups}, hidden),
++            .projection = try r.matrixMode(layer, &.{prefix ++ ".kernel_projection.weight"}, .{4 * groups}, hidden, false),
+         };
+     }
+ 
+-    fn layerMatrix(r: *Reader, comptime count: usize, names: [count][]const u8, ns: [count]usize, k: usize) !fp8.Matrix {
++    fn layerMatrix(r: *Reader, comptime count: usize, names: [count][]const u8, ns: [count]usize, k: usize, allow_fp4: bool) !fp8.Matrix {
+         var parts: [count][]const u8 = undefined;
+         if (r.packed_layers) {
+             var scales: [count][]const u8 = undefined;
+@@ -185,16 +188,22 @@ const Reader = struct {
+             return r.arena.packedMatrix(&parts, &scales);
+         }
+         for (names, ns, &parts) |name, n, *part| part.* = try r.tensor(name, &.{ n, k });
+-        return r.arena.matrix(&parts, @reduce(.Add, @as(@Vector(count, usize), ns)), k, r.options.layers);
++        const total_n = @reduce(.Add, @as(@Vector(count, usize), ns));
++        if (allow_fp4 and r.options.fp4_layers) return r.arena.matrixFp4(&parts, total_n, k);
++        return r.arena.matrix(&parts, total_n, k, r.options.layers);
+     }
+ 
+     fn matrix(r: *Reader, layer: usize, comptime suffixes: []const []const u8, ns: [suffixes.len]usize, k: usize) !fp8.Matrix {
++        return r.matrixMode(layer, suffixes, ns, k, true);
++    }
++
++    fn matrixMode(r: *Reader, layer: usize, comptime suffixes: []const []const u8, ns: [suffixes.len]usize, k: usize, allow_fp4: bool) !fp8.Matrix {
+         var storage: [suffixes.len][96]u8 = undefined;
+         var names: [suffixes.len][]const u8 = undefined;
+         inline for (suffixes, &storage, &names) |suffix, *name, *part| {
+             part.* = try std.fmt.bufPrint(name, "layers.{d}." ++ suffix, .{layer});
+         }
+-        return r.layerMatrix(suffixes.len, names, ns, k);
++        return r.layerMatrix(suffixes.len, names, ns, k, allow_fp4);
+     }
+ 
+     fn codebook(r: *Reader, name: []const u8) !fp8.Table {
+@@ -224,14 +233,17 @@ const Reader = struct {
+         const out: Weights = .{
+             .memory = r.arena.memory orelse undefined,
+             .layer = ls,
+-            .fuse = try r.layerMatrix(1, .{"fc.weight"}, .{hidden}, dspark.taps.len * hidden),
++            .fuse = try r.layerMatrix(1, .{"fc.weight"}, .{hidden}, dspark.taps.len * hidden, true),
+             .fuse_norm = try r.put("hidden_norm.weight", &.{hidden}),
+             .norm = try r.put("norm.weight", &.{hidden}),
+             .project = try r.arena.matrix(&.{try r.tensor("candidate_selector.hidden_projection.weight", &.{ rank, hidden })}, rank, hidden, r.options.head),
+             .predecessor = try r.codebook("candidate_selector.predecessor_codebook"),
+             .successor = try r.codebook("candidate_selector.successor_codebook"),
+             .base = try r.arena.base(r.options, base, n_vocab, hidden),
+-            .fp8_layers = r.packed_layers or r.options.layers,
++            .draft_vocab = r.options.draftVocab(n_vocab),
++            .vocab_split = r.options.vocabSplit(n_vocab),
++            .fp8_layers = r.packed_layers or r.options.layers or r.options.fp4_layers,
++            .fp4_layers = !r.packed_layers and r.options.fp4_layers,
+         };
+         if (r.file.names.count() != r.count) return error.MiniDFlash2Tensor;
+         return out;
+@@ -273,7 +285,7 @@ pub fn load(a: std.mem.Allocator, io: std.Io, dir: []const u8, n_vocab: usize, o
+     const packed_layers = packedLayers(&file);
+     var mem = try cuda.DeviceBuffer.alloc(d, try size(&file, n_vocab, options, selector_rows));
+     errdefer mem.free();
+-    const stage = @max(if (options.layers and !packed_layers) @as(usize, 2 * 2 * inter * hidden) else 0, if (options.head) selector_rows * rank * 2 else 0);
++    const stage = @max(if ((options.layers or options.fp4_layers) and !packed_layers) @as(usize, 2 * 2 * inter * hidden) else 0, if (options.head) selector_rows * rank * 2 else 0);
+     var p = if (stage != 0) try fp8.Packer.init(d, base.stream, stage) else null;
+     defer if (p) |*packer| packer.deinit();
+     var r: Reader = .{
+diff --git a/zig/src/families/inkling2/draft_fp8.zig b/zig/src/families/inkling2/draft_fp8.zig
+index 12cfc68..954678e 100644
+--- a/zig/src/families/inkling2/draft_fp8.zig
++++ b/zig/src/families/inkling2/draft_fp8.zig
+@@ -5,44 +5,99 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const lazy_head = @import("loop_lazy_head.zig");
+ 
++pub const special_tail: usize = 60; // Inkling-2-Mini added special tokens at unpadded_vocab - 60 .. unpadded_vocab
++
+ pub const Options = struct {
+     layers: bool = false,
++    fp4_layers: bool = false,
+     head: bool = false,
+     fp4_head: bool = false,
+     borrow_head: bool = false,
++    vocab_limit: usize = 0,
+ 
+-    pub fn fromEnv(borrow_head: bool, default_fp8: bool) Options {
++    pub fn fromEnv(borrow_head: bool, default_fp8: bool, drafter_bits: u8) Options {
++        const env = @import("sys").environment;
++        const fp8_layers_env = env.read(bool, "TF_INKLING2_DRAFT_FP8_LAYERS", default_fp8) catch false;
++        var layers = fp8_layers_env;
++        var fp4_layers = false;
++        if (default_fp8) {
++            if (std.c.getenv("TF_INKLING2_DRAFT_LAYER_BITS")) |raw| {
++                const bits = std.fmt.parseInt(u8, std.mem.span(raw), 10) catch 8;
++                if (bits == 4) {
++                    layers = true;
++                    fp4_layers = true;
++                } else if (bits == 8) {
++                    layers = true;
++                    fp4_layers = false;
++                } else {
++                    layers = false;
++                    fp4_layers = false;
++                }
++            } else if (drafter_bits == 4 and fp8_layers_env) {
++                layers = true;
++                fp4_layers = true;
++            } else if (drafter_bits == 0) {
++                layers = false;
++                fp4_layers = false;
++            }
++        }
++        const vocab_limit: usize = if (default_fp8) (env.read(usize, "TF_INKLING2_DRAFT_VOCAB", 0) catch 0) else 0;
+         return .{
+-            .layers = @import("sys").environment.read(bool, "TF_INKLING2_DRAFT_FP8_LAYERS", default_fp8) catch false,
+-            .head = @import("sys").environment.read(bool, "TF_INKLING2_DRAFT_FP8_HEAD", default_fp8) catch false,
+-            .fp4_head = @import("sys").environment.read(bool, "TF_INKLING2_DRAFT_FP4_HEAD", false) catch false,
++            .layers = layers,
++            .fp4_layers = fp4_layers,
++            .head = env.read(bool, "TF_INKLING2_DRAFT_FP8_HEAD", default_fp8) catch false,
++            .fp4_head = env.read(bool, "TF_INKLING2_DRAFT_FP4_HEAD", false) catch false,
+             .borrow_head = borrow_head,
++            .vocab_limit = vocab_limit,
+         };
+     }
+ 
+     pub fn active(o: Options) bool {
+-        return o.layers or o.head or o.fp4_head;
++        return o.layers or o.fp4_layers or o.head or o.fp4_head;
++    }
++
++    pub fn draftVocab(o: Options, n_vocab: usize) usize {
++        if (o.vocab_limit == 0 or o.vocab_limit >= n_vocab) return n_vocab;
++        const clamped = std.mem.alignForward(usize, @max(o.vocab_limit, 1024), 128);
++        return if (clamped >= n_vocab) n_vocab else clamped;
++    }
++
++    pub fn vocabSplit(o: Options, n_vocab: usize) usize {
++        const dv = o.draftVocab(n_vocab);
++        if (dv == n_vocab) return n_vocab;
++        return dv - @min(special_tail, dv / 2);
+     }
+ 
+     pub fn baseBytes(o: Options, n: usize, k: usize) usize {
+-        if (o.fp4_head) return lazy_head.fp4HeadBytes(n, k);
+-        return if (o.head and !o.borrow_head) lazy_head.codeBytes(n, k) else 0;
++        const dv = o.draftVocab(n);
++        const pruned = dv < n;
++        if (o.fp4_head) return lazy_head.fp4HeadBytes(dv, k);
++        return if (o.head and (!o.borrow_head or pruned)) lazy_head.codeBytes(dv, k) else 0;
+     }
+ };
+ 
+-/// A BF16 row-major weight, or a CUDA lane with one f32 scale per group of 64 inputs.
++/// A BF16 row-major weight, an FP8G64 CUDA lane, or an NVFP4 CUDA lane (global_scale > 0).
+ pub const Matrix = struct {
+     data: u64,
+     scales: u64 = 0,
++    global_scale: f32 = 0,
+ 
+     pub fn afterRows(m: Matrix, rows: usize, k: usize) Matrix {
+         if (m.scales == 0) return .{ .data = m.data + rows * k * 2 };
+         std.debug.assert(rows % 128 == 0);
++        if (m.global_scale > 0) {
++            return .{
++                .data = m.data + rows * (k / 2),
++                .scales = m.scales + rows * (k / 16),
++                .global_scale = m.global_scale,
++            };
++        }
+         return .{ .data = m.data + rows * k, .scales = m.scales + rows * (k / cuda.qmmf.group) * 4 };
+     }
+ 
+     pub fn lane(m: Matrix, n: usize, k: usize) cuda.qmmf.Weight {
+         std.debug.assert(m.scales != 0);
++        if (m.global_scale > 0) return cuda.nvfp4.weight(m.data, m.scales, m.global_scale, n, k);
+         return cuda.fp8.weight(m.data, m.scales, n, k);
+     }
+ };
+@@ -60,18 +115,36 @@ pub const Packer = struct {
+     stream: cuda.Stream,
+     mod: cuda.Module,
+     staging: cuda.DeviceBuffer,
++    amax: cuda.DeviceBuffer,
+     matrix: cuda.Function,
+     rows: cuda.Function,
++    amax_fn: cuda.Function,
++    fp4_matrix: cuda.Function,
+ 
+     pub fn init(d: *const cuda.Driver, s: cuda.Stream, staging_bytes: usize) !Packer {
+         var mod = try cuda.Module.load(d, cuda.kernels.inkling2_dspark);
+         errdefer mod.unload();
+         const matrix = try mod.function("tf_ink2_draft_pack_layers");
+         const rows = try mod.function("tf_ink2_draft_pack_rows");
+-        return .{ .stream = s, .mod = mod, .matrix = matrix, .rows = rows, .staging = try cuda.DeviceBuffer.alloc(d, staging_bytes) };
++        const amax_fn = try mod.function("tf_ink2_draft_amax");
++        const fp4_matrix = try mod.function("tf_ink2_draft_pack_fp4_matrix");
++        var staging = try cuda.DeviceBuffer.alloc(d, staging_bytes);
++        errdefer staging.free();
++        const amax = try cuda.DeviceBuffer.alloc(d, 4);
++        return .{
++            .stream = s,
++            .mod = mod,
++            .staging = staging,
++            .amax = amax,
++            .matrix = matrix,
++            .rows = rows,
++            .amax_fn = amax_fn,
++            .fp4_matrix = fp4_matrix,
++        };
+     }
+ 
+     pub fn deinit(p: *Packer) void {
++        p.amax.free();
+         p.staging.free();
+         p.mod.unload();
+     }
+@@ -92,8 +165,105 @@ pub const Packer = struct {
+         try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((work + 7) / 8) }, .block = .{ .x = 256 } }, p.stream, &a);
+         try p.stream.synchronize();
+     }
++
++    fn applyFp4(p: *const Packer, sources: []const []const u8, data: u64, scales: u64, n: usize, k: usize) !f32 {
++        var offset: usize = 0;
++        for (sources) |source| {
++            try p.staging.upload(offset, source);
++            offset += source.len;
++        }
++        std.debug.assert(offset == n * k * 2);
++        try p.amax.fill8(0, p.stream.handle);
++        var a: cuda.Args = .{};
++        a.add(p.staging.ptr);
++        a.add(@as(i64, @intCast(n * k)));
++        a.add(p.amax.ptr);
++        try cuda.launch.launch(p.amax_fn, .{ .grid = .{ .x = 256 }, .block = .{ .x = 256 } }, p.stream, &a);
++        try p.stream.synchronize();
++        var value: u32 = 0;
++        try p.amax.download(0, std.mem.asBytes(&value));
++        if (value > 0x4b80) return error.Inkling2FP8HeadWeights;
++        const biggest: f32 = @bitCast(value << 16);
++        const global_scale = @max(biggest, 0x1p-16) / (6.0 * 448.0);
++        const inv_global: f32 = 1.0 / global_scale;
++        const tiles = (cuda.nvfp4.padded(n) / 64) * (k / 64);
++        a = .{};
++        a.add(p.staging.ptr);
++        a.add(data);
++        a.add(scales);
++        a.add(@as(i32, @intCast(n)));
++        a.add(@as(i32, @intCast(n)));
++        a.add(@as(i32, @intCast(n)));
++        a.add(@as(i32, @intCast(k)));
++        a.add(inv_global);
++        try cuda.launch.launch(p.fp4_matrix, .{ .grid = .{ .x = @intCast(tiles) }, .block = .{ .x = 256 } }, p.stream, &a);
++        try p.stream.synchronize();
++        return global_scale;
++    }
+ };
+ 
++fn computeAmax(mod: cuda.Module, d: *const cuda.Driver, s: cuda.Stream, source: u64, elems: usize) !f32 {
++    var amax = try cuda.DeviceBuffer.alloc(d, 4);
++    defer amax.free();
++    errdefer s.synchronize() catch {};
++    try amax.fill8(0, s.handle);
++    var a: cuda.Args = .{};
++    a.add(source);
++    a.add(@as(i64, @intCast(elems)));
++    a.add(amax.ptr);
++    try cuda.launch.launch(try mod.function("tf_ink2_draft_amax"), .{ .grid = .{ .x = 256 }, .block = .{ .x = 256 } }, s, &a);
++    try s.synchronize();
++    var value: u32 = 0;
++    try amax.download(0, std.mem.asBytes(&value));
++    if (value > 0x4b80) return error.Inkling2FP8HeadWeights;
++    return @bitCast(value << 16);
++}
++
++fn packPrunedFp8(d: *const cuda.Driver, s: cuda.Stream, source: u64, dest: u64, full_n: usize, draft_n: usize, split: usize, k: usize) !cuda.qmmf.Weight {
++    if (k % 64 != 0 or draft_n == 0 or draft_n > full_n) return error.Inkling2FP8HeadShape;
++    var mod = try cuda.Module.load(d, cuda.kernels.inkling2_dspark);
++    defer mod.unload();
++    const biggest = try computeAmax(mod, d, s, source, full_n * k);
++    const scale = @exp2(@ceil(@log2(@max(biggest, 0x1p-16) / 448.0)));
++    const total = lazy_head.codeBytes(draft_n, k);
++    var a: cuda.Args = .{};
++    a.add(source);
++    a.add(dest);
++    a.add(@as(i32, @intCast(full_n)));
++    a.add(@as(i32, @intCast(draft_n)));
++    a.add(@as(i32, @intCast(split)));
++    a.add(@as(i32, @intCast(k)));
++    a.add(1.0 / scale);
++    a.add(@as(i64, @intCast(total)));
++    try cuda.launch.launch(try mod.function("tf_ink2_draft_pack_fp8_pruned"), .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 } }, s, &a);
++    try s.synchronize();
++    return .{ .mode = .fp8, .codes = dest, .scales = 0, .scale = scale, .n = @intCast(draft_n), .k = @intCast(k), .npad = @intCast(cuda.fp8.padded(draft_n)), .sk = 1 };
++}
++
++fn packPrunedFp4(d: *const cuda.Driver, s: cuda.Stream, source: u64, dest: u64, full_n: usize, draft_n: usize, split: usize, k: usize) !cuda.qmmf.Weight {
++    if (k % 64 != 0 or draft_n == 0 or draft_n > full_n) return error.Inkling2FP8HeadShape;
++    var mod = try cuda.Module.load(d, cuda.kernels.inkling2_dspark);
++    defer mod.unload();
++    const biggest = try computeAmax(mod, d, s, source, full_n * k);
++    const global_scale = @max(biggest, 0x1p-16) / (6.0 * 448.0);
++    const inv_global: f32 = 1.0 / global_scale;
++    const words = dest;
++    const scales = dest + lazy_head.fp4CodeBytes(draft_n, k);
++    const tiles = (cuda.nvfp4.padded(draft_n) / 64) * (k / 64);
++    var a: cuda.Args = .{};
++    a.add(source);
++    a.add(words);
++    a.add(scales);
++    a.add(@as(i32, @intCast(full_n)));
++    a.add(@as(i32, @intCast(draft_n)));
++    a.add(@as(i32, @intCast(split)));
++    a.add(@as(i32, @intCast(k)));
++    a.add(inv_global);
++    try cuda.launch.launch(try mod.function("tf_ink2_draft_pack_fp4_matrix"), .{ .grid = .{ .x = @intCast(tiles) }, .block = .{ .x = 256 } }, s, &a);
++    try s.synchronize();
++    return cuda.nvfp4.weight(words, scales, global_scale, draft_n, k);
++}
++
+ pub fn loadLane(d: *const cuda.Driver, wanted: bool) !?cuda.qmmf.Lane {
+     if (!wanted) return null;
+     const sm = try d.currentCapability();
+@@ -139,6 +309,15 @@ pub const Arena = struct {
+         return .{ .data = data, .scales = scales };
+     }
+ 
++    pub fn matrixFp4(a: *Arena, sources: []const []const u8, n: usize, k: usize) !Matrix {
++        if (k % cuda.qmmf.group != 0) return error.Inkling2DraftShape;
++        const padded = cuda.nvfp4.padded(n);
++        const data = a.alloc(padded * (k / 2));
++        const scales = a.alloc(padded * (k / 16));
++        const gs: f32 = if (a.packer) |p| try p.applyFp4(sources, data, scales, n, k) else 1.0;
++        return .{ .data = data, .scales = scales, .global_scale = gs };
++    }
++
+     pub fn packedMatrix(a: *Arena, data: []const []const u8, scales: []const []const u8) !Matrix {
+         return .{ .data = try a.put(data), .scales = try a.put(scales) };
+     }
+@@ -152,15 +331,28 @@ pub const Arena = struct {
+     }
+ 
+     pub fn base(a: *Arena, o: Options, head: ?BaseHead, n: usize, k: usize) !?cuda.qmmf.Weight {
++        const dv = o.draftVocab(n);
++        const split = o.vocabSplit(n);
++        const pruned = dv < n;
+         if (o.fp4_head) {
+             const dest = a.alloc(o.baseBytes(n, k));
+-            if (head) |h| return try lazy_head.packFp4(h.stream.d, h.stream, h.source, dest, n, k);
++            if (head) |h| {
++                return if (!pruned)
++                    try lazy_head.packFp4(h.stream.d, h.stream, h.source, dest, n, k)
++                else
++                    try packPrunedFp4(h.stream.d, h.stream, h.source, dest, n, dv, split, k);
++            }
+             return null;
+         }
+         if (!o.head) return null;
+-        if (o.borrow_head) return if (head) |h| h.borrowed else null;
++        if (o.borrow_head and !pruned) return if (head) |h| h.borrowed else null;
+         const dest = a.alloc(o.baseBytes(n, k));
+-        if (head) |h| return try lazy_head.pack(h.stream.d, h.stream, h.source, dest, n, k);
++        if (head) |h| {
++            return if (!pruned)
++                try lazy_head.pack(h.stream.d, h.stream, h.source, dest, n, k)
++            else
++                try packPrunedFp8(h.stream.d, h.stream, h.source, dest, n, dv, split, k);
++        }
+         return null;
+     }
+ };
+@@ -174,3 +366,17 @@ test "Mini FP8 matrices keep the K/V suffix at its own packed tile and scale" {
+     try std.testing.expectEqual(256 + 6144 * (2304 + (2304 / 64) * 4), a.used);
+     try std.testing.expectEqual(@as(u32, 2048), kv.lane(2048, 2304).npad);
+ }
++
++test "Mini NVFP4 matrices keep the K/V suffix at its own packed tile and scale" {
++    var a: Arena = .{ .used = 256 };
++    const projection = try a.matrixFp4(&.{}, 6144, 2304);
++    const kv = projection.afterRows(4096, 2304);
++    try std.testing.expectEqual(projection.data + 4096 * (2304 / 2), kv.data);
++    try std.testing.expectEqual(projection.scales + 4096 * (2304 / 16), kv.scales);
++    try std.testing.expectEqual(projection.global_scale, kv.global_scale);
++    try std.testing.expectEqual(cuda.qmmf.Mode.fp4, kv.lane(2048, 2304).mode);
++    const o: Options = .{ .head = true, .borrow_head = true, .vocab_limit = 32768 };
++    try std.testing.expectEqual(@as(usize, 32768), o.draftVocab(200058));
++    try std.testing.expectEqual(@as(usize, 32768 - special_tail), o.vocabSplit(200058));
++    try std.testing.expectEqual(lazy_head.codeBytes(32768, 2304), o.baseBytes(200058, 2304));
++}
+diff --git a/zig/src/families/inkling2/loop_backend.zig b/zig/src/families/inkling2/loop_backend.zig
+index 55931c2..d106d50 100644
+--- a/zig/src/families/inkling2/loop_backend.zig
++++ b/zig/src/families/inkling2/loop_backend.zig
+@@ -156,10 +156,13 @@ pub const Backend = struct {
+                 "attn_raw"
+         else
+             "attn_none";
++        var draft_mode_buf: [48]u8 = undefined;
+         const draft_mode: []const u8 = switch (d.*) {
+-            .dflash2 => |df| if (df.w.fp8_layers)
+-                if (df.w.base) |bw| (if (bw.mode == .fp4) "df_fp8_fp4" else "df_fp8_fp8") else "df_fp8_bf16"
+-            else if (df.w.base) |bw| (if (bw.mode == .fp4) "df_bf16_fp4" else "df_bf16_fp8") else "df_bf16_bf16",
++            .dflash2 => |df| blk_dm: {
++                const ltag = if (df.w.fp4_layers) "fp4" else if (df.w.fp8_layers) "fp8" else "bf16";
++                const htag = if (df.w.base) |bw| (if (bw.mode == .fp4) "fp4" else "fp8") else "bf16";
++                break :blk_dm std.fmt.bufPrint(&draft_mode_buf, "df_{s}_{s}_v{d}", .{ ltag, htag, df.w.draft_vocab }) catch return null;
++            },
+             .dspark => "ds",
+         };
+         var tc_buf: [24]u8 = undefined;
+diff --git a/zig/src/families/inkling2/loop_drafter.zig b/zig/src/families/inkling2/loop_drafter.zig
+index 04ff346..e6f01a7 100644
+--- a/zig/src/families/inkling2/loop_drafter.zig
++++ b/zig/src/families/inkling2/loop_drafter.zig
+@@ -39,28 +39,28 @@ pub const Source = struct {
+         if (src.owns_path) a.free(src.path);
+     }
+ 
+-    fn options(src: Source, capability: u32, borrow_head: bool) fp8.Options {
++    fn options(src: Source, capability: u32, borrow_head: bool, drafter_bits: u8) fp8.Options {
+         if (capability < 120) return .{};
+-        return fp8.Options.fromEnv(borrow_head, src.kind == .dflash2);
++        return fp8.Options.fromEnv(borrow_head, src.kind == .dflash2, drafter_bits);
+     }
+ 
+-    pub fn checkpointBytes(src: Source, a: std.mem.Allocator, io: std.Io, c: *const config.Config, capability: u32, borrow_head: bool) !usize {
+-        const opts = src.options(capability, borrow_head);
++    pub fn checkpointBytes(src: Source, a: std.mem.Allocator, io: std.Io, c: *const config.Config, capability: u32, borrow_head: bool, drafter_bits: u8) !usize {
++        const opts = src.options(capability, borrow_head, drafter_bits);
+         return switch (src.kind) {
+             .dspark => dspark_weights.checkpointBytes(a, io, c, src.path, opts),
+             .dflash2 => dflash_weights.checkpointBytes(a, io, src.path, c.text.unpadded_vocab, opts),
+         };
+     }
+ 
+-    pub fn preparedHeadBytes(src: Source, c: *const config.Config, capability: u32, borrow_head: bool) usize {
+-        const opts = src.options(capability, borrow_head);
++    pub fn preparedHeadBytes(src: Source, c: *const config.Config, capability: u32, borrow_head: bool, drafter_bits: u8) usize {
++        const opts = src.options(capability, borrow_head, drafter_bits);
+         const folded = if (src.kind == .dspark) dspark_weights.preparedHeadBytes(opts.head) else 0;
+         return folded + opts.baseBytes(c.text.unpadded_vocab, c.text.hidden);
+     }
+ 
+-    pub fn load(src: Source, a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, c: *const config.Config, ck: *core.Checkpoint, s: cuda.Stream, unembed: u64, borrowed_head: ?cuda.qmmf.Weight) !Weights {
++    pub fn load(src: Source, a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, c: *const config.Config, ck: *core.Checkpoint, s: cuda.Stream, unembed: u64, borrowed_head: ?cuda.qmmf.Weight, drafter_bits: u8) !Weights {
+         std.debug.assert(s.d == d);
+-        const opts = src.options(try d.currentCapability(), borrowed_head != null);
++        const opts = src.options(try d.currentCapability(), borrowed_head != null, drafter_bits);
+         const base: fp8.BaseHead = .{ .stream = s, .source = unembed, .borrowed = borrowed_head };
+         return switch (src.kind) {
+             .dspark => blk: {
+@@ -75,7 +75,7 @@ pub const Source = struct {
+ test "Ampere and Ada account for full BF16 drafter weights even with a Blackwell head requested" {
+     const src: Source = .{ .kind = .dflash2, .path = "" };
+     for ([_]u32{ 86, 89 }) |capability| {
+-        const opts = src.options(capability, true);
++        const opts = src.options(capability, true, 4);
+         try std.testing.expect(!opts.active());
+         try std.testing.expect(!opts.borrow_head);
+     }
+diff --git a/zig/src/native/cuda_mini_capacity.zig b/zig/src/native/cuda_mini_capacity.zig
+index 9a3721b..a336c33 100644
+--- a/zig/src/native/cuda_mini_capacity.zig
++++ b/zig/src/native/cuda_mini_capacity.zig
+@@ -20,6 +20,7 @@ pub const Query = struct {
+     format: Format = .fp8,
+     drafts: bool = true,
+     drafter: ?[]const u8 = null,
++    drafter_bits: u8 = 8,
+     vision: ?mini.native.VisionOptions = null,
+     prompt_cache_gib: ?f64 = null,
+     cache_entries: usize = kv.most_snaps,
+@@ -186,7 +187,7 @@ pub fn modelContext(a: Allocator, io: std.Io, dir: []const u8, problem: *[]const
+ 
+ pub fn plan(a: Allocator, io: std.Io, dir: []const u8, before: budget.Pool, q: Query, problem: *[]const u8) !?Report {
+     var why: @import("inkling2").capacity.ConfigWhy = .{};
+-    const ck = mini.capacity.Checkpoint.read(a, io, dir, q.drafts, q.drafter, q.vision, q.capability, &why) catch |err| {
++    const ck = mini.capacity.Checkpoint.read(a, io, dir, q.drafts, q.drafter, q.drafter_bits, q.vision, q.capability, &why) catch |err| {
+         if (err == error.OutOfMemory) return err;
+         problem.* = if (why.text().len > 0) try a.dupe(u8, why.text()) else mini.native.explain(null, err) orelse @errorName(err);
+         return null;
+@@ -215,6 +216,7 @@ fn runtime(a: Allocator, io: std.Io, o: api.Open, before: budget.Pool, capabilit
+         .format = if (opts.kv8) .fp8 else .bf16,
+         .drafts = opts.drafts,
+         .drafter = opts.drafter,
++        .drafter_bits = opts.drafter_bits,
+         .vision = opts.vision,
+         .prompt_cache_gib = o.prompt_cache_gib,
+         .cache_entries = if (o.keep) |n| @intCast(@max(n, 0)) else kv.most_snaps,
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 41386d1..c7380eb 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -74,6 +74,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_INKLING2_DRAFT_FP8_LAYERS", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (FP8 Mini draft projections; default 1 for DFlash2 on Blackwell)" },
+     .{ .name = "TF_INKLING2_DRAFT_FP8_HEAD", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (FP8 Mini draft head weights; default 1 for DFlash2 on Blackwell)" },
+     .{ .name = "TF_INKLING2_DRAFT_FP4_HEAD", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (NVFP4 Mini draft head weights; default 0, borrows FP8 lazy head when available)" },
++    .{ .name = "TF_INKLING2_DRAFT_VOCAB", .scope = .cuda, .kind = .size, .forms = "0 (full vocab) or 1024..200058 (pruned Mini DFlash2 draft head vocab rows)" },
+     .{ .name = "TF_INKLING2_DFLASH2_DIR", .scope = .cuda, .kind = .path, .forms = "a local Mini DFlash2 checkpoint directory" },
+     .{ .name = "TF_INKLING2_DFLASH2_TRIM_SELECTOR", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (default 1 stores only Mini's real tokenizer rows in both DFlash2 selector codebooks)" },
+     .{ .name = "TF_INKLING2_DFLASH2_SHARED", .scope = .cuda, .kind = .u32, .only = &.{ 0, 2, 4 }, .forms = "0, 2 or 4 (maximum active streams for Mini DFlash2 shared pricing; default 4 on GB10, 2 elsewhere)" },

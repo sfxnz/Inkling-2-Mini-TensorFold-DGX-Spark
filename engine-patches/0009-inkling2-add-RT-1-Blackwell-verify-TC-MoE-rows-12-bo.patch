@@ -1,8 +1,8 @@
 From a5705079c129d8ccc7aa489e963dbdcd61629776 Mon Sep 17 00:00:00 2001
 From: sfxnz <sfxnz@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 21:19:32 +0000
-Subject: [PATCH 09/14] inkling2: add RT=1 Blackwell verify TC MoE (rows>=12),
- bound verify_cache=64, include flags in warmCacheKey
+Subject: [PATCH] inkling2: add RT=1 Blackwell verify TC MoE (rows>=12), bound
+ verify_cache=64, include flags in warmCacheKey
 
 ---
  zig/kernels/cuda/inkling2/modelopt.cu      | 90 ++++++++++++++--------
@@ -380,6 +380,3 @@ index 7295f3b..cf826bb 100644
          "TF_INKLING2_TOPK_WARP",
          "TF_INKLING2_LAZY_HEAD",
          "TF_INKLING2_ATTN_FP8_PREFETCH",
--- 
-2.43.0
-
